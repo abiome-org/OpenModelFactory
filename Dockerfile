@@ -1,0 +1,28 @@
+# syntax=docker/dockerfile:1.7
+FROM python:3.11-slim-bookworm AS build
+
+ENV PIP_DISABLE_PIP_VERSION_CHECK=1 PIP_NO_CACHE_DIR=1
+WORKDIR /src
+COPY pyproject.toml README.md SPEC.md LICENSE requirements.runtime.lock ./
+COPY factory ./factory
+RUN python -m pip wheel --require-hashes --wheel-dir /wheels -r requirements.runtime.lock \
+    && python -m pip wheel --no-deps --wheel-dir /wheels .
+
+FROM python:3.11-slim-bookworm AS runtime
+
+ARG OMF_UID=10001
+ARG OMF_GID=10001
+ENV PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1 PIP_DISABLE_PIP_VERSION_CHECK=1
+RUN groupadd --gid ${OMF_GID} omf \
+    && useradd --uid ${OMF_UID} --gid ${OMF_GID} --create-home omf
+COPY --from=build /wheels /wheels
+COPY requirements.runtime.lock /requirements.runtime.lock
+RUN python -m pip install --no-index --find-links /wheels --require-hashes \
+        -r /requirements.runtime.lock \
+    && python -m pip install --no-index --no-deps /wheels/open_model_factory-*.whl \
+    && rm -rf /wheels
+WORKDIR /workspace
+USER omf
+EXPOSE 8080
+ENTRYPOINT ["omf"]
+CMD ["--help"]

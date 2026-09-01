@@ -1,0 +1,32 @@
+# Open Model Factory local runtime and caches
+.omf/
+
+# Data payloads are content-addressed outside Git. Manifests remain tracked.
+data/payloads/
+data/incoming/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+dist/
+build/
+.venv/
+
+# Credentials and local environment
+.env
+.env.*
+!.env.example
+*.secret
+*.key
+*.pem
+
+# Editors and operating systems
+.DS_Store
+.idea/
+.vscode/

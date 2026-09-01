@@ -1,0 +1,516 @@
+"""Authenticated FastAPI surface for the Open Model Factory service."""
+
+from __future__ import annotations
+
+from collections.abc import AsyncIterator, Iterator
+from contextlib import asynccontextmanager
+from dataclasses import asdict
+from pathlib import Path
+from typing import Any
+
+from fastapi import Depends, FastAPI, Header, Query, Request
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, ConfigDict, Field
+
+from omf.config import ProjectPaths
+from omf.errors import AuthorizationError, OMFError
+from omf.factory import Factory
+from omf.federation import CapacityOffer, FederatedEvent, FederationBroker, Lease
+from omf.schema_registry import default_registry
+
+
+class StoreRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    name: str
+    driver: str
+    endpoint: str
+    secret_ref: str | None = None
+    plan: bool = False
+
+
+class DataRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    source: str
+    name: str
+    mode: str = "copy"
+    rights: dict[str, Any] = Field(default_factory=dict)
+    sample_schema: str = "application/octet-stream"
+    cursor_policy: dict[str, Any] = Field(default_factory=dict)
+
+
+class SyncRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    asset: str
+    source: str = "local"
+    destination: str
+    direction: str = "push"
+    concurrency: int = Field(default=4, ge=1, le=256)
+    plan: bool = False
+
+
+class ModuleRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    manifest: str
+
+
+class RunRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    workload: str
+    binding: str = "bindings/local.yaml"
+
+
+class BackupRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    destination: str
+
+
+class EvaluationRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    subject: str
+
+
+class ReleaseRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    run_id: str
+    name: str
+    intended_use: str
+    limitations: list[str] = Field(default_factory=list)
+    promote: bool = False
+    alias: str = "candidate"
+    approvals: list[str] = Field(default_factory=list)
+    vulnerability_report: str | None = None
+
+
+class DeploymentRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    manifest: str
+
+
+class DeploymentRollbackRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    expected_version: int = Field(ge=1)
+
+
+class FederationTrustRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    peer_id: str
+    trust_bundle: dict[str, str]
+
+
+class FederationLeaseRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    lease_id: str
+    peer_id: str
+    expires_at: str
+    policy_epoch: int = Field(ge=1)
+
+
+class FederationEventRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    peer_id: str
+    event_id: str
+    sequence: int = Field(ge=1)
+    policy_epoch: int = Field(ge=1)
+    lease_id: str
+    kind: str
+    resource: str
+    content_digest: str
+    key_id: str
+    signature: str
+
+
+class FederationEmitRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    peer_id: str
+    lease_id: str
+    kind: str
+    resource: str
+    content: Any
+
+
+class FederationPublishRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    peer_id: str
+    event_id: str
+
+
+class CapacityOfferRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    peer_id: str
+    labels: set[str]
+    capacity: dict[str, int]
+    policy_epoch: int = Field(ge=1)
+
+
+class PlacementRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    offers: list[CapacityOfferRequest]
+    required_labels: set[str] = Field(default_factory=set)
+    residency: str
+    resource: str
+    amount: int = Field(default=1, ge=1)
+
+
+class ApiTokenRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    actor: str = Field(min_length=1)
+    scopes: set[str]
+    expires_at: str | None = None
+
+
+class ConformanceBuildRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    evidence: str
+    output: str
+
+
+class ConformanceVerifyRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    report: str
+
+
+def create_app(paths: ProjectPaths) -> FastAPI:
+    """Create one API application bound to an already bootstrapped project."""
+    factory = Factory(paths)
+
+    @asynccontextmanager
+    async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
+        try:
+            yield
+        finally:
+            factory.close()
+
+    app = FastAPI(
+        title="Open Model Factory API",
+        version="0.1.0",
+        docs_url="/docs",
+        redoc_url="/redoc",
+        openapi_url="/openapi.json",
+        lifespan=lifespan,
+    )
+    app.state.factory = factory
+
+    @app.exception_handler(OMFError)
+    async def omf_error(_request: Request, exc: OMFError) -> JSONResponse:
+        return JSONResponse(status_code=exc.status_code, content=exc.as_dict())
+
+    def authorized(request: Request, authorization: str = Header(default="")) -> Iterator[Factory]:
+        scheme, _, token = authorization.partition(" ")
+        principal = factory.authenticate_principal(token) if scheme.lower() == "bearer" else None
+        if principal is None:
+            raise AuthorizationError("valid Bearer authentication is required")
+        admin_paths = {
+            "/v1/backups",
+            "/v1/federation/trust",
+            "/v1/federation/leases",
+        }
+        required_scope = (
+            "admin"
+            if request.url.path in admin_paths or request.url.path.startswith("/v1/tokens")
+            else "read"
+            if request.method == "GET"
+            else "write"
+        )
+        if not principal.allows(required_scope):
+            raise AuthorizationError(f"API token lacks {required_scope} scope")
+        service = Factory(paths, actor=principal.actor)
+        try:
+            yield service
+        finally:
+            service.close()
+
+    @app.get("/healthz")
+    def health() -> dict[str, Any]:
+        return {"status": "ok", "project": factory.project["metadata"]["name"]}
+
+    @app.get("/v1/doctor")
+    def doctor(service: Factory = Depends(authorized)) -> dict[str, Any]:
+        return service.doctor()
+
+    @app.get("/v1/schemas")
+    def schemas(_service: Factory = Depends(authorized)) -> dict[str, Any]:
+        return {"apiVersion": "omf.dev/v1alpha1", "kinds": default_registry.kinds}
+
+    @app.get("/v1/schemas/{kind}")
+    def schema(kind: str, _service: Factory = Depends(authorized)) -> dict[str, Any]:
+        return default_registry.schema_for(kind)
+
+    @app.get("/v1/resources")
+    def resources(
+        kind: str | None = Query(default=None),
+        limit: int = Query(default=100, ge=1, le=1000),
+        offset: int = Query(default=0, ge=0),
+        service: Factory = Depends(authorized),
+    ) -> list[dict[str, Any]]:
+        return service.list_resources(kind=kind)[offset : offset + limit]
+
+    @app.post("/v1/resources")
+    def apply_resource(
+        resource: dict[str, Any], service: Factory = Depends(authorized)
+    ) -> dict[str, Any]:
+        return service.apply_resource(resource)
+
+    @app.get("/v1/events")
+    def events(
+        run_id: str | None = None,
+        resource_uid: str | None = None,
+        event_type: str | None = None,
+        limit: int = Query(default=100, ge=1, le=1000),
+        offset: int = Query(default=0, ge=0),
+        service: Factory = Depends(authorized),
+    ) -> list[dict[str, Any]]:
+        values = [
+            event.as_dict()
+            for event in service.events.query(
+                run_id=run_id, resource_uid=resource_uid, type=event_type
+            )
+        ]
+        return values[offset : offset + limit]
+
+    @app.post("/v1/stores")
+    def add_store(request: StoreRequest, service: Factory = Depends(authorized)) -> dict[str, Any]:
+        return service.add_store(
+            request.name,
+            driver=request.driver,
+            endpoint=request.endpoint,
+            secret_ref=request.secret_ref,
+            plan=request.plan,
+        )
+
+    @app.post("/v1/data")
+    def add_data(request: DataRequest, service: Factory = Depends(authorized)) -> dict[str, Any]:
+        return service.add_data(
+            request.source,
+            name=request.name,
+            mode=request.mode,
+            rights=request.rights,
+            sample_schema=request.sample_schema,
+            cursor_policy=request.cursor_policy,
+        )
+
+    @app.get("/v1/data/{name}/verify")
+    def verify_data(name: str, service: Factory = Depends(authorized)) -> dict[str, Any]:
+        return {"name": name, "valid": service.verify_data(name)}
+
+    @app.post("/v1/sync")
+    def sync(request: SyncRequest, service: Factory = Depends(authorized)) -> dict[str, Any]:
+        return service.sync(
+            request.asset,
+            source=request.source,
+            destination=request.destination,
+            direction=request.direction,
+            concurrency=request.concurrency,
+            plan=request.plan,
+        )
+
+    @app.post("/v1/modules/validate")
+    def validate_module(
+        request: ModuleRequest, service: Factory = Depends(authorized)
+    ) -> dict[str, Any]:
+        return service.validate_module(paths.root / request.manifest)
+
+    @app.post("/v1/modules/test")
+    def test_module(
+        request: ModuleRequest, service: Factory = Depends(authorized)
+    ) -> dict[str, Any]:
+        return service.test_module(paths.root / request.manifest)
+
+    @app.post("/v1/runs")
+    def run(request: RunRequest, service: Factory = Depends(authorized)) -> dict[str, Any]:
+        return service.run(paths.root / request.workload, paths.root / request.binding)
+
+    @app.get("/v1/runs/{run_id}")
+    def run_status(run_id: str, service: Factory = Depends(authorized)) -> dict[str, Any]:
+        return service.run_status(run_id)
+
+    @app.post("/v1/evaluations")
+    def evaluate(
+        request: EvaluationRequest, service: Factory = Depends(authorized)
+    ) -> dict[str, Any]:
+        return service.evaluate(request.subject)
+
+    @app.post("/v1/releases")
+    def release(request: ReleaseRequest, service: Factory = Depends(authorized)) -> dict[str, Any]:
+        return service.create_release(
+            request.run_id,
+            name=request.name,
+            intended_use=request.intended_use,
+            limitations=request.limitations,
+            promote=request.promote,
+            alias=request.alias,
+            approvals=request.approvals,
+            vulnerability_report=(
+                paths.root / request.vulnerability_report if request.vulnerability_report else None
+            ),
+        )
+
+    @app.post("/v1/deployments")
+    def deploy(
+        request: DeploymentRequest, service: Factory = Depends(authorized)
+    ) -> dict[str, Any]:
+        return service.deploy(paths.root / request.manifest)
+
+    @app.get("/v1/deployments/{name}")
+    def deployment_status(name: str, service: Factory = Depends(authorized)) -> dict[str, Any]:
+        return service.deployment_status(name)
+
+    @app.post("/v1/deployments/{name}/cancel")
+    def deployment_cancel(name: str, service: Factory = Depends(authorized)) -> dict[str, Any]:
+        return service.cancel_deployment(name)
+
+    @app.post("/v1/deployments/{name}/rollback")
+    def deployment_rollback(
+        name: str,
+        request: DeploymentRollbackRequest,
+        service: Factory = Depends(authorized),
+    ) -> dict[str, Any]:
+        return service.rollback_deployment(name, expected_version=request.expected_version)
+
+    @app.get("/v1/lineage")
+    def lineage(
+        subject: str,
+        direction: str = "upstream",
+        max_depth: int = Query(default=100, ge=1, le=1000),
+        service: Factory = Depends(authorized),
+    ) -> list[dict[str, Any]]:
+        return service.lineage_query(subject, direction=direction, max_depth=max_depth)
+
+    @app.post("/v1/backups")
+    def backup(request: BackupRequest, service: Factory = Depends(authorized)) -> dict[str, Any]:
+        return service.backup(request.destination)
+
+    @app.post("/v1/conformance/reports")
+    def conformance_build(
+        request: ConformanceBuildRequest, service: Factory = Depends(authorized)
+    ) -> dict[str, Any]:
+        return service.create_conformance_report(
+            paths.root / request.evidence, paths.root / request.output
+        )
+
+    @app.post("/v1/conformance/verify")
+    def conformance_verify(
+        request: ConformanceVerifyRequest, service: Factory = Depends(authorized)
+    ) -> dict[str, Any]:
+        return service.verify_conformance_report(paths.root / request.report)
+
+    @app.post("/v1/tokens")
+    def token_create(
+        request: ApiTokenRequest, service: Factory = Depends(authorized)
+    ) -> dict[str, Any]:
+        token, principal = service.api_tokens.create(
+            actor=request.actor, scopes=request.scopes, expires_at=request.expires_at
+        )
+        return {
+            "token": token,
+            "tokenId": principal.token_id,
+            "actor": principal.actor,
+            "scopes": sorted(principal.scopes),
+            "expiresAt": principal.expires_at,
+        }
+
+    @app.get("/v1/tokens")
+    def token_list(service: Factory = Depends(authorized)) -> list[dict[str, Any]]:
+        return service.api_tokens.list()
+
+    @app.delete("/v1/tokens/{token_id}")
+    def token_revoke(token_id: str, service: Factory = Depends(authorized)) -> dict[str, Any]:
+        service.revoke_api_token(token_id)
+        return {"tokenId": token_id, "revoked": True}
+
+    @app.get("/v1/operations")
+    def operations(
+        state: str | None = None,
+        limit: int = Query(default=100, ge=1, le=1000),
+        offset: int = Query(default=0, ge=0),
+        service: Factory = Depends(authorized),
+    ) -> list[dict[str, Any]]:
+        return service.operations.list(state=state)[offset : offset + limit]
+
+    @app.get("/v1/operations/{operation_id}")
+    def operation(operation_id: str, service: Factory = Depends(authorized)) -> dict[str, Any]:
+        return service.operations.get(operation_id)
+
+    @app.post("/v1/federation/trust")
+    def federation_trust(
+        request: FederationTrustRequest, service: Factory = Depends(authorized)
+    ) -> dict[str, Any]:
+        service.federation.trust(request.peer_id, request.trust_bundle)
+        return {"peerId": request.peer_id, "trusted": True}
+
+    @app.get("/v1/federation/identity")
+    def federation_identity(service: Factory = Depends(authorized)) -> dict[str, str]:
+        return service.identity.export_trust_bundle()
+
+    @app.post("/v1/federation/leases")
+    def federation_lease(
+        request: FederationLeaseRequest, service: Factory = Depends(authorized)
+    ) -> dict[str, Any]:
+        lease = Lease(
+            request.lease_id,
+            request.peer_id,
+            request.expires_at,
+            request.policy_epoch,
+        )
+        service.federation.issue_lease(lease)
+        return asdict(lease)
+
+    @app.post("/v1/federation/reconcile")
+    def federation_reconcile(
+        request: FederationEventRequest, service: Factory = Depends(authorized)
+    ) -> dict[str, Any]:
+        accepted = service.federation.reconcile(FederatedEvent(**request.model_dump()))
+        return {"accepted": accepted, "eventId": request.event_id}
+
+    @app.post("/v1/federation/events")
+    def federation_emit(
+        request: FederationEmitRequest, service: Factory = Depends(authorized)
+    ) -> dict[str, Any]:
+        return asdict(
+            service.federation.emit(
+                request.peer_id,
+                request.lease_id,
+                request.kind,
+                request.resource,
+                request.content,
+            )
+        )
+
+    @app.get("/v1/federation/outbox")
+    def federation_outbox(
+        peer_id: str | None = None, service: Factory = Depends(authorized)
+    ) -> list[dict[str, Any]]:
+        return [asdict(event) for event in service.federation.pending(peer_id)]
+
+    @app.post("/v1/federation/outbox/published")
+    def federation_published(
+        request: FederationPublishRequest, service: Factory = Depends(authorized)
+    ) -> dict[str, Any]:
+        service.federation.mark_published(request.peer_id, request.event_id)
+        return {"peerId": request.peer_id, "eventId": request.event_id, "published": True}
+
+    @app.post("/v1/capacity/place")
+    def capacity_place(
+        request: PlacementRequest, _service: Factory = Depends(authorized)
+    ) -> dict[str, Any]:
+        offer = FederationBroker.place(
+            [
+                CapacityOffer(
+                    item.peer_id,
+                    frozenset(item.labels),
+                    item.capacity,
+                    item.policy_epoch,
+                )
+                for item in request.offers
+            ],
+            required_labels=request.required_labels,
+            residency=request.residency,
+            resource=request.resource,
+            amount=request.amount,
+        )
+        return asdict(offer)
+
+    return app
+
+
+def app_from_directory(project: str | Path) -> FastAPI:
+    return create_app(ProjectPaths(Path(project).resolve()))

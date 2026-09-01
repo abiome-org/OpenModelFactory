@@ -1,0 +1,687 @@
+"""Command-line interface for the Open Model Factory."""
+
+from __future__ import annotations
+
+import json
+from collections.abc import Iterator
+from contextlib import contextmanager
+from dataclasses import asdict
+from pathlib import Path
+from typing import Any
+
+import typer
+import uvicorn
+import yaml
+from rich.console import Console
+
+from omf import __version__
+from omf.api import create_app
+from omf.config import ProjectPaths, discover_project
+from omf.config import bootstrap as bootstrap_project
+from omf.errors import OMFError
+from omf.factory import Factory
+from omf.federation import CapacityOffer, FederatedEvent, FederationBroker, Lease
+from omf.schema_registry import default_registry
+
+app = typer.Typer(no_args_is_help=True, pretty_exceptions_show_locals=False)
+module_app = typer.Typer(no_args_is_help=True)
+data_app = typer.Typer(no_args_is_help=True)
+store_app = typer.Typer(no_args_is_help=True)
+sync_app = typer.Typer(no_args_is_help=True)
+resource_app = typer.Typer(no_args_is_help=True)
+schema_app = typer.Typer(no_args_is_help=True)
+runs_app = typer.Typer(no_args_is_help=True)
+lineage_app = typer.Typer(no_args_is_help=True)
+secret_app = typer.Typer(no_args_is_help=True)
+api_app = typer.Typer(no_args_is_help=True)
+release_app = typer.Typer(no_args_is_help=True)
+deployment_app = typer.Typer(no_args_is_help=True)
+federation_app = typer.Typer(no_args_is_help=True)
+capacity_app = typer.Typer(no_args_is_help=True)
+operation_app = typer.Typer(no_args_is_help=True)
+token_app = typer.Typer(no_args_is_help=True)
+conformance_app = typer.Typer(no_args_is_help=True)
+
+app.add_typer(module_app, name="module")
+app.add_typer(data_app, name="data")
+app.add_typer(store_app, name="store")
+app.add_typer(sync_app, name="sync")
+app.add_typer(resource_app, name="resource")
+app.add_typer(schema_app, name="schema")
+app.add_typer(runs_app, name="runs")
+app.add_typer(lineage_app, name="lineage")
+app.add_typer(secret_app, name="secret")
+app.add_typer(api_app, name="api")
+app.add_typer(release_app, name="release")
+app.add_typer(deployment_app, name="deployment")
+app.add_typer(federation_app, name="federation")
+app.add_typer(capacity_app, name="capacity")
+app.add_typer(operation_app, name="operation")
+app.add_typer(token_app, name="token")
+app.add_typer(conformance_app, name="conformance")
+
+console = Console(stderr=False)
+
+
+class State:
+    project: Path | None = None
+    output: str = "table"
+    actor: str = "local-user"
+
+
+state = State()
+
+
+def _version(value: bool) -> None:
+    if value:
+        typer.echo(__version__)
+        raise typer.Exit()
+
+
+@app.callback()
+def main(
+    project: Path | None = typer.Option(None, "--project", "-p", help="OMF project directory"),
+    output: str = typer.Option("table", "--output", "-o", help="table, json, or yaml"),
+    actor: str = typer.Option("local-user", "--actor", help="Attributable local actor"),
+    version: bool = typer.Option(False, "--version", callback=_version, is_eager=True),
+) -> None:
+    """Open, model-neutral, local-to-federated model lifecycle platform."""
+    del version
+    if output not in {"table", "json", "yaml"}:
+        raise typer.BadParameter("output must be table, json, or yaml")
+    state.project, state.output, state.actor = project, output, actor
+
+
+def _paths() -> ProjectPaths:
+    return discover_project(state.project)
+
+
+@contextmanager
+def _factory() -> Iterator[Factory]:
+    factory = Factory(_paths(), actor=state.actor)
+    try:
+        yield factory
+    finally:
+        factory.close()
+
+
+def _emit(value: Any) -> None:
+    if state.output == "json":
+        typer.echo(json.dumps(value, sort_keys=True, indent=2, default=str))
+    elif state.output == "yaml":
+        typer.echo(yaml.safe_dump(value, sort_keys=True), nl=False)
+    elif isinstance(value, dict):
+        for key, item in value.items():
+            console.print(f"[bold]{key}[/bold]: {item}")
+    else:
+        console.print(value)
+
+
+def _load_value(path: Path) -> Any:
+    return yaml.safe_load(path.read_text())
+
+
+def _handle(function: Any) -> None:
+    try:
+        _emit(function())
+    except OMFError as exc:
+        if state.output in {"json", "yaml"}:
+            _emit(exc.as_dict())
+        else:
+            console.print(f"[red]{exc.code}[/red]: {exc.message}")
+            if exc.details:
+                console.print(exc.details)
+        raise typer.Exit(code=1) from exc
+
+
+@app.command()
+def bootstrap(
+    profile: str = typer.Option("local", help="Bootstrap profile"),
+    plan: bool = typer.Option(False, "--plan", "--dry-run", help="Show changes only"),
+) -> None:
+    """Create or reconcile a complete repository-scoped factory profile."""
+    _handle(lambda: bootstrap_project(_paths(), profile=profile, plan=plan))
+
+
+@app.command()
+def doctor() -> None:
+    """Validate the host, project, storage, identity, and recovery prerequisites."""
+
+    def run() -> dict[str, Any]:
+        with _factory() as factory:
+            return factory.doctor()
+
+    _handle(run)
+
+
+@schema_app.command("list")
+def schema_list() -> None:
+    _emit({"apiVersion": "omf.dev/v1alpha1", "kinds": default_registry.kinds})
+
+
+@schema_app.command("show")
+def schema_show(kind: str) -> None:
+    _handle(lambda: default_registry.schema_for(kind))
+
+
+@schema_app.command("validate")
+def schema_validate(path: Path) -> None:
+    _handle(lambda: default_registry.load(path))
+
+
+@resource_app.command("apply")
+def resource_apply(path: Path) -> None:
+    def run() -> dict[str, Any]:
+        with _factory() as factory:
+            return factory.apply_resource_file(path)
+
+    _handle(run)
+
+
+@resource_app.command("list")
+def resource_list(kind: str | None = typer.Option(None)) -> None:
+    def run() -> list[dict[str, Any]]:
+        with _factory() as factory:
+            return factory.list_resources(kind=kind)
+
+    _handle(run)
+
+
+def _module_paths(path: Path | None) -> list[Path]:
+    if path is not None:
+        return [path]
+    paths = sorted(_paths().root.glob("modules/**/module.yaml"))
+    if not paths:
+        raise typer.BadParameter("no modules/**/module.yaml manifests found")
+    return paths
+
+
+@module_app.command("validate")
+def module_validate(path: Path | None = typer.Argument(None)) -> None:
+    def run() -> list[dict[str, Any]]:
+        with _factory() as factory:
+            return [factory.validate_module(item) for item in _module_paths(path)]
+
+    _handle(run)
+
+
+@module_app.command("test")
+def module_test(path: Path | None = typer.Argument(None)) -> None:
+    def run() -> list[dict[str, Any]]:
+        with _factory() as factory:
+            return [factory.test_module(item) for item in _module_paths(path)]
+
+    _handle(run)
+
+
+@data_app.command("add")
+def data_add(
+    source: str,
+    name: str = typer.Option(..., "--name"),
+    mode: str = typer.Option("copy", "--mode"),
+    sample_schema: str = typer.Option("application/octet-stream", "--sample-schema"),
+    cursor: str | None = typer.Option(None, "--cursor"),
+    rights: Path | None = typer.Option(None, "--rights", help="YAML/JSON rights declaration"),
+) -> None:
+    def run() -> dict[str, Any]:
+        rights_value: dict[str, Any] | None = None
+        if rights is not None:
+            loaded = yaml.safe_load(rights.read_text())
+            if not isinstance(loaded, dict):
+                raise typer.BadParameter("--rights must contain a YAML/JSON object")
+            rights_value = loaded
+        with _factory() as factory:
+            return factory.add_data(
+                source,
+                name=name,
+                mode=mode,
+                rights=rights_value,
+                sample_schema=sample_schema,
+                cursor_policy={"cursor": cursor} if cursor else None,
+            )
+
+    _handle(run)
+
+
+@data_app.command("list")
+def data_list() -> None:
+    def run() -> list[dict[str, Any]]:
+        with _factory() as factory:
+            return factory.list_resources(kind="DatasetSnapshot")
+
+    _handle(run)
+
+
+@data_app.command("verify")
+def data_verify(name: str) -> None:
+    def run() -> dict[str, Any]:
+        with _factory() as factory:
+            return {"name": name, "valid": factory.verify_data(name)}
+
+    _handle(run)
+
+
+@store_app.command("add")
+def store_add(
+    name: str,
+    driver: str = typer.Option(..., "--driver"),
+    endpoint: str = typer.Option(..., "--endpoint"),
+    secret_ref: str | None = typer.Option(None, "--secret-ref"),
+    plan: bool = typer.Option(False, "--plan", "--dry-run"),
+) -> None:
+    def run() -> dict[str, Any]:
+        with _factory() as factory:
+            return factory.add_store(
+                name,
+                driver=driver,
+                endpoint=endpoint,
+                secret_ref=secret_ref,
+                plan=plan,
+            )
+
+    _handle(run)
+
+
+@store_app.command("list")
+def store_list() -> None:
+    def run() -> list[dict[str, Any]]:
+        with _factory() as factory:
+            return factory.list_resources(kind="ArtifactStore")
+
+    _handle(run)
+
+
+def _sync(
+    asset: str,
+    source: str,
+    destination: str,
+    direction: str,
+    concurrency: int,
+    plan: bool,
+) -> dict[str, Any]:
+    with _factory() as factory:
+        return factory.sync(
+            asset,
+            source=source,
+            destination=destination,
+            direction=direction,
+            concurrency=concurrency,
+            plan=plan,
+        )
+
+
+@sync_app.command("push")
+def sync_push(
+    asset: str,
+    destination: str = typer.Option(..., "--to"),
+    source: str = typer.Option("local", "--from"),
+    concurrency: int = typer.Option(4, min=1, max=256),
+    plan: bool = typer.Option(False, "--plan", "--dry-run"),
+) -> None:
+    _handle(lambda: _sync(asset, source, destination, "push", concurrency, plan))
+
+
+@sync_app.command("pull")
+def sync_pull(
+    asset: str,
+    source: str = typer.Option(..., "--from"),
+    destination: str = typer.Option("local", "--to"),
+    concurrency: int = typer.Option(4, min=1, max=256),
+    plan: bool = typer.Option(False, "--plan", "--dry-run"),
+) -> None:
+    _handle(lambda: _sync(asset, destination, source, "pull", concurrency, plan))
+
+
+@app.command("run")
+def run_workload(
+    workload: Path,
+    binding: Path = typer.Option(Path("bindings/local.yaml"), "--binding"),
+) -> None:
+    def run() -> dict[str, Any]:
+        with _factory() as factory:
+            return factory.run(workload, binding)
+
+    _handle(run)
+
+
+@runs_app.command("status")
+def runs_status(run_id: str) -> None:
+    def run() -> dict[str, Any]:
+        with _factory() as factory:
+            return factory.run_status(run_id.removeprefix("run/"))
+
+    _handle(run)
+
+
+@app.command("evaluate")
+def evaluate(subject: str) -> None:
+    """Materialize or inspect immutable evaluation evidence for a run."""
+
+    def run() -> dict[str, Any]:
+        with _factory() as factory:
+            return factory.evaluate(subject)
+
+    _handle(run)
+
+
+@release_app.command("create")
+def release_create(
+    run_id: str,
+    name: str = typer.Option(..., "--name"),
+    intended_use: str = typer.Option(..., "--intended-use"),
+    limitation: list[str] | None = typer.Option(None, "--limitation"),
+    promote: bool = typer.Option(False, "--promote"),
+    alias: str = typer.Option("candidate", "--alias"),
+    approval: list[str] | None = typer.Option(None, "--approval"),
+    vulnerability_report: Path | None = typer.Option(None, "--vulnerability-report"),
+) -> None:
+    def run() -> dict[str, Any]:
+        with _factory() as factory:
+            return factory.create_release(
+                run_id,
+                name=name,
+                intended_use=intended_use,
+                limitations=limitation,
+                promote=promote,
+                alias=alias,
+                approvals=approval,
+                vulnerability_report=vulnerability_report,
+            )
+
+    _handle(run)
+
+
+@app.command("deploy")
+def deploy(path: Path) -> None:
+    """Policy-check and apply a deployment resource."""
+
+    def run() -> dict[str, Any]:
+        with _factory() as factory:
+            return factory.deploy(path)
+
+    _handle(run)
+
+
+@deployment_app.command("status")
+def deployment_status(name: str) -> None:
+    def run() -> dict[str, Any]:
+        with _factory() as factory:
+            return factory.deployment_status(name)
+
+    _handle(run)
+
+
+@deployment_app.command("cancel")
+def deployment_cancel(name: str) -> None:
+    def run() -> dict[str, Any]:
+        with _factory() as factory:
+            return factory.cancel_deployment(name)
+
+    _handle(run)
+
+
+@deployment_app.command("rollback")
+def deployment_rollback(
+    name: str, expected_version: int = typer.Option(..., "--expected-version", min=1)
+) -> None:
+    def run() -> dict[str, Any]:
+        with _factory() as factory:
+            return factory.rollback_deployment(name, expected_version=expected_version)
+
+    _handle(run)
+
+
+@federation_app.command("identity")
+def federation_identity() -> None:
+    def run() -> dict[str, str]:
+        with _factory() as factory:
+            return factory.identity.export_trust_bundle()
+
+    _handle(run)
+
+
+@federation_app.command("trust")
+def federation_trust(peer_id: str, bundle: Path) -> None:
+    def run() -> dict[str, Any]:
+        value = _load_value(bundle)
+        if not isinstance(value, dict):
+            raise typer.BadParameter("trust bundle must be an object")
+        with _factory() as factory:
+            factory.federation.trust(peer_id, {str(key): str(item) for key, item in value.items()})
+        return {"peerId": peer_id, "trusted": True}
+
+    _handle(run)
+
+
+@federation_app.command("lease")
+def federation_lease(
+    peer_id: str,
+    lease_id: str = typer.Option(..., "--lease-id"),
+    expires_at: str = typer.Option(..., "--expires-at"),
+    policy_epoch: int = typer.Option(1, "--policy-epoch", min=1),
+) -> None:
+    def run() -> dict[str, Any]:
+        lease = Lease(lease_id, peer_id, expires_at, policy_epoch)
+        with _factory() as factory:
+            factory.federation.issue_lease(lease)
+        return asdict(lease)
+
+    _handle(run)
+
+
+@federation_app.command("emit")
+def federation_emit(
+    peer_id: str,
+    content: Path = typer.Option(..., "--content"),
+    lease_id: str = typer.Option(..., "--lease-id"),
+    kind: str = typer.Option(..., "--kind"),
+    resource: str = typer.Option(..., "--resource"),
+) -> None:
+    def run() -> dict[str, Any]:
+        with _factory() as factory:
+            return asdict(
+                factory.federation.emit(peer_id, lease_id, kind, resource, _load_value(content))
+            )
+
+    _handle(run)
+
+
+@federation_app.command("reconcile")
+def federation_reconcile(event: Path) -> None:
+    def run() -> dict[str, Any]:
+        value = _load_value(event)
+        if not isinstance(value, dict):
+            raise typer.BadParameter("federated event must be an object")
+        item = FederatedEvent(**value)
+        with _factory() as factory:
+            return {"eventId": item.event_id, "accepted": factory.federation.reconcile(item)}
+
+    _handle(run)
+
+
+@federation_app.command("outbox")
+def federation_outbox(peer_id: str | None = typer.Option(None, "--peer-id")) -> None:
+    def run() -> list[dict[str, Any]]:
+        with _factory() as factory:
+            return [asdict(event) for event in factory.federation.pending(peer_id)]
+
+    _handle(run)
+
+
+@federation_app.command("published")
+def federation_published(peer_id: str, event_id: str) -> None:
+    def run() -> dict[str, Any]:
+        with _factory() as factory:
+            factory.federation.mark_published(peer_id, event_id)
+        return {"peerId": peer_id, "eventId": event_id, "published": True}
+
+    _handle(run)
+
+
+@capacity_app.command("place")
+def capacity_place(
+    offers: Path,
+    residency: str = typer.Option(..., "--residency"),
+    resource: str = typer.Option(..., "--resource"),
+    amount: int = typer.Option(1, "--amount", min=1),
+    required_label: list[str] | None = typer.Option(None, "--required-label"),
+) -> None:
+    def run() -> dict[str, Any]:
+        values = _load_value(offers)
+        if not isinstance(values, list) or any(not isinstance(item, dict) for item in values):
+            raise typer.BadParameter("offers must be an array of objects")
+        candidates = [
+            CapacityOffer(
+                str(item["peer_id"]),
+                frozenset(str(label) for label in item.get("labels", [])),
+                {str(key): int(value) for key, value in item.get("capacity", {}).items()},
+                int(item.get("policy_epoch", 1)),
+            )
+            for item in values
+        ]
+        return asdict(
+            FederationBroker.place(
+                candidates,
+                required_labels=set(required_label or []),
+                residency=residency,
+                resource=resource,
+                amount=amount,
+            )
+        )
+
+    _handle(run)
+
+
+@operation_app.command("list")
+def operation_list(state_filter: str | None = typer.Option(None, "--state")) -> None:
+    def run() -> list[dict[str, Any]]:
+        with _factory() as factory:
+            return factory.operations.list(state=state_filter)
+
+    _handle(run)
+
+
+@operation_app.command("get")
+def operation_get(operation_id: str) -> None:
+    def run() -> dict[str, Any]:
+        with _factory() as factory:
+            return factory.operations.get(operation_id)
+
+    _handle(run)
+
+
+@token_app.command("create")
+def token_create(
+    actor: str = typer.Option(..., "--actor"),
+    scope: list[str] | None = typer.Option(None, "--scope"),
+    expires_at: str | None = typer.Option(None, "--expires-at"),
+) -> None:
+    """Create an attributable API credential; the token is returned only once."""
+
+    def run() -> dict[str, Any]:
+        with _factory() as factory:
+            token, principal = factory.api_tokens.create(
+                actor=actor, scopes=set(scope or ["read"]), expires_at=expires_at
+            )
+        return {
+            "token": token,
+            "tokenId": principal.token_id,
+            "actor": principal.actor,
+            "scopes": sorted(principal.scopes),
+            "expiresAt": principal.expires_at,
+        }
+
+    _handle(run)
+
+
+@token_app.command("list")
+def token_list() -> None:
+    def run() -> list[dict[str, Any]]:
+        with _factory() as factory:
+            return factory.api_tokens.list()
+
+    _handle(run)
+
+
+@token_app.command("revoke")
+def token_revoke(token_id: str) -> None:
+    def run() -> dict[str, Any]:
+        with _factory() as factory:
+            factory.revoke_api_token(token_id)
+        return {"tokenId": token_id, "revoked": True}
+
+    _handle(run)
+
+
+@conformance_app.command("build")
+def conformance_build(evidence: Path, output: Path = typer.Option(..., "--output")) -> None:
+    """Build, sign, and commit a conservative report from measured scenario evidence."""
+
+    def run() -> dict[str, Any]:
+        with _factory() as factory:
+            return factory.create_conformance_report(evidence, output)
+
+    _handle(run)
+
+
+@conformance_app.command("verify")
+def conformance_verify(report: Path) -> None:
+    def run() -> dict[str, Any]:
+        with _factory() as factory:
+            return factory.verify_conformance_report(report)
+
+    _handle(run)
+
+
+@lineage_app.command("show")
+def lineage_show(
+    subject: str,
+    direction: str = typer.Option("upstream"),
+    max_depth: int = typer.Option(100, min=1, max=1000),
+) -> None:
+    def run() -> list[dict[str, Any]]:
+        with _factory() as factory:
+            return factory.lineage_query(subject, direction=direction, max_depth=max_depth)
+
+    _handle(run)
+
+
+@secret_app.command("set")
+def secret_set(name: str, purpose: str = typer.Option(...), value: str = typer.Option(...)) -> None:
+    def run() -> dict[str, Any]:
+        with _factory() as factory:
+            version = factory.secrets.put(name, value, purpose)
+            return {"name": name, "purpose": purpose, "version": version}
+
+    _handle(run)
+
+
+@secret_app.command("list")
+def secret_list() -> None:
+    def run() -> list[dict[str, Any]]:
+        with _factory() as factory:
+            return factory.secrets.list()
+
+    _handle(run)
+
+
+@app.command("backup")
+def backup(destination: Path) -> None:
+    def run() -> dict[str, Any]:
+        with _factory() as factory:
+            return factory.backup(destination)
+
+    _handle(run)
+
+
+@api_app.command("serve")
+def api_serve(
+    host: str = typer.Option("127.0.0.1"),
+    port: int = typer.Option(8080, min=1, max=65535),
+) -> None:
+    """Run the authenticated HTTP API. Keep it behind site TLS when exposed."""
+    uvicorn.run(create_app(_paths()), host=host, port=port, log_level="info")
+
+
+if __name__ == "__main__":
+    app()

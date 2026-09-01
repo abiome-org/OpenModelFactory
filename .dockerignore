@@ -1,0 +1,14 @@
+.git
+.omf
+.venv
+__pycache__
+*.pyc
+.coverage
+htmlcov
+dist
+build
+.mypy_cache
+.pytest_cache
+.ruff_cache
+data/incoming
+data/payloads

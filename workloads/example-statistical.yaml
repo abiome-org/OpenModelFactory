@@ -1,0 +1,27 @@
+stages:
+  - name: train
+    module: modules/examples/statistical/module.yaml
+    operation: run
+    inputs:
+      dataset: dataset/example-numbers
+    config:
+      action: train
+    outputs:
+      - mean
+      - count
+      - model
+  - name: evaluate
+    needs:
+      - train
+    module: modules/examples/statistical/module.yaml
+    operation: run
+    inputs:
+      mean: train.mean
+    config:
+      action: evaluate
+      expected: 3.0
+      tolerance: 0.0
+    outputs:
+      - passed
+      - absoluteError
+      - evaluation

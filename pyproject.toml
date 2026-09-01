@@ -1,0 +1,102 @@
+[build-system]
+requires = ["hatchling>=1.27,<2"]
+build-backend = "hatchling.build"
+
+[project]
+name = "open-model-factory"
+version = "0.1.0"
+description = "Open, model-neutral, local-to-federated model lifecycle platform"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { file = "LICENSE" }
+authors = [{ name = "Open Model Factory contributors" }]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Environment :: Console",
+  "Framework :: FastAPI",
+  "License :: OSI Approved :: Apache Software License",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+  "cryptography>=45.0,<47",
+  "fastapi>=0.116,<1",
+  "httpx>=0.28,<1",
+  "jsonschema>=4.25,<5",
+  "pydantic>=2.11,<3",
+  "PyYAML>=6.0,<7",
+  "rfc8785>=0.1,<1",
+  "typer>=0.16,<1",
+  "uvicorn>=0.35,<1",
+]
+
+[project.optional-dependencies]
+s3 = ["boto3>=1.40,<2"]
+telemetry = [
+  "opentelemetry-api>=1.36,<2",
+  "opentelemetry-sdk>=1.36,<2",
+  "opentelemetry-exporter-otlp-proto-http>=1.36,<2",
+]
+dev = [
+  "build>=1.3,<2",
+  "mypy>=1.17,<2",
+  "pytest>=8.4,<10",
+  "pytest-cov>=6.2,<8",
+  "ruff>=0.12,<1",
+  "types-jsonschema>=4.25,<5",
+  "types-PyYAML>=6.0,<7",
+]
+
+[project.scripts]
+omf = "omf.cli:app"
+
+[project.urls]
+Documentation = "https://github.com/abiome/OpenModelFactory"
+Repository = "https://github.com/abiome/OpenModelFactory"
+Issues = "https://github.com/abiome/OpenModelFactory/issues"
+
+[tool.hatch.build.targets.wheel]
+packages = ["factory/omf"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+  "/factory",
+  "/schemas",
+  "/README.md",
+  "/SPEC.md",
+  "/LICENSE",
+]
+
+[tool.pytest.ini_options]
+addopts = "-ra --strict-config --strict-markers"
+testpaths = ["tests"]
+
+[tool.coverage.run]
+branch = true
+source = ["omf"]
+# This worker is exercised as a real child process by executor integration tests.
+omit = ["*/executors/local_worker.py"]
+
+[tool.coverage.report]
+fail_under = 85
+show_missing = true
+skip_covered = true
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "A", "C4", "DTZ", "ISC", "PIE", "PT", "RUF", "SIM"]
+ignore = ["ISC001"]
+
+[tool.ruff.lint.per-file-ignores]
+"factory/omf/api.py" = ["B008"]
+"factory/omf/cli.py" = ["B008"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+packages = ["omf"]

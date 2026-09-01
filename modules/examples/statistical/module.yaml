@@ -1,0 +1,29 @@
+kind: trainer
+code_root: .
+argv:
+  - python3
+  - main.py
+schemas:
+  input: omf.example.numeric/v1
+  output: omf.example.statistical-model/v1
+capabilities:
+  - cpu
+platforms:
+  - linux
+  - darwin
+resources:
+  cpu_seconds: 30
+  address_space: 536870912
+  timeout_seconds: 30
+determinism: bitwise
+checkpoint: true
+side_effects:
+  - declared-artifact-write
+concurrency: 1
+secrets: []
+network: []
+fixtures:
+  - request:
+      operation: validate
+    result:
+      status: ok
