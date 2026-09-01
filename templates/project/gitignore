@@ -1,0 +1,28 @@
+# BEGIN OMF MANAGED IGNORE
+# OMF runtime, local environments, and ungoverned payload ingress
+.omf/
+.omf-venvs/
+.venv
+.venv/
+.venv.omf-link-*
+.venv.omf-old-*/
+data/payloads/
+data/incoming/
+
+# Local credentials and environment
+.env
+.env.*
+!.env.example
+*.secret
+*.key
+*.pem
+
+# Python execution caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+# END OMF MANAGED IGNORE

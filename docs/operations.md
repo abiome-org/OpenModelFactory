@@ -2,13 +2,37 @@
 
 ## Install and bootstrap
 
-Use Python 3.11 or 3.12 in an isolated environment:
+Use the directory installer for a new or existing project. Inspect its complete
+plan before allowing package downloads or local state creation:
+
+```sh
+./install.sh --plan /path/to/model-project
+./install.sh /path/to/model-project
+. /path/to/model-project/.venv/bin/activate
+omf --project /path/to/model-project --output json agent context
+```
+
+The installer preserves existing manifests and appends rather than replaces an
+existing `AGENTS.md` or `.gitignore`. It creates missing local desired state,
+initializes Git only when needed, prints and applies the bootstrap plan, then
+requires `omf doctor` and bounded agent context to succeed. Reinstallation
+builds a fresh environment from the selected base interpreter and atomically
+replaces only a `.venv` carrying the OMF installer marker; an unrelated
+pre-existing `.venv` is rejected rather than executed or overwritten. Pip may
+use the configured package index only for hash-locked binary runtime and build
+dependencies; OMF itself builds without an isolated backend download. The plan
+discloses that network effect. OMF creates no hosted account, uploads no project
+metadata, and leaves call-home telemetry disabled.
+
+For a manual development installation, use Python 3.11 or 3.12 in an isolated
+environment:
 
 ```sh
 python3 -m venv .venv
 . .venv/bin/activate
-python -m pip install --require-hashes -r requirements.runtime.lock
-python -m pip install --no-deps -e .
+python -m pip install --only-binary=:all: --require-hashes -r requirements.lock
+python -m pip install --only-binary=:all: --require-hashes -r requirements.build.lock
+python -m pip install --no-build-isolation --no-deps -e .
 omf bootstrap
 omf doctor
 ```

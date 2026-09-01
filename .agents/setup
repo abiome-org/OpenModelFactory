@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
+cd -- "$repo_root"
+
+export PIP_DISABLE_PIP_VERSION_CHECK=1
+export PIP_NO_INPUT=1
+
+started=$SECONDS
+printf '[setup] checking Python version\n'
+python3 - <<'PY'
+import sys
+
+if sys.version_info < (3, 11):
+    raise SystemExit("Open Model Factory requires Python 3.11 or newer")
+PY
+
+printf '[setup] installing locked runtime dependencies\n'
+python3 -m pip install --quiet --only-binary=:all: --require-hashes -r requirements.lock
+
+printf '[setup] installing locked build and development dependencies\n'
+python3 -m pip install --quiet --only-binary=:all: --require-hashes -r requirements.build.lock
+
+printf '[setup] installing Open Model Factory in editable mode\n'
+python3 -m pip install --quiet --no-build-isolation --no-deps -e .
+
+printf '[setup] ready in %ss\n' "$((SECONDS - started))"

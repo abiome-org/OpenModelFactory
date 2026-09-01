@@ -549,6 +549,17 @@ deployments/
 - Raw data and secret files MUST be ignored by default. A user may explicitly
   version a small non-sensitive fixture.
 
+The reference distribution MUST provide a non-destructive directory installer.
+Before mutation it MUST disclose target, downloads, local state, and bootstrap
+effects. Installation MUST preserve existing manifests and guidance, generate
+only missing desired-state files, install a locked isolated runtime, initialize
+repository-scoped state through the normal bootstrap contract, and fail unless
+readiness and agent context are available. It MUST install or merge a root
+`AGENTS.md` operator guide that teaches the evidence loop, attributable actions,
+planning and provider preflight, verification, accumulated knowledge, policy
+gates, and secret/payload boundaries. Repeated installation MUST not duplicate
+managed guidance or change existing desired state.
+
 The repository MUST remain relocatable: cloning it into a different absolute
 path cannot change resource identity or require manifest edits. A clean clone
 plus authorized access to declared stores MUST reconstruct every retained

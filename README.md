@@ -40,13 +40,44 @@ test has run on at least 1,024 actual accelerators.
 - [Executor provider guide](docs/executors.md) — portable workload boundary,
   plugin contract, backend guidance, and conformance checklist.
 
-## Install
+## Install into a directory
+
+After cloning this distribution, inspect the non-mutating plan and install it
+into the clone or another project directory:
+
+```sh
+./install.sh --plan /path/to/model-project
+./install.sh /path/to/model-project
+cd /path/to/model-project
+. .venv/bin/activate
+omf --output json agent context
+```
+
+The installer requires Python 3.11 or newer. It creates an isolated `.venv`,
+installs hash-locked runtime dependencies and this exact OMF source, and on
+reinstall atomically rebuilds only a `.venv` previously marked as OMF-managed.
+It generates only missing project manifests and workspace directories,
+initializes Git when needed, plans and applies local bootstrap, and verifies
+both `omf doctor` and the agent context. It never overwrites existing manifests
+or an unrelated pre-existing `.venv`. Existing `AGENTS.md` and `.gitignore`
+files are preserved and receive one idempotent, managed OMF section.
+
+For the most self-contained, directly editable workspace, clone this repository
+at the desired project path and run `./install.sh .`. The installed
+`AGENTS.md` section is an operator runbook for agents: observe, state intent,
+plan/preflight, execute, verify evidence, and accrete knowledge. It is ordinary
+Markdown in the uppercase root location defined by the
+[AGENTS.md standard](https://agents.md/); nearest nested guides can specialize
+subtrees.
+
+## Manual development install
 
 ```sh
 python3 -m venv .venv
 . .venv/bin/activate
-python -m pip install --require-hashes -r requirements.lock
-python -m pip install --no-deps -e .
+python -m pip install --only-binary=:all: --require-hashes -r requirements.lock
+python -m pip install --only-binary=:all: --require-hashes -r requirements.build.lock
+python -m pip install --no-build-isolation --no-deps -e .
 omf bootstrap
 omf doctor
 ```

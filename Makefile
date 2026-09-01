@@ -1,8 +1,9 @@
 .PHONY: install format lint typecheck test test-all build
 
 install:
-	python3 -m pip install --require-hashes -r requirements.lock
-	python3 -m pip install --no-deps -e .
+	python3 -m pip install --only-binary=:all: --require-hashes -r requirements.lock
+	python3 -m pip install --only-binary=:all: --require-hashes -r requirements.build.lock
+	python3 -m pip install --no-build-isolation --no-deps -e .
 
 format:
 	python3 -m ruff format factory tests modules/examples
@@ -21,4 +22,4 @@ test:
 test-all: lint typecheck test
 
 build:
-	python3 -m build
+	python3 -m build --no-isolation

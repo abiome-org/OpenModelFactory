@@ -62,11 +62,17 @@ packages = ["factory/omf"]
 
 [tool.hatch.build.targets.sdist]
 include = [
+  "/AGENTS.md",
   "/factory",
   "/docs",
-  "/schemas",
+  "/install.sh",
   "/README.md",
+  "/requirements.build.in",
+  "/requirements.build.lock",
+  "/requirements.lock",
+  "/requirements.runtime.lock",
   "/SPEC.md",
+  "/templates",
   "/LICENSE",
 ]
 

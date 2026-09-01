@@ -1,0 +1,509 @@
+import os
+import stat
+import subprocess
+import sys
+from pathlib import Path
+
+import pytest
+from omf.install_support import main as install_support_main
+from omf.install_support import render_template, upsert_managed_section, validate_managed_file
+from omf.schema_registry import SchemaRegistry
+
+AGENTS_BEGIN = "<!-- BEGIN OMF OPERATOR GUIDE -->"
+AGENTS_END = "<!-- END OMF OPERATOR GUIDE -->"
+IGNORE_BEGIN = "# BEGIN OMF MANAGED IGNORE"
+IGNORE_END = "# END OMF MANAGED IGNORE"
+
+
+def test_install_script_help_and_plan_are_non_mutating(tmp_path):
+    assert Path("install.sh").stat().st_mode & stat.S_IXUSR
+    help_result = subprocess.run(
+        ["bash", "install.sh", "--help"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert "--plan" in help_result.stdout
+    assert "AGENTS.md" in help_result.stdout
+
+    target = tmp_path / "My Model Project"
+    plan = subprocess.run(
+        ["bash", "install.sh", "--plan", str(target)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert f"target: {target}" in plan.stdout
+    assert "project name if created: my-model-project" in plan.stdout
+    assert "No changes made." in plan.stdout
+    assert not target.exists()
+
+
+def test_install_script_rejects_invalid_project_name(tmp_path):
+    result = subprocess.run(
+        ["bash", "install.sh", "--plan", "--name", "Not Valid", str(tmp_path / "target")],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 1
+    assert "project name must satisfy" in result.stderr
+    assert not (tmp_path / "target").exists()
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        "<!-- BEGIN OMF OPERATOR GUIDE -->\n",
+        "<!-- END OMF OPERATOR GUIDE -->\n",
+        (
+            "<!-- BEGIN OMF OPERATOR GUIDE -->\n"
+            "<!-- END OMF OPERATOR GUIDE -->\n"
+            "<!-- BEGIN OMF OPERATOR GUIDE -->\n"
+            "<!-- END OMF OPERATOR GUIDE -->\n"
+        ),
+        ("> <!-- BEGIN OMF OPERATOR GUIDE -->\n> <!-- END OMF OPERATOR GUIDE -->\n"),
+    ],
+)
+def test_install_plan_rejects_malformed_managed_markers_without_mutation(tmp_path, content):
+    target = tmp_path / "target"
+    target.mkdir()
+    agents = target / "AGENTS.md"
+    agents.write_text(content, encoding="utf-8")
+
+    result = subprocess.run(
+        ["bash", "install.sh", "--plan", str(target)],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 1
+    assert "managed markers are malformed" in result.stderr
+    assert agents.read_text(encoding="utf-8") == content
+    assert not (target / ".venv").exists()
+
+
+def test_install_plan_resolves_target_before_root_guard(tmp_path):
+    target = tmp_path / "root-link"
+    target.symlink_to("/", target_is_directory=True)
+    result = subprocess.run(
+        ["bash", "install.sh", "--plan", str(target)],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 1
+    assert "filesystem root" in result.stderr
+
+
+def test_install_rejects_fake_venv_python_without_executing_it(tmp_path):
+    target = tmp_path / "target"
+    binary = target / ".venv/bin/python"
+    binary.parent.mkdir(parents=True)
+    marker = tmp_path / "fake-python-executed"
+    binary.write_text(f"#!/bin/sh\ntouch '{marker}'\n", encoding="utf-8")
+    binary.chmod(0o755)
+    (target / ".venv/pyvenv.cfg").write_text("home = /tmp\n", encoding="utf-8")
+    (target / ".venv/.omf-managed").write_text("forged marker\n", encoding="utf-8")
+
+    result = subprocess.run(
+        ["bash", "install.sh", str(target)],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 1
+    assert "is not OMF-managed" in result.stderr
+    assert not marker.exists()
+
+
+def test_install_rejects_symlinked_managed_directory_before_creating_venv(tmp_path):
+    target = tmp_path / "target"
+    target.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (target / "bindings").symlink_to(outside, target_is_directory=True)
+
+    result = subprocess.run(
+        ["bash", "install.sh", str(target)],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 1
+    assert "symbolic-link directory" in result.stderr
+    assert not (target / ".venv").exists()
+
+
+@pytest.mark.parametrize(
+    ("template", "destination_name", "begin", "end"),
+    [
+        (Path("templates/project/AGENTS.md"), "AGENTS.md", AGENTS_BEGIN, AGENTS_END),
+        (Path("templates/project/gitignore"), ".gitignore", IGNORE_BEGIN, IGNORE_END),
+    ],
+)
+def test_managed_sections_upgrade_once_and_preserve_project_content(
+    tmp_path, template, destination_name, begin, end
+):
+    destination = tmp_path / destination_name
+    destination.write_text(
+        f"project content before\n\n{begin}\nobsolete OMF text\n{end}\n\nproject content after\n",
+        encoding="utf-8",
+    )
+    destination.chmod(0o640)
+
+    assert upsert_managed_section(template, destination, begin, end)
+    updated = destination.read_text(encoding="utf-8")
+    metadata = destination.stat()
+    assert updated.startswith("project content before\n\n")
+    assert updated.endswith("\n\nproject content after\n")
+    assert "obsolete OMF text" not in updated
+    assert updated.count(begin) == 1
+    assert updated.count(end) == 1
+    assert stat.S_IMODE(metadata.st_mode) == 0o640
+
+    assert not upsert_managed_section(template, destination, begin, end)
+    assert destination.read_text(encoding="utf-8") == updated
+    assert destination.stat().st_ino == metadata.st_ino
+
+
+@pytest.mark.parametrize(
+    ("destination_name", "begin", "end"),
+    [
+        ("AGENTS.md", AGENTS_BEGIN, AGENTS_END),
+        (".gitignore", IGNORE_BEGIN, IGNORE_END),
+    ],
+)
+def test_managed_file_validation_rejects_non_standalone_markers(
+    tmp_path, destination_name, begin, end
+):
+    destination = tmp_path / destination_name
+    destination.write_text(f"> {begin}\n> {end}\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="standalone lines"):
+        validate_managed_file(destination, begin, end)
+
+
+@pytest.mark.parametrize(
+    ("destination_name", "begin", "end"),
+    [
+        ("AGENTS.md", AGENTS_BEGIN, AGENTS_END),
+        (".gitignore", IGNORE_BEGIN, IGNORE_END),
+    ],
+)
+def test_managed_file_validation_rejects_incomplete_and_duplicate_markers(
+    tmp_path, destination_name, begin, end
+):
+    destination = tmp_path / destination_name
+    malformed = [f"{begin}\n", f"{begin}\n{end}\n{begin}\n{end}\n"]
+
+    for content in malformed:
+        destination.write_text(content, encoding="utf-8")
+        with pytest.raises(ValueError, match="exactly one ordered"):
+            validate_managed_file(destination, begin, end)
+
+
+def test_install_support_creates_and_preserves_templates_and_managed_files(tmp_path, capsys):
+    section = tmp_path / "section"
+    section.write_text(f"{IGNORE_BEGIN}\ngenerated\n{IGNORE_END}\n", encoding="utf-8")
+    destination = tmp_path / ".gitignore"
+
+    assert install_support_main(["validate", str(destination), IGNORE_BEGIN, IGNORE_END]) == 0
+    assert (
+        install_support_main(["upsert", str(section), str(destination), IGNORE_BEGIN, IGNORE_END])
+        == 0
+    )
+    assert destination.read_text(encoding="utf-8") == section.read_text(encoding="utf-8")
+
+    destination.write_text("project-ignore", encoding="utf-8")
+    assert upsert_managed_section(section, destination, IGNORE_BEGIN, IGNORE_END)
+    assert destination.read_text(encoding="utf-8").startswith("project-ignore\n\n")
+
+    rendered = tmp_path / "omf.yaml"
+    manifest_template = Path("templates/project/omf.yaml")
+    assert (
+        install_support_main(
+            ["render", str(manifest_template), str(rendered), "factory", "local/factory"]
+        )
+        == 0
+    )
+    content = rendered.read_text(encoding="utf-8")
+    assert "name: factory" in content
+    assert "namespace: local/factory" in content
+    assert not render_template(manifest_template, rendered, "changed", "local/changed")
+    assert rendered.read_text(encoding="utf-8") == content
+
+    malformed = tmp_path / "malformed"
+    malformed.write_text("no managed markers\n", encoding="utf-8")
+    assert (
+        install_support_main(["upsert", str(malformed), str(destination), IGNORE_BEGIN, IGNORE_END])
+        == 1
+    )
+    assert "template markers do not match" in capsys.readouterr().err
+
+
+def test_install_support_writes_through_an_inherited_target_after_path_swap(tmp_path):
+    target_path = tmp_path / "target"
+    target_path.mkdir()
+    relocated = tmp_path / "relocated"
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    descriptor = os.open(target_path, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        target_path.rename(relocated)
+        target_path.symlink_to(outside, target_is_directory=True)
+        target = Path(f"/proc/self/fd/{descriptor}")
+        rendered = target / "omf.yaml"
+        assert render_template(
+            Path("templates/project/omf.yaml"), rendered, "anchored", "local/anchored"
+        )
+    finally:
+        os.close(descriptor)
+
+    assert "name: anchored" in (relocated / "omf.yaml").read_text(encoding="utf-8")
+    assert not (outside / "omf.yaml").exists()
+
+
+def test_render_template_never_replaces_a_concurrently_created_manifest(tmp_path, monkeypatch):
+    destination = tmp_path / "omf.yaml"
+    original_link = os.link
+
+    def create_competing_manifest(*args, **kwargs):
+        destination.write_text("created concurrently\n", encoding="utf-8")
+        return original_link(*args, **kwargs)
+
+    monkeypatch.setattr(os, "link", create_competing_manifest)
+    with pytest.raises(FileExistsError):
+        render_template(Path("templates/project/omf.yaml"), destination, "factory", "local/factory")
+
+    assert destination.read_text(encoding="utf-8") == "created concurrently\n"
+    assert not list(tmp_path.glob(".omf.yaml.omf-*"))
+
+
+def test_render_template_does_not_publish_a_partial_manifest(tmp_path, monkeypatch):
+    destination = tmp_path / "omf.yaml"
+
+    def fail_sync(_descriptor):
+        raise OSError("simulated storage failure")
+
+    monkeypatch.setattr(os, "fsync", fail_sync)
+    with pytest.raises(OSError, match="simulated storage failure"):
+        render_template(Path("templates/project/omf.yaml"), destination, "factory", "local/factory")
+
+    assert not destination.exists()
+    assert not list(tmp_path.glob(".omf.yaml.omf-*"))
+
+
+def test_managed_file_validation_rejects_non_regular_destination(tmp_path):
+    destination = tmp_path / "AGENTS.md"
+    destination.mkdir()
+
+    with pytest.raises(ValueError, match="regular non-symbolic-link file"):
+        validate_managed_file(destination, AGENTS_BEGIN, AGENTS_END)
+
+
+def test_directory_installer_is_idempotent_and_rebuilds_only_its_managed_venv(tmp_path):
+    target = tmp_path / "installed-factory"
+    target.mkdir()
+    (target / "AGENTS.md").write_text(
+        f"project agent rule\n\n{AGENTS_BEGIN}\nold guide\n{AGENTS_END}\n",
+        encoding="utf-8",
+    )
+    (target / ".gitignore").write_text(
+        f"project-ignore\n\n{IGNORE_BEGIN}\nold ignore\n{IGNORE_END}\n",
+        encoding="utf-8",
+    )
+    wrapper = tmp_path / "python-with-system-packages"
+    fail_cleanup = tmp_path / "fail-cleanup"
+    wrapper.write_text(
+        "#!/bin/sh\n"
+        f'if [ -f "{fail_cleanup}" ] && [ "$1" = "-" ]; then\n'
+        '  case "${3:-}" in root:*|target:*) exit 70;; esac\n'
+        "fi\n"
+        'if [ "$1" = "-m" ] && [ "$2" = "venv" ]; then\n'
+        "  shift 2\n"
+        f'exec "{sys.executable}" -m venv --system-site-packages "$@"\n'
+        "fi\n"
+        f'exec "{sys.executable}" "$@"\n',
+        encoding="utf-8",
+    )
+    wrapper.chmod(0o755)
+    wrapper_argument = os.path.relpath(wrapper, Path.cwd())
+    environment = os.environ | {"PIP_NO_INDEX": "1"}
+
+    first = subprocess.run(
+        ["bash", "install.sh", "--python", wrapper_argument, str(target)],
+        check=True,
+        capture_output=True,
+        text=True,
+        env=environment,
+    )
+    agents = (target / "AGENTS.md").read_text(encoding="utf-8")
+    gitignore = (target / ".gitignore").read_text(encoding="utf-8")
+    first_venv_inode = (target / ".venv").stat().st_ino
+    assert "Open Model Factory is ready" in first.stdout
+    assert agents.startswith("project agent rule\n\n")
+    assert "old guide" not in agents
+    assert gitignore.startswith("project-ignore\n\n")
+    assert "old ignore" not in gitignore
+    assert (target / ".venv").is_symlink()
+    assert (target / ".venv/.omf-managed").is_file()
+    entrypoint = (target / ".venv/bin/omf").read_text(encoding="utf-8").splitlines()[0]
+    assert "/proc/self/fd/" not in entrypoint
+    assert "/dev/fd/" not in entrypoint
+
+    second = subprocess.run(
+        ["bash", "install.sh", "--python", wrapper_argument, str(target)],
+        check=True,
+        capture_output=True,
+        text=True,
+        env=environment,
+    )
+    assert "Open Model Factory is ready" in second.stdout
+    assert (target / "AGENTS.md").read_text(encoding="utf-8") == agents
+    assert (target / ".gitignore").read_text(encoding="utf-8") == gitignore
+    assert (target / ".venv").stat().st_ino != first_venv_inode
+    assert len(list((target / ".omf-venvs").iterdir())) == 1
+    assert not list(target.glob(".venv.omf-link-*"))
+    assert not list(target.glob(".venv.omf-old-*"))
+
+    fail_cleanup.touch()
+    third = subprocess.run(
+        ["bash", "install.sh", "--python", wrapper_argument, str(target)],
+        check=True,
+        capture_output=True,
+        text=True,
+        env=environment,
+    )
+    assert "previous OMF environment cleanup was deferred" in third.stderr
+    assert (target / ".venv").is_symlink()
+    assert (target / ".venv/.omf-managed").is_file()
+    assert len(list((target / ".omf-venvs").iterdir())) == 2
+
+
+def test_directory_installer_never_follows_a_swapped_target_path(tmp_path):
+    target = tmp_path / "target"
+    target.mkdir()
+    relocated = tmp_path / "relocated"
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    wrapper = tmp_path / "python-that-swaps-target"
+    wrapper.write_text(
+        "#!/bin/sh\n"
+        'if [ "$1" = "-m" ] && [ "$2" = "venv" ]; then\n'
+        f'  mv "{target}" "{relocated}"\n'
+        f'  ln -s "{outside}" "{target}"\n'
+        "  shift 2\n"
+        f'  exec "{sys.executable}" -m venv --system-site-packages "$@"\n'
+        "fi\n"
+        f'exec "{sys.executable}" "$@"\n',
+        encoding="utf-8",
+    )
+    wrapper.chmod(0o755)
+
+    result = subprocess.run(
+        ["bash", "install.sh", "--python", str(wrapper), str(target)],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=os.environ | {"PIP_NO_INDEX": "1"},
+    )
+
+    assert result.returncode == 1
+    assert "target pathname changed during installation" in result.stderr
+    assert not list(outside.iterdir())
+    assert (relocated / "omf.yaml").is_file()
+    assert (relocated / ".venv").is_symlink()
+    assert (relocated / ".venv/.omf-managed").is_file()
+    entrypoint = (relocated / ".venv/bin/omf").read_text(encoding="utf-8").splitlines()[0]
+    assert "/proc/self/fd/" not in entrypoint
+    assert "/dev/fd/" not in entrypoint
+
+
+def test_interruption_after_venv_switch_never_deletes_active_environment(tmp_path):
+    target = tmp_path / "target"
+    activation_script = tmp_path / "activation.py"
+    wrapper = tmp_path / "python-that-interrupts-activation"
+    wrapper.write_text(
+        "#!/bin/sh\n"
+        'if [ "$1" = "-m" ] && [ "$2" = "venv" ]; then\n'
+        "  shift 2\n"
+        f'  exec "{sys.executable}" -m venv --system-site-packages "$@"\n'
+        "fi\n"
+        'if [ "$1" = "-" ]; then\n'
+        '  case "${3:-}" in\n'
+        "    venv.*)\n"
+        f'      cat >"{activation_script}"\n'
+        f"      sed -i '/^    committed = True$/a\\    os.kill(os.getpid(), 15)' "
+        f'"{activation_script}"\n'
+        f'      exec "{sys.executable}" "{activation_script}" "$2" "$3"\n'
+        "      ;;\n"
+        "  esac\n"
+        "fi\n"
+        f'exec "{sys.executable}" "$@"\n',
+        encoding="utf-8",
+    )
+    wrapper.chmod(0o755)
+
+    result = subprocess.run(
+        ["bash", "install.sh", "--python", str(wrapper), str(target)],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=os.environ | {"PIP_NO_INDEX": "1"},
+    )
+
+    assert result.returncode == 1
+    assert "could not atomically activate" in result.stderr
+    assert (target / ".venv").is_symlink()
+    assert (target / ".venv/.omf-managed").is_file()
+    assert len(list((target / ".omf-venvs").iterdir())) == 1
+
+
+def test_rendered_project_templates_match_resource_contracts():
+    registry = SchemaRegistry()
+    replacements = {
+        "__OMF_PROJECT_NAME__": "installed-factory",
+        "__OMF_PROJECT_NAMESPACE__": "local/installed-factory",
+    }
+    templates = [
+        Path("templates/project/omf.yaml"),
+        Path("templates/project/bindings/local.yaml"),
+        Path("templates/project/policies/default.yaml"),
+    ]
+
+    for template in templates:
+        content = template.read_text(encoding="utf-8")
+        for placeholder, value in replacements.items():
+            content = content.replace(placeholder, value)
+        resource = registry.load(content)
+        assert resource["metadata"]["namespace"] == "local/installed-factory"
+
+
+def test_operator_guide_is_bounded_and_actionable():
+    root_guide = Path("AGENTS.md")
+    guide = Path("templates/project/AGENTS.md").read_text(encoding="utf-8")
+    root_names = {path.name for path in Path.cwd().iterdir()}
+    assert root_guide.name == "AGENTS.md"
+    assert root_guide.is_file()
+    assert "AGENTS.md" in root_names
+    assert "agents.md" not in root_names
+    assert guide.count("<!-- BEGIN OMF OPERATOR GUIDE -->") == 1
+    assert guide.count("<!-- END OMF OPERATOR GUIDE -->") == 1
+    assert "AGENTS.md standard" in guide
+    assert "another `AGENTS.md`" in guide
+    assert "--output json doctor" in guide
+    assert "agent context" in guide
+    assert "executor preflight" in guide
+    assert "--expected-version" in guide
+    assert "Never place credentials" in guide
+
+
+def test_installer_locks_build_backend_and_disables_build_isolation():
+    script = Path("install.sh").read_text(encoding="utf-8")
+    build_lock = Path("requirements.build.lock").read_text(encoding="utf-8")
+    assert "requirements.build.lock" in script
+    assert "--only-binary=:all:" in script
+    assert "--no-build-isolation --no-deps" in script
+    assert "editables==0.5" in build_lock
+    assert "hatchling==1.32.0" in build_lock

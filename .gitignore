@@ -1,5 +1,6 @@
 # Open Model Factory local runtime and caches
 .omf/
+.amp/portals/*
 
 # Data payloads are content-addressed outside Git. Manifests remain tracked.
 data/payloads/

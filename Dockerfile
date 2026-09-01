@@ -3,10 +3,12 @@ FROM python:3.11-slim-bookworm AS build
 
 ENV PIP_DISABLE_PIP_VERSION_CHECK=1 PIP_NO_CACHE_DIR=1
 WORKDIR /src
-COPY pyproject.toml README.md SPEC.md LICENSE requirements.runtime.lock ./
+COPY pyproject.toml README.md SPEC.md LICENSE requirements.build.lock requirements.runtime.lock ./
 COPY factory ./factory
-RUN python -m pip wheel --require-hashes --wheel-dir /wheels -r requirements.runtime.lock \
-    && python -m pip wheel --no-deps --wheel-dir /wheels .
+RUN python -m pip install --only-binary=:all: --require-hashes -r requirements.build.lock \
+    && python -m pip wheel --only-binary=:all: --require-hashes \
+        --wheel-dir /wheels -r requirements.runtime.lock \
+    && python -m pip wheel --no-build-isolation --no-deps --wheel-dir /wheels .
 
 FROM python:3.11-slim-bookworm AS runtime
 

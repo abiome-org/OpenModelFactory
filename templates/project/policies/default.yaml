@@ -1,0 +1,26 @@
+apiVersion: omf.dev/v1alpha1
+kind: Policy
+metadata:
+  name: default
+  namespace: __OMF_PROJECT_NAMESPACE__
+spec:
+  rules:
+    - name: allow-local-project-operations
+      effect: allow
+      match:
+        actor: local-user
+        resource: __OMF_PROJECT_NAMESPACE__
+    - name: deny-unapproved-external-network
+      effect: deny
+      match:
+        action: network.egress
+        purpose: unapproved
+  config:
+    dirtyWorktree: deny
+    unsignedModules: deny
+    sync:
+      requirePlan: true
+      allowDelete: false
+    promotion:
+      requireEvaluationPass: true
+      requireCompleteLineage: true
