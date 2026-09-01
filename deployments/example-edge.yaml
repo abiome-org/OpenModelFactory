@@ -1,0 +1,11 @@
+apiVersion: omf.dev/v1alpha1
+kind: DeploymentSpec
+metadata:
+  name: example-edge
+  namespace: local/open-model-factory
+spec:
+  releaseRef: release/candidate
+  runtime: omf.module/v1
+  routing: {}
+  extensions:
+    form: edge

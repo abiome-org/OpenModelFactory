@@ -1,5 +1,6 @@
 from copy import deepcopy
 from datetime import UTC, datetime
+from pathlib import Path
 
 import pytest
 from omf.errors import ValidationError
@@ -76,3 +77,9 @@ def test_finalization_excludes_status_and_does_not_mutate():
     second = finalize_resource(source2, actor="a", now=datetime(2026, 1, 1, tzinfo=UTC))
     assert source == original
     assert first["metadata"]["revision"] == second["metadata"]["revision"]
+
+
+def test_checked_in_deployment_manifest_is_valid():
+    value = SchemaRegistry().load(Path("deployments/example-edge.yaml"))
+    assert value["kind"] == "DeploymentSpec"
+    assert value["metadata"]["namespace"] == "local/open-model-factory"

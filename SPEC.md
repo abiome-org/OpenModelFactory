@@ -1534,10 +1534,6 @@ after publishing evidence for:
 12. **Openness:** release artifacts, schemas, tests, lineage summaries,
     licenses, and provenance are independently inspectable.
 
-Poolside's reported five-week Laguna XS.2 training-start-to-release cycle is a
-useful industry comparison, not a normative threshold or a greenfield build
-estimate.
-
 ## 24. Open decisions for v0.2
 
 The implementation process must resolve these without weakening the invariants:
@@ -1577,7 +1573,3 @@ The implementation process must resolve these without weakening the invariants:
 - [Kueue](https://kueue.sigs.k8s.io/docs/overview/) and
   [JobSet](https://jobset.sigs.k8s.io/docs/overview/) as informative Kubernetes
   bindings
-
-The Poolside evidence and the boundary between public facts and OMF design are
-documented separately in
-[the research note](docs/research/poolside-model-factory.md).

@@ -29,8 +29,6 @@ test has run on at least 1,024 actual accelerators.
 
 - [Specification](SPEC.md) — normative product, architecture, interface,
   conformance, and implementation requirements.
-- [Poolside research note](docs/research/poolside-model-factory.md) — public
-  evidence, explicit inference boundaries, and design consequences.
 - [Operations runbook](docs/operations.md) — service, S3, backup/restore,
   incident, and offline-install procedures.
 
@@ -51,6 +49,10 @@ authenticated local API service.
 
 ## North-star workflow
 
+The following path uses only files included in a clean clone through training
+and evaluation. Replace the example module, data, and workload with your own as
+the project evolves.
+
 ```sh
 git clone <repo-url> my-model-factory
 cd my-model-factory
@@ -63,29 +65,51 @@ omf doctor
 omf module validate
 omf module test
 
-# Import data or register it in place as an immutable dataset snapshot.
-omf data add ./incoming-data --name training-corpus --mode copy
+# Import the checked-in non-sensitive fixture as an immutable snapshot.
+omf data add data/fixtures/numbers.jsonl --name example-numbers --mode copy \
+  --rights data/fixtures/rights.yaml
 
-# Choose any supported local, on-premises, or remote holding site.
-omf store add primary --driver s3 --endpoint <endpoint> --secret-ref primary
-omf sync push dataset/training-corpus --to primary
+# Sync it to a second local holding site. Replace this with S3 when needed.
+omf store add secondary --driver filesystem --endpoint .omf/secondary-store
+omf sync push dataset/example-numbers --to secondary --plan
+omf sync push dataset/example-numbers --to secondary
 
 # Run the scientific workload through the verified local binding.
-omf run workloads/train.yaml --binding bindings/local.yaml
+omf run workloads/example-statistical.yaml --binding bindings/local.yaml
 
-# Inspect evidence and promote a passing release.
-omf lineage show run/<run-id>
+# Use the emitted runId to inspect and evaluate the run.
+omf lineage show run:<run-id>/stage:train
 omf evaluate run/<run-id>
+
+# After an approved scanner writes a report covering the emitted model and
+# admitted module digests, promote and package the release for edge use.
 omf release create <run-id> --name candidate --intended-use research \
   --vulnerability-report reports/vulnerabilities.yaml --promote --approval reviewer
-omf deploy deployments/candidate.yaml
-omf deployment status candidate
-# Use the returned statusVersion as an optimistic concurrency guard:
-omf deployment rollback candidate --expected-version <status-version>
+omf deploy deployments/example-edge.yaml
+omf deployment status example-edge
+# After applying a second deployment revision, use statusVersion as the guard:
+omf deployment rollback example-edge --expected-version <status-version>
 ```
 
-These are working reference-implementation commands. `omf --help` and the
-OpenAPI document expose the complete installed command/API surface.
+Commands through evaluation run directly from the clean clone. Release
+promotion intentionally fails closed until an external scanner supplies current
+vulnerability evidence; OMF does not fabricate it. `omf --help` and the OpenAPI
+document expose the complete installed command/API surface.
+
+## Self-contained operation
+
+The local profile requires no hosted control plane, account, or call-home
+service. SQLite, filesystem artifact storage, identity, secrets, events,
+lineage, telemetry, subprocess execution, and deployment supervision are all
+repository-scoped and initialized by `omf bootstrap`. Exact Python dependencies
+are locked, and the same clone can be installed from a prepared wheelhouse in an
+air-gapped environment. S3, cluster schedulers, federation, and external secret
+services are optional bindings selected only when the installation needs them.
+
+The repository is relocatable: absolute checkout paths are runtime metadata,
+not resource identity. `.omf/` contains all generated local state and is ignored
+by Git, so cloning into a new directory starts clean without losing the desired
+state stored in manifests.
 
 ## Repository contract
 
