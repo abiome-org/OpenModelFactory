@@ -32,8 +32,11 @@ def test_secret_roundtrip_purpose_cas_and_no_values_in_list(tmp_path):
     assert store.get("api", "sync") == b"super-secret"
     with pytest.raises(IntegrityError):
         store.get("api", "other")
-    with pytest.raises(ConflictError):
+    with pytest.raises(ConflictError) as stale:
         store.put("api", "new", "sync")
+    assert stale.value.details == {"expectedVersion": None, "currentVersion": 1}
+    assert store.put("api", "new", "sync", expected_version=1) == 2
+    assert store.get("api", "sync") == b"new"
     assert "super-secret" not in repr(store.list())
 
 

@@ -9,6 +9,18 @@ from typing import Any, Literal
 
 ExecutionState = Literal["pending", "running", "succeeded", "failed", "canceled", "unknown"]
 
+# These capabilities mean that an executor can carry the complete module protocol across its
+# execution boundary. Scheduler submission alone is deliberately not enough.
+MODULE_PROTOCOL_CAPABILITIES = frozenset(
+    {
+        "protocol:omf.module/v1",
+        "transport:module-source",
+        "transport:request-result",
+        "transport:artifacts",
+    }
+)
+DEPLOYMENT_PROTOCOL_CAPABILITIES = frozenset({"protocol:omf.deployment/v1"})
+
 
 @dataclass(frozen=True)
 class ExecutionPlan:
@@ -47,3 +59,11 @@ class Executor(ABC):
     def cancel(self, execution_id: str) -> None: ...
     @abstractmethod
     def logs(self, execution_id: str) -> tuple[Path, Path]: ...
+
+    def attach(self, execution_id: str, run_dir: Path) -> None:
+        """Restore controller-local bookkeeping after a process restart.
+
+        Executors whose scheduler identity is sufficient may keep the default no-op. Adapters
+        that use the local run directory for status or logs should override this method.
+        """
+        del execution_id, run_dir

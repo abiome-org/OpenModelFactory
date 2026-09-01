@@ -1,0 +1,162 @@
+# Agent control and accumulated knowledge
+
+OMF's agent surface is a deterministic projection over the same resources,
+status records, events, and lineage used by humans and APIs. It is not an
+autonomous planner, prompt store, or second control plane.
+
+```diagram
+┌──────────────────────────────────────────────────────────────────────┐
+│ Intent                                                               │
+│ Goal objective · success criteria · constraints · budget · priority  │
+└──────────────────────────────┬───────────────────────────────────────┘
+                               ▼
+┌──────────────────────────────────────────────────────────────────────┐
+│ Situation                                                            │
+│ readiness · inventory · activity · blockers · incremental events     │
+└──────────────────────────────┬───────────────────────────────────────┘
+                               ▼
+┌──────────────────────────────────────────────────────────────────────┐
+│ Control                                                              │
+│ capability contracts · preconditions · effects · risk · cost · CAS   │
+└──────────────────────────────┬───────────────────────────────────────┘
+                               ▼
+┌──────────────────────────────────────────────────────────────────────┐
+│ Evidence                                                             │
+│ immutable resources · signed events · bidirectional lineage          │
+└──────────────────────────────┬───────────────────────────────────────┘
+                               ▼
+┌──────────────────────────────────────────────────────────────────────┐
+│ Accumulated knowledge                                                │
+│ claim · confidence · evidence · scope · supersession · expiry        │
+└──────────────────────────────────────────────────────────────────────┘
+```
+
+## Situation contract
+
+`omf --output json agent context` and `GET /v1/agent/context` return
+`omf.agent/v1alpha1` `AgentContext` documents. The projection contains:
+
+- project identity and content revision;
+- normalized readiness checks without volatile passing details;
+- active or focused goals and their status versions;
+- object and revision counts by resource kind plus installed executor-provider
+  contracts;
+- bounded recent run, deployment, and operation status;
+- active, evidence-backed knowledge;
+- signed event metadata without event payloads;
+- global blockers, even when `focus` filters the detail sections;
+- deterministic next actions and the action-catalog digest.
+
+`limit` is constrained to 1–100 items per section. `max_bytes` is constrained to
+16 KiB–1 MiB and bounds canonical JSON output. When a section cannot fit, OMF
+removes its ordered tail, retains the original total, and sets
+`truncated: true`. At least one global blocker is retained whenever blockers
+exist, even when other detail must be trimmed. The projection never expands
+artifact payloads, event data, operation requests/results, secret values,
+prompts, model inputs, or model outputs.
+
+`viewDigest` is the SHA-256 digest of the exact returned projection excluding
+`generatedAt` and the digest field itself. Two requests with the same selected
+facts therefore have the same digest even at different wall-clock times. A
+knowledge expiry is a real view change and changes the digest. The HTTP
+endpoint returns the digest as an ETag and honors `If-None-Match` with `304 Not
+Modified`.
+
+`recentEvents.cursor` is the newest returned event ID for an initial view. Pass
+it as `--since` or `since=` to receive an oldest-first incremental event window.
+If a cursor is unknown, OMF returns a structured `not_found` error and tells the
+caller to start a new window; it never silently skips an unknown interval.
+
+## Capability and recommendation contracts
+
+`omf agent capabilities` and `GET /v1/agent/capabilities` return a stable,
+digest-addressed catalog. Each action declares:
+
+- symbolic action name and intent;
+- exact CLI template and HTTP method/path when an HTTP equivalent exists;
+- required authorization scope;
+- whether it mutates or supports a non-mutating plan;
+- idempotency behavior;
+- risk and conservative cost class;
+- machine-readable preconditions and expected effects;
+- approval and destructive flags.
+
+Recommendations are deterministic gap analyses over authoritative global state.
+They are not predictions and do not execute. Cost classes (`negligible`,
+`metadata`, `io`, `compute`, or `external`) avoid fabricating numeric estimates
+when the selected data, module, binding, or external service determines actual
+consumption. High-risk actions remain explicitly approval-marked.
+
+Use `omf executor list` to inspect the execution plugins visible to the agent,
+then `omf executor preflight <binding> --workload <workload>` before an expensive
+run. Preflight reports actual transport/isolation capabilities and host issues
+without allocating a run. Provider selection is exact and never falls back to
+local; see [Executor providers and portable workloads](executors.md).
+
+## Goals
+
+A `Goal` is immutable intent plus mutable observed lifecycle status. Its spec
+contains an objective, one or more measurable success criteria, constraints,
+numeric named budget limits, priority, optional parent, and resource/run scope.
+Its status is `pending`, `active`, `blocked`, `satisfied`, or `canceled`.
+
+A goal name is create-only. Repeating identical intent is idempotent; submitting
+different intent under that name returns a conflict and requires a new goal or
+child goal. This prevents a previously observed status from silently acquiring
+a different meaning.
+
+Status changes require the exact `statusVersion`. A stale write returns `409`
+with `expectedVersion`, `currentVersion`, `currentState`, `retryable: true`, and
+a context-refresh remediation. `satisfied` and `canceled` are terminal; new
+intent becomes a new goal or child goal rather than rewriting history.
+
+## Knowledge
+
+A `Knowledge` resource is a bounded assertion, not hidden model memory. It has:
+
+- category: observation, hypothesis, decision, constraint, lesson, or
+  retraction;
+- one explicit claim and confidence in [0, 1];
+- at least one evidence reference, optionally with a content digest;
+- optional goal, resource, run, and tag scope;
+- exact knowledge revisions superseded by this assertion;
+- optional RFC 3339 expiry.
+
+Recording knowledge commits an immutable resource, links every evidence source
+through lineage, links superseded revisions without deleting them, and emits a
+signed `KnowledgeRecorded` event. Repeating identical content is idempotent and
+does not emit another semantic event. The default active view excludes expired,
+superseded, and older revised entries; `omf knowledge list --all` retains all of
+their reasons and content.
+
+Claims are visible to principals with project read scope. Never put credentials,
+private keys, raw sensitive samples, prompts, or model payloads in a claim;
+reference a governed artifact or event digest instead. Knowledge and goals are
+factory metadata and must be included in normal metadata backup, restore, and
+federation procedures.
+
+## Machine-actionable errors
+
+CLI and domain API errors use one envelope:
+
+```json
+{
+  "error": {
+    "code": "conflict",
+    "message": "goal status version mismatch",
+    "retryable": true,
+    "remediation": [
+      {
+        "action": "agent.context",
+        "command": "omf agent context",
+        "description": "Refresh observed state before retrying with the current version."
+      }
+    ],
+    "details": {"expectedVersion": 1, "currentVersion": 2}
+  }
+}
+```
+
+HTTP request-validation errors use the same shape and report only paths,
+messages, and error types. Submitted values are intentionally omitted so a bad
+request cannot echo a token or sensitive payload into logs or agent context.

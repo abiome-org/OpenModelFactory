@@ -14,7 +14,13 @@ import uuid
 from pathlib import Path
 from typing import Any
 
-from omf.executors.base import ExecutionPlan, ExecutionStatus, Executor
+from omf.executors.base import (
+    DEPLOYMENT_PROTOCOL_CAPABILITIES,
+    MODULE_PROTOCOL_CAPABILITIES,
+    ExecutionPlan,
+    ExecutionStatus,
+    Executor,
+)
 
 
 class LocalExecutor(Executor):
@@ -24,9 +30,14 @@ class LocalExecutor(Executor):
 
     @property
     def capabilities(self) -> frozenset[str]:
-        caps = {"process-group", "rlimit"}
+        caps = {
+            "process-group",
+            "rlimit",
+            *MODULE_PROTOCOL_CAPABILITIES,
+            *DEPLOYMENT_PROTOCOL_CAPABILITIES,
+        }
         if self._network_namespace_available():
-            caps.add("network-namespace")
+            caps.update({"network-namespace", "isolation:network-deny"})
         return frozenset(caps)
 
     @staticmethod
@@ -227,8 +238,14 @@ class LocalExecutor(Executor):
         directory, _ = self._record(execution_id)
         return directory / "stdout.log", directory / "stderr.log"
 
+    def attach(self, execution_id: str, run_dir: Path) -> None:
+        record = json.loads((run_dir / "execution.json").read_text())
+        if str(record["id"]) != execution_id:
+            raise RuntimeError("execution identity does not match the run directory")
+        self._dirs[execution_id] = run_dir
+
     def reconcile(self, run_dir: Path) -> str:
         record = json.loads((run_dir / "execution.json").read_text())
         execution_id = str(record["id"])
-        self._dirs[execution_id] = run_dir
+        self.attach(execution_id, run_dir)
         return execution_id

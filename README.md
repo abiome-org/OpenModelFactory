@@ -20,6 +20,12 @@ and lineage, policy-gated releases, durable local deployment supervision, and
 local/edge deployment packaging. The same service backs the Typer CLI and an
 attributable, scoped, expiring-token FastAPI surface.
 
+Execution is selected through an explicit provider registry. Bindings can use
+built-in local/Slurm/Kubernetes adapters or trusted installed providers for
+Modal, Vast.ai, site schedulers, and future runners without changing a workload.
+Provider inventory, configuration contracts, and fail-closed preflight are
+available to both agents and operators.
+
 The maturity label remains **Alpha**, intentionally. Slurm and Kubernetes
 adapters, signed federation primitives, capacity measurement, and air-gap
 procedures are present, but this repository does not claim cluster, federated,
@@ -31,6 +37,8 @@ test has run on at least 1,024 actual accelerators.
   conformance, and implementation requirements.
 - [Operations runbook](docs/operations.md) — service, S3, backup/restore,
   incident, and offline-install procedures.
+- [Executor provider guide](docs/executors.md) — portable workload boundary,
+  plugin contract, backend guidance, and conformance checklist.
 
 ## Install
 
@@ -75,6 +83,7 @@ omf sync push dataset/example-numbers --to secondary --plan
 omf sync push dataset/example-numbers --to secondary
 
 # Run the scientific workload through the verified local binding.
+omf executor preflight bindings/local.yaml --workload workloads/example-statistical.yaml
 omf run workloads/example-statistical.yaml --binding bindings/local.yaml
 
 # Use the emitted runId to inspect and evaluate the run.
@@ -95,6 +104,54 @@ Commands through evaluation run directly from the clean clone. Release
 promotion intentionally fails closed until an external scanner supplies current
 vulnerability evidence; OMF does not fabricate it. `omf --help` and the OpenAPI
 document expose the complete installed command/API surface.
+
+## Agent control loop
+
+OMF presents agents with a control loop rather than asking them to infer state
+from logs or replay an entire conversation. The same first command works before
+and after bootstrap:
+
+```sh
+# Use JSON for a stable machine interface. Before bootstrap this includes the
+# exact repository-scoped bootstrap plan; afterward it is the live situation.
+omf --output json agent context --limit 10 --max-bytes 65536
+
+# Discover every agent-facing action's CLI/API mapping, scope, preconditions,
+# effects, plan support, idempotency, risk, and cost class.
+omf --output json agent capabilities
+
+# Make intent explicit and guard later state changes against stale observers.
+omf goal create quality --objective "Improve held-out quality" \
+  --success "accuracy >= 0.90" --constraint "gpuHours <= 100" \
+  --budget gpuHours=100 --priority 80
+omf goal status quality --state blocked --expected-version 1 \
+  --reason "waiting for dataset rights review"
+
+# Accrete a claim only with evidence. A correction names the exact knowledge it
+# supersedes, preserving rather than rewriting history.
+omf knowledge record baseline --category observation \
+  --claim "evaluation/42 measured accuracy 0.81" --confidence 0.98 \
+  --evidence evaluation/42 --goal-ref goal/quality --tag quality
+omf knowledge record baseline-corrected --category observation \
+  --claim "the corrected measurement is 0.83" --confidence 1 \
+  --evidence evaluation/43 --supersedes knowledge/baseline
+```
+
+An `AgentContext` contains readiness, active goals, per-kind and
+executor-provider inventory, recent run/deployment/operation status, active
+knowledge, payload-free event summaries, global blockers, and deterministic
+recommended actions. Every recommendation states why it exists, its exact
+command template, preconditions, expected effects, approval/destructive flags,
+idempotency semantics, and a conservative cost class. Recommendations never
+execute themselves and do not replace policy or scientific judgment.
+
+The view is bounded by item and byte budgets. `viewDigest` covers the projection
+except its own field and `generatedAt`; HTTP serves it as an ETag, and
+`recentEvents.cursor` can be passed back with `--since` for incremental
+refreshes. Event summaries omit payloads, operation summaries omit
+requests/results, and secrets are never included. A focus narrows detail but
+never hides a global blocker or changes the facts used to recommend an action.
+See the [agent control guide](docs/agent-control.md) for the complete contract.
 
 ## Self-contained operation
 
@@ -147,6 +204,7 @@ does not constrain language or project organization.
 | Code, workloads, modules, bindings, policies | Git repository |
 | Data, checkpoints, model packages, releases | User-selected artifact stores |
 | Derivation and decisions | Signed event and lineage records |
+| Goals and evidence-backed accumulated knowledge | Immutable resources, CAS status, signed events, and lineage |
 | Credentials and encryption keys | Local or site secret service, never Git |
 | Local downloads and generated state | Rebuildable `.omf/` cache |
 
@@ -156,7 +214,7 @@ not change when physical storage changes.
 
 ## What the factory supplies automatically
 
-For every admitted local run, the implementation:
+For every admitted run, the implementation:
 
 1. validates module, data, binding, protocol, and namespace compatibility;
 2. packages and executes immutable admitted module source and identifies inputs
@@ -172,12 +230,17 @@ For every admitted local run, the implementation:
 10. creates a complete signed release and packages or starts an explicit
     deployment without a separate production fork.
 
-Slurm/Kubernetes executor adapters and federation contracts are deliberately
-separate from the verified local execution path. They expose deterministic
-plans and scheduler lifecycle primitives, not a claim that `omf run` currently
-executes a complete workload on those schedulers. A site binding is conformant
-only after its integration passes the portable-workload, recovery, scheduling,
-and scale scenarios in `SPEC.md`.
+The executor registry resolves the binding exactly; unknown providers and
+missing protocol transport fail before a run is allocated and never fall back
+to local. Slurm can transport the complete module protocol over an explicitly
+declared shared filesystem, subject to workload isolation requirements. The
+built-in Kubernetes adapter exposes deterministic Job/JobSet lifecycle
+primitives but intentionally does not claim module source, request/result, or
+artifact transport. Trusted entry-point packages can provide Modal, Vast.ai,
+complete Kubernetes, or site-specific runners. See
+[executor providers](docs/executors.md). A site binding is conformant only after
+its integration passes the portable-workload, recovery, scheduling, and scale
+scenarios in `SPEC.md`.
 
 ## Scale target
 
@@ -189,7 +252,7 @@ and scale scenarios in `SPEC.md`.
         same workload schema, asset identities, events, and lineage
 ```
 
-Scale changes an explicit deployment binding, not pipeline code. A workload
+Scale changes an explicit binding/provider, not pipeline code. A workload
 that cannot physically fit on a small target may use offload or a shape-reduced
 configuration, but it uses the same graph and interfaces.
 

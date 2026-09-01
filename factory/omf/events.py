@@ -53,6 +53,16 @@ class CloudEvent:
         return cls(**value)
 
 
+@dataclass(frozen=True)
+class EventWindow:
+    """A bounded event page with a stable incremental cursor."""
+
+    items: tuple[CloudEvent, ...]
+    cursor: str | None
+    total: int
+    truncated: bool
+
+
 class EventStore:
     def __init__(self, database: Database, identity: SigningIdentity) -> None:
         self.db, self.identity = database, identity
@@ -71,9 +81,23 @@ class EventStore:
         run_id: str | None = None,
         mutation: Callable[[sqlite3.Connection], None] | None = None,
         outbox: bool = True,
+        dedupe_revision: bool = False,
         **digests: str | None,
     ) -> CloudEvent:
         with self.db.transaction(immediate=True) as connection:
+            if dedupe_revision:
+                row = connection.execute(
+                    "SELECT data FROM events WHERE resource_uid=? AND revision=? AND type=? "
+                    "ORDER BY sequence LIMIT 1",
+                    (resource_uid, revision, type),
+                ).fetchone()
+                if row is not None:
+                    existing = CloudEvent.from_dict(json.loads(row[0]))
+                    if existing.payload_digest != sha256_digest(data):
+                        raise IntegrityError(
+                            "deduplicated event revision already has a different payload"
+                        )
+                    return existing
             sequence = int(
                 connection.execute(
                     "SELECT COALESCE(MAX(sequence),0)+1 FROM events WHERE resource_uid=?",
@@ -120,6 +144,7 @@ class EventStore:
                     event.signature,
                 ),
             )
+            connection.execute("INSERT INTO event_order(event_id) VALUES(?)", (event.id,))
             if mutation is not None:
                 mutation(connection)
             if outbox:
@@ -150,6 +175,7 @@ class EventStore:
                         event.signature,
                     ),
                 )
+                connection.execute("INSERT INTO event_order(event_id) VALUES(?)", (event.id,))
                 if outbox:
                     connection.execute("INSERT INTO outbox(event_id) VALUES(?)", (event.id,))
         except sqlite3.IntegrityError as exc:
@@ -205,6 +231,61 @@ class EventStore:
             CloudEvent.from_dict(json.loads(row[0]))
             for row in self.db.connection.execute(sql, args)
         ]
+
+    def window(
+        self, *, limit: int, after: str | None = None, focus: str | None = None
+    ) -> EventWindow:
+        """Read a bounded recent or incremental event window without payload expansion."""
+        if limit < 1:
+            raise ValueError("event window limit must be positive")
+        clauses: list[str] = []
+        args: list[Any] = []
+        if after is not None:
+            cursor = self.db.connection.execute(
+                "SELECT position FROM event_order WHERE event_id=?", (after,)
+            ).fetchone()
+            if cursor is None:
+                raise NotFoundError(
+                    "event cursor not found",
+                    details={"cursor": after},
+                    remediation=[
+                        {
+                            "action": "agent.context",
+                            "command": "omf agent context",
+                            "description": "Start a new event window and retain its returned cursor.",
+                        }
+                    ],
+                )
+            clauses.append("eo.position>?")
+            args.append(int(cursor[0]))
+        if focus:
+            escaped = focus.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+            pattern = f"%{escaped}%"
+            clauses.append(
+                "(e.type LIKE ? ESCAPE '\\' OR e.subject LIKE ? ESCAPE '\\' "
+                "OR COALESCE(e.run_id,'') LIKE ? ESCAPE '\\')"
+            )
+            args.extend((pattern, pattern, pattern))
+        where = " WHERE " + " AND ".join(clauses) if clauses else ""
+        source = " FROM events e JOIN event_order eo ON eo.event_id=e.id"
+        total = int(
+            self.db.connection.execute("SELECT COUNT(*)" + source + where, args).fetchone()[0]
+        )
+        order = "ASC" if after is not None else "DESC"
+        rows = list(
+            self.db.connection.execute(
+                "SELECT e.data" + source + where + f" ORDER BY eo.position {order} LIMIT ?",
+                [*args, limit + 1],
+            )
+        )
+        truncated = len(rows) > limit
+        items = tuple(CloudEvent.from_dict(json.loads(row[0])) for row in rows[:limit])
+        next_cursor: str | None
+        if after is not None:
+            next_cursor = items[-1].id if items else after
+        else:
+            next_cursor = items[0].id if items else None
+        return EventWindow(items, next_cursor, total, truncated)
 
     def pending(self) -> list[CloudEvent]:
         rows = self.db.connection.execute(

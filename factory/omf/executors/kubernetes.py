@@ -118,3 +118,6 @@ class KubernetesExecutor(Executor):
         out.write_bytes(result.stdout)
         err.write_bytes(result.stderr)
         return out, err
+
+    def attach(self, execution_id: str, run_dir: Path) -> None:
+        self._dirs[execution_id] = run_dir

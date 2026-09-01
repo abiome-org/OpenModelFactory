@@ -201,6 +201,30 @@ licenses MAY be more restrictive, but they MUST be declared and policy-checked.
 - Moving or replicating a payload between stores MUST NOT change its logical
   asset identity.
 
+### 4.10 Agents operate one explicit evidence loop
+
+An implementation used by autonomous or semi-autonomous agents MUST expose one
+bounded, machine-readable projection that distinguishes current facts, desired
+intent, blockers, available actions, and accumulated knowledge. An agent MUST
+NOT need to infer authoritative state from prose logs or an unbounded chat
+history.
+
+- Goals MUST state success criteria, constraints, budget, and priority. Mutable
+  goal status MUST use compare-and-set or an equivalent lost-update guard.
+- Available actions MUST declare preconditions, effects, authorization scope,
+  mutability, plan support, idempotency, risk, and cost class before execution.
+- Recommended actions MUST be deterministic consequences of visible facts;
+  they MUST NOT execute themselves or bypass policy and approval.
+- Agent context MUST be bounded by item and byte budgets, identify truncation,
+  carry a digest, and support incremental event refresh.
+- Narrowing a context view MUST NOT hide a global blocker or change the global
+  facts used to derive recommendations.
+- Durable knowledge MUST be an immutable evidence-backed assertion with
+  confidence, scope, supersession, and optional expiry. Opaque model memory or
+  conversation history is not authoritative knowledge.
+- Context and error surfaces MUST NOT echo secrets, event payloads, operation
+  requests/results, raw samples, prompts, or model payloads.
+
 ## 5. Conceptual architecture
 
 ```diagram
@@ -374,6 +398,7 @@ Core event types include:
 - `ArtifactCommitted`, `CheckpointCommitted`;
 - `SamplerPolicyActivated`, `PolicyStatePublished`;
 - `EvaluationCompleted`, `ReviewRecorded`;
+- `GoalStatusChanged`, `KnowledgeRecorded`;
 - `PolicyDecisionRecorded`, `AliasMoved`;
 - `DeploymentChanged`, `ReleasePublished`;
 - `ArtifactRevoked`, `LineageReconciled`.
@@ -406,6 +431,8 @@ index. A mutable object-store prefix is not an artifact identity.
 | Kind | Purpose |
 | --- | --- |
 | `Project` | Namespace, ownership, budget, policy, and trust boundary |
+| `Goal` | Objective, measurable success, constraints, budget, scope, and priority |
+| `Knowledge` | Evidence-backed assertion with confidence, scope, supersession, and expiry |
 | `Module` | Versioned user-code entry point with typed contracts and capabilities |
 | `Artifact` | Immutable payload or content-addressed collection |
 | `ArtifactStore` | User-selected physical holding site and its capabilities |
@@ -560,6 +587,10 @@ operations and equivalent machine APIs:
 | --- | --- |
 | `omf bootstrap` | Create or reconcile a complete selected factory profile |
 | `omf doctor` | Validate host, services, devices, stores, identity, and policy |
+| `omf agent context/capabilities` | Return bounded situation and machine-readable action contracts |
+| `omf executor list/preflight` | Discover providers and verify a binding without allocating a run |
+| `omf goal create/list/status` | Record intent and guard observed lifecycle transitions |
+| `omf knowledge record/list` | Accrete evidence-backed knowledge without rewriting history |
 | `omf module validate/test` | Validate and execute module contract tests |
 | `omf data add` | Copy, register, or stream data into an immutable snapshot |
 | `omf store add` | Declare a holding site without writing credentials to Git |
@@ -608,6 +639,33 @@ A binding MUST identify every implementation and image by immutable revision.
 Operational microbatching MAY differ if the workload's declared global batch and
 numerical semantics remain satisfied.
 
+### 9.2.1 Executor provider resolution
+
+An implementation MUST resolve `Binding.spec.executor` through an explicit,
+inspectable provider registry. Provider-specific options MUST remain in the
+binding (under `spec.config.executor` in this reference contract), not the
+workload. Unknown and duplicate provider names MUST fail closed and MUST NOT
+fall back to a local executor.
+
+Before allocating a run identity, resource, or event, the implementation MUST
+preflight the selected provider against the workload's required transport,
+isolation, and lifecycle capabilities. A provider may claim complete
+`omf.module/v1` execution only when it can:
+
+- make the exact admitted module source available at the worker;
+- deliver the protocol request and retrieve a protocol result;
+- retrieve declared artifacts and logs into the governed run boundary;
+- report durable observed status, cancel work, and reattach after controller
+  restart; and
+- enforce every isolation capability required by the admitted modules.
+
+Submitting to a scheduler does not by itself satisfy this contract. Remote
+providers MAY use shared storage, content-addressed object transport, immutable
+images, or another declared mechanism, but terminal success MUST NOT be
+reported before result and artifact transport is complete. Installed provider
+plugins are trusted control-plane code and MUST be governed as supply-chain
+dependencies.
+
 ### 9.3 Run state machine
 
 ```diagram
@@ -645,6 +703,10 @@ The scheduler contract MUST support:
 
 The scheduler decides **where and when**, not **what the scientific workload
 means**. OMF SHOULD bind existing schedulers rather than inventing one.
+
+Provider inventory and non-mutating preflight MUST be available through the
+same authenticated CLI/API surface as workload admission so automated agents
+can distinguish scheduler availability from end-to-end workload readiness.
 
 ## 10. Data, synthesis, and streaming mixtures
 
@@ -1138,6 +1200,21 @@ MUST support tombstone/revocation events, access denial, impact analysis, and
 payload deletion or cryptographic erasure. Historical metadata SHOULD retain a
 non-sensitive record that an artifact existed and was revoked, where lawful.
 
+### 15.5 Accumulated knowledge
+
+Knowledge claims are entities in the lineage graph. Every claim MUST identify
+at least one evidence reference. Internal evidence SHOULD resolve to an exact
+event, resource revision, run, artifact digest, or lineage node. External
+evidence MUST retain a stable identifier and SHOULD retain a verified digest.
+
+A correction creates a new claim that names the exact claims it supersedes.
+Supersession and expiry remove a claim from the active decision view but MUST
+NOT erase its resource, event, or lineage history. Repeating an identical claim
+MUST be idempotent and MUST NOT emit another semantic event. Knowledge has the
+same authorization, retention, backup, reconciliation, and erasure obligations
+as other project metadata. Claims MUST reference rather than copy secret or
+sensitive payload content.
+
 ## 16. Security, trust, and governance
 
 ### 16.1 Threat model
@@ -1405,7 +1482,7 @@ Claims also name supported capability profiles, such as modality plugins,
 trainers, inference runtimes, environments, and reproducibility classes.
 
 For executable profile decisions, `OMF-Core` requires scenarios 1, 2, 4–12,
-16, and 17 below, excluding cluster-only scenario 3 and site-specific scenarios
+16–18 below, excluding cluster-only scenario 3 and site-specific scenarios
 13–15. `OMF-Cluster` additionally requires scenarios 3 and 14. `OMF-Airgap`
 additionally requires scenario 13. `OMF-Federated` additionally requires
 scenario 15. `OMF-Frontier` requires a complete `OMF-Cluster` or
@@ -1452,6 +1529,11 @@ any required scenario or measured field is absent.
 17. **Governed feedback:** Capture a deployment signal, apply privacy and
     quality policy, materialize a new dataset revision, and prove it cannot
     enter training or update a deployment before explicit approval.
+18. **Agent evidence loop:** Start with an unbootstrapped clone, obtain a
+    bounded bootstrap context, discover action contracts, record and guard a
+    goal, record evidence-backed knowledge, supersede and expire claims, refresh
+    events incrementally, and prove focus/byte limits do not hide blockers or
+    expose event, operation, secret, prompt, or payload values.
 
 ### 21.3 Conformance report
 
@@ -1533,6 +1615,9 @@ after publishing evidence for:
 11. **Scale:** declared capacity is reproduced by the published benchmark.
 12. **Openness:** release artifacts, schemas, tests, lineage summaries,
     licenses, and provenance are independently inspectable.
+13. **Decision efficiency:** an agent can discover capabilities, obtain a
+    bounded current context, identify global blockers, and refresh changes
+    incrementally without scanning all resources or payloads.
 
 ## 24. Open decisions for v0.2
 

@@ -8,12 +8,14 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
-from fastapi import Depends, FastAPI, Header, Query, Request
+from fastapi import Depends, FastAPI, Header, Query, Request, Response
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field
 
 from omf.config import ProjectPaths
 from omf.errors import AuthorizationError, OMFError
+from omf.executors import ExecutorRegistry
 from omf.factory import Factory
 from omf.federation import CapacityOffer, FederatedEvent, FederationBroker, Lease
 from omf.schema_registry import default_registry
@@ -57,6 +59,12 @@ class RunRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     workload: str
     binding: str = "bindings/local.yaml"
+
+
+class ExecutorPreflightRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    binding: str
+    workload: str | None = None
 
 
 class BackupRequest(BaseModel):
@@ -169,9 +177,60 @@ class ConformanceVerifyRequest(BaseModel):
     report: str
 
 
-def create_app(paths: ProjectPaths) -> FastAPI:
+class GoalScopeRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    resource_refs: list[str] = Field(default_factory=list)
+    run_ids: list[str] = Field(default_factory=list)
+
+
+class GoalRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    name: str
+    objective: str
+    success_criteria: list[str]
+    constraints: list[str] = Field(default_factory=list)
+    budget: dict[str, float] = Field(default_factory=dict)
+    priority: int = Field(default=50, ge=0, le=100)
+    parent_ref: str | None = None
+    scope: GoalScopeRequest = Field(default_factory=GoalScopeRequest)
+
+
+class GoalStatusRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    state: str
+    expected_version: int = Field(ge=0)
+    reason: str = Field(min_length=1, max_length=2048)
+
+
+class KnowledgeEvidenceRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    ref: str = Field(min_length=1)
+    digest: str | None = None
+
+
+class KnowledgeScopeRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    goal_refs: list[str] = Field(default_factory=list)
+    resource_refs: list[str] = Field(default_factory=list)
+    run_ids: list[str] = Field(default_factory=list)
+    tags: list[str] = Field(default_factory=list)
+
+
+class KnowledgeRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    name: str
+    category: str
+    claim: str
+    confidence: float = Field(ge=0, le=1)
+    evidence: list[KnowledgeEvidenceRequest] = Field(min_length=1)
+    scope: KnowledgeScopeRequest = Field(default_factory=KnowledgeScopeRequest)
+    supersedes: list[str] = Field(default_factory=list)
+    expires_at: str | None = None
+
+
+def create_app(paths: ProjectPaths, *, executors: ExecutorRegistry | None = None) -> FastAPI:
     """Create one API application bound to an already bootstrapped project."""
-    factory = Factory(paths)
+    factory = Factory(paths, executors=executors)
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
@@ -194,6 +253,40 @@ def create_app(paths: ProjectPaths) -> FastAPI:
     async def omf_error(_request: Request, exc: OMFError) -> JSONResponse:
         return JSONResponse(status_code=exc.status_code, content=exc.as_dict())
 
+    @app.exception_handler(RequestValidationError)
+    async def request_validation_error(
+        _request: Request, exc: RequestValidationError
+    ) -> JSONResponse:
+        errors = [
+            {
+                "path": "$"
+                + "".join(
+                    f"[{item}]" if isinstance(item, int) else f".{item}" for item in error["loc"]
+                ),
+                "message": str(error["msg"]),
+                "type": str(error["type"]),
+            }
+            for error in exc.errors()
+        ]
+        return JSONResponse(
+            status_code=422,
+            content={
+                "error": {
+                    "code": "request_validation_error",
+                    "message": f"request failed validation ({len(errors)} error(s))",
+                    "retryable": False,
+                    "remediation": [
+                        {
+                            "action": "agent.capabilities",
+                            "command": "omf agent capabilities",
+                            "description": "Inspect the action contract and endpoint schema.",
+                        }
+                    ],
+                    "details": {"errors": errors},
+                }
+            },
+        )
+
     def authorized(request: Request, authorization: str = Header(default="")) -> Iterator[Factory]:
         scheme, _, token = authorization.partition(" ")
         principal = factory.authenticate_principal(token) if scheme.lower() == "bearer" else None
@@ -204,16 +297,17 @@ def create_app(paths: ProjectPaths) -> FastAPI:
             "/v1/federation/trust",
             "/v1/federation/leases",
         }
+        read_post_paths = {"/v1/executors/preflight"}
         required_scope = (
             "admin"
             if request.url.path in admin_paths or request.url.path.startswith("/v1/tokens")
             else "read"
-            if request.method == "GET"
+            if request.method == "GET" or request.url.path in read_post_paths
             else "write"
         )
         if not principal.allows(required_scope):
             raise AuthorizationError(f"API token lacks {required_scope} scope")
-        service = Factory(paths, actor=principal.actor)
+        service = Factory(paths, actor=principal.actor, executors=factory.executors)
         try:
             yield service
         finally:
@@ -226,6 +320,118 @@ def create_app(paths: ProjectPaths) -> FastAPI:
     @app.get("/v1/doctor")
     def doctor(service: Factory = Depends(authorized)) -> dict[str, Any]:
         return service.doctor()
+
+    @app.get("/v1/executors")
+    def executors_catalog(service: Factory = Depends(authorized)) -> dict[str, Any]:
+        return service.executor_catalog()
+
+    @app.post("/v1/executors/preflight")
+    def executor_preflight(
+        request: ExecutorPreflightRequest, service: Factory = Depends(authorized)
+    ) -> dict[str, Any]:
+        return service.executor_preflight(
+            paths.root / request.binding,
+            workload_path=paths.root / request.workload if request.workload else None,
+        )
+
+    @app.get("/v1/agent/capabilities")
+    def agent_capabilities(
+        response: Response,
+        if_none_match: str | None = Header(default=None),
+        service: Factory = Depends(authorized),
+    ) -> Any:
+        value = service.agent.capabilities()
+        etag = f'"{value["catalogDigest"]}"'
+        if if_none_match in {etag, value["catalogDigest"]}:
+            return Response(status_code=304, headers={"ETag": etag, "Cache-Control": "no-cache"})
+        response.headers["ETag"] = etag
+        response.headers["Cache-Control"] = "no-cache"
+        return value
+
+    @app.get("/v1/agent/context")
+    def agent_context(
+        response: Response,
+        focus: str | None = None,
+        limit: int = Query(default=20, ge=1, le=100),
+        since: str | None = None,
+        max_bytes: int = Query(default=65_536, ge=16_384, le=1_048_576),
+        if_none_match: str | None = Header(default=None),
+        service: Factory = Depends(authorized),
+    ) -> Any:
+        value = service.agent.context(focus=focus, limit=limit, since=since, max_bytes=max_bytes)
+        etag = f'"{value["viewDigest"]}"'
+        if if_none_match in {etag, value["viewDigest"]}:
+            return Response(status_code=304, headers={"ETag": etag, "Cache-Control": "no-cache"})
+        response.headers["ETag"] = etag
+        response.headers["Cache-Control"] = "no-cache"
+        return value
+
+    @app.post("/v1/goals")
+    def goal_create(request: GoalRequest, service: Factory = Depends(authorized)) -> dict[str, Any]:
+        scope = request.scope.model_dump()
+        return service.agent.create_goal(
+            request.name,
+            objective=request.objective,
+            success_criteria=request.success_criteria,
+            constraints=request.constraints,
+            budget=request.budget,
+            priority=request.priority,
+            parent_ref=request.parent_ref,
+            scope={
+                "resourceRefs": scope["resource_refs"],
+                "runIds": scope["run_ids"],
+            },
+        )
+
+    @app.get("/v1/goals")
+    def goals(
+        state: str | None = None,
+        focus: str | None = None,
+        limit: int = Query(default=20, ge=1, le=100),
+        service: Factory = Depends(authorized),
+    ) -> dict[str, Any]:
+        return service.agent.list_goals(state=state, focus=focus, limit=limit)
+
+    @app.patch("/v1/goals/{name}/status")
+    def goal_status(
+        name: str, request: GoalStatusRequest, service: Factory = Depends(authorized)
+    ) -> dict[str, Any]:
+        return service.agent.set_goal_status(
+            name,
+            state=request.state,
+            expected_version=request.expected_version,
+            reason=request.reason,
+        )
+
+    @app.post("/v1/knowledge")
+    def knowledge_record(
+        request: KnowledgeRequest, service: Factory = Depends(authorized)
+    ) -> dict[str, Any]:
+        scope = request.scope.model_dump()
+        return service.agent.record_knowledge(
+            request.name,
+            category=request.category,
+            claim=request.claim,
+            confidence=request.confidence,
+            evidence=[item.model_dump(exclude_none=True) for item in request.evidence],
+            scope={
+                "goalRefs": scope["goal_refs"],
+                "resourceRefs": scope["resource_refs"],
+                "runIds": scope["run_ids"],
+                "tags": scope["tags"],
+            },
+            supersedes=request.supersedes,
+            expires_at=request.expires_at,
+        )
+
+    @app.get("/v1/knowledge")
+    def knowledge(
+        active_only: bool = True,
+        focus: str | None = None,
+        limit: int = Query(default=20, ge=1, le=100),
+        service: Factory = Depends(authorized),
+    ) -> dict[str, Any]:
+        return service.agent.list_knowledge(active_only=active_only, focus=focus, limit=limit)
 
     @app.get("/v1/schemas")
     def schemas(_service: Factory = Depends(authorized)) -> dict[str, Any]:

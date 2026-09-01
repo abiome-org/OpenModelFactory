@@ -15,6 +15,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from omf.agent import AgentControl
 from omf.artifacts import ArtifactBuilder, ArtifactManifest
 from omf.canonical import canonical_json, load_document, sha256_digest
 from omf.config import ProjectPaths, load_project
@@ -31,7 +32,14 @@ from omf.errors import (
     ValidationError,
 )
 from omf.events import EventStore
-from omf.executors import LocalExecutor
+from omf.executors import (
+    DEPLOYMENT_PROTOCOL_CAPABILITIES,
+    MODULE_PROTOCOL_CAPABILITIES,
+    Executor,
+    ExecutorRegistry,
+    ResolvedExecutor,
+    default_executor_registry,
+)
 from omf.federation import FederationBroker
 from omf.ids import uuid7
 from omf.lineage import LineageEdge, LineageStore
@@ -63,9 +71,24 @@ def _utc_now() -> str:
 class Factory:
     """One authenticated application boundary shared by CLI and HTTP interfaces."""
 
-    def __init__(self, paths: ProjectPaths, *, actor: str = "local-user") -> None:
+    def __init__(
+        self,
+        paths: ProjectPaths,
+        *,
+        actor: str = "local-user",
+        executors: ExecutorRegistry | None = None,
+    ) -> None:
         if not paths.database.exists():
-            raise ConfigurationError("factory is not bootstrapped; run `omf bootstrap` first")
+            raise ConfigurationError(
+                "factory is not bootstrapped; run `omf bootstrap` first",
+                remediation=[
+                    {
+                        "action": "project.bootstrap",
+                        "command": "omf bootstrap --plan && omf bootstrap",
+                        "description": "Inspect and then apply repository-scoped initialization.",
+                    }
+                ],
+            )
         self.paths = paths
         self.actor = actor
         self.project = load_project(paths)
@@ -89,6 +112,8 @@ class Factory:
         self.operations = OperationStore(self.db)
         self.local_store = FilesystemStore(paths.store)
         self.telemetry = TelemetrySink(paths.telemetry)
+        self.executors = executors or default_executor_registry()
+        self.agent = AgentControl(self)
 
     def close(self) -> None:
         self.db.close()
@@ -521,6 +546,16 @@ class Factory:
     def test_module(self, manifest_path: str | Path) -> dict[str, Any]:
         manifest, code_root = load_manifest(manifest_path, self.paths.root)
         validate_fixtures(manifest)
+        resolved = self._resolve_executor(
+            "local",
+            {"kind": "ModuleTest", "manifest": str(Path(manifest_path).resolve())},
+            {},
+        )
+        self._require_executor(
+            resolved,
+            MODULE_PROTOCOL_CAPABILITIES
+            | (frozenset({"isolation:network-deny"}) if not manifest.network else frozenset()),
+        )
         fixtures = manifest.fixtures or [{"request": {"operation": "validate"}, "result": {}}]
         results = []
         for index, fixture in enumerate(fixtures):
@@ -532,6 +567,8 @@ class Factory:
                 code_root,
                 protocol,
                 self.paths.runs / "module-tests" / f"{Path(manifest_path).stem}-{index}",
+                executor=resolved.executor,
+                executor_config=resolved.config,
             )
             expected = fixture.get("result", {})
             actual = result.model_dump(mode="json")
@@ -547,6 +584,9 @@ class Factory:
         code_root: Path,
         request: ProtocolRequest,
         run_dir: Path,
+        *,
+        executor: Executor,
+        executor_config: dict[str, Any],
     ) -> ProtocolResult:
         run_dir.mkdir(parents=True, exist_ok=True)
         request_path = run_dir / "request.json"
@@ -554,7 +594,6 @@ class Factory:
         argv = list(manifest.argv)
         if "/" in argv[0]:
             argv[0] = str((code_root / argv[0]).resolve())
-        executor = LocalExecutor()
         plan = executor.plan(
             argv=argv,
             run_dir=run_dir,
@@ -562,6 +601,8 @@ class Factory:
             resources=manifest.resources,
             timeout=float(manifest.resources.get("timeout_seconds", 0)) or None,
             deny_network=not manifest.network,
+            requires_result=True,
+            **executor_config,
         )
         execution_id = executor.submit(plan)
         while True:
@@ -587,6 +628,108 @@ class Factory:
             )
         return result
 
+    @staticmethod
+    def _executor_config(declaration: dict[str, Any]) -> dict[str, Any]:
+        spec = declaration.get("spec", {})
+        config = spec.get("config", {}) if isinstance(spec, dict) else {}
+        if not isinstance(config, dict):
+            raise ValidationError("declaration spec.config must be an object")
+        options = config.get("executor", {})
+        if not isinstance(options, dict):
+            raise ValidationError("spec.config.executor must be an object")
+        return dict(options)
+
+    def _resolve_executor(
+        self, name: str, declaration: dict[str, Any], config: dict[str, Any]
+    ) -> ResolvedExecutor:
+        return self.executors.resolve(
+            name,
+            project_root=self.paths.root,
+            state_root=self.paths.state,
+            actor=self.actor,
+            declaration=declaration,
+            config=config,
+        )
+
+    def _require_executor(
+        self, resolved: ResolvedExecutor, required: frozenset[str]
+    ) -> dict[str, Any]:
+        report = self.executors.preflight(resolved, required_capabilities=required)
+        if report["ready"]:
+            return report
+        raise CapabilityError(
+            f"executor provider {resolved.provider.name!r} is not ready",
+            details=report,
+            remediation=[
+                {
+                    "action": "executor.preflight",
+                    "command": "omf executor preflight <binding> --workload <workload>",
+                    "description": "Inspect missing transport capabilities and host prerequisites.",
+                }
+            ],
+        )
+
+    @staticmethod
+    def _stages(workload: dict[str, Any]) -> list[Stage]:
+        stages_value = workload.get("stages")
+        if stages_value is None and isinstance(workload.get("spec"), dict):
+            stages_value = workload["spec"].get("graph", {}).get("stages")
+        stages = [Stage.model_validate(stage) for stage in stages_value or []]
+        if not stages:
+            raise ValidationError("workload has no stages")
+        return stages
+
+    def _module_requirements(self, stages: list[Stage]) -> frozenset[str]:
+        required = set(MODULE_PROTOCOL_CAPABILITIES)
+        for stage in stages:
+            module_path = Path(stage.module)
+            if not module_path.is_absolute():
+                module_path = self.paths.root / module_path
+            manifest, _code_root = load_manifest(module_path, self.paths.root)
+            validate_fixtures(manifest)
+            if not manifest.network:
+                required.add("isolation:network-deny")
+        return frozenset(required)
+
+    def executor_catalog(self) -> dict[str, Any]:
+        return self.executors.catalog()
+
+    def _project_file(self, value: str | Path, *, kind: str) -> Path:
+        candidate = Path(value)
+        if not candidate.is_absolute():
+            candidate = self.paths.root / candidate
+        resolved = candidate.resolve()
+        try:
+            resolved.relative_to(self.paths.root.resolve())
+        except ValueError as exc:
+            raise ValidationError(f"{kind} must be inside the project repository") from exc
+        if not resolved.is_file():
+            raise ValidationError(f"{kind} file does not exist")
+        return resolved
+
+    def executor_preflight(
+        self,
+        binding_path: str | Path,
+        *,
+        workload_path: str | Path | None = None,
+    ) -> dict[str, Any]:
+        binding_file = self._project_file(binding_path, kind="binding")
+        binding = load_document(binding_file.read_bytes())
+        if not isinstance(binding, dict):
+            raise ValidationError("binding must be an object")
+        default_registry.validate(binding)
+        self._validate_namespace(binding)
+        required = MODULE_PROTOCOL_CAPABILITIES
+        if workload_path is not None:
+            workload_file = self._project_file(workload_path, kind="workload")
+            workload = load_document(workload_file.read_bytes())
+            if not isinstance(workload, dict):
+                raise ValidationError("workload must be an object")
+            required = self._module_requirements(self._stages(workload))
+        name = str(binding["spec"]["executor"])
+        resolved = self._resolve_executor(name, binding, self._executor_config(binding))
+        return self.executors.preflight(resolved, required_capabilities=required)
+
     def run(self, workload_path: str | Path, binding_path: str | Path) -> dict[str, Any]:
         workload_raw = load_document(Path(workload_path).read_bytes())
         binding_raw = load_document(Path(binding_path).read_bytes())
@@ -595,17 +738,12 @@ class Factory:
         default_registry.validate(binding_raw)
         self._validate_namespace(binding_raw)
         executor_name = str(binding_raw["spec"]["executor"])
-        if executor_name != "local":
-            raise ValidationError(
-                f"executor {executor_name!r} is available as an adapter but is not integrated "
-                "with workload execution; this run was not submitted"
-            )
-        stages_value = workload_raw.get("stages")
-        if stages_value is None and isinstance(workload_raw.get("spec"), dict):
-            stages_value = workload_raw["spec"].get("graph", {}).get("stages")
-        stages = [Stage.model_validate(stage) for stage in stages_value or []]
-        if not stages:
-            raise ValidationError("workload has no stages")
+        stages = self._stages(workload_raw)
+        required = self._module_requirements(stages)
+        resolved_executor = self._resolve_executor(
+            executor_name, binding_raw, self._executor_config(binding_raw)
+        )
+        self._require_executor(resolved_executor, required)
         run_id = str(uuid7())
         run_dir = self.paths.runs / run_id
         admitted_modules: dict[str, tuple[ModuleManifest, Path, str]] = {}
@@ -689,7 +827,12 @@ class Factory:
                 },
             )
             result = self._execute_module(
-                manifest, code_root, request, run_dir / "stages" / stage.name
+                manifest,
+                code_root,
+                request,
+                run_dir / "stages" / stage.name,
+                executor=resolved_executor.executor,
+                executor_config=resolved_executor.config,
             )
             stage_outputs = dict(result.outputs)
             for artifact_index, artifact_value in enumerate(result.artifacts):
@@ -1204,7 +1347,7 @@ class Factory:
         return True
 
     def deploy(self, deployment_path: str | Path) -> dict[str, Any]:
-        """Apply a deployment resource and launch an explicitly declared local command."""
+        """Apply a deployment resource through its explicitly selected executor provider."""
         raw = load_document(Path(deployment_path).read_bytes())
         if not isinstance(raw, dict):
             raise ValidationError("deployment file must contain one resource")
@@ -1231,6 +1374,12 @@ class Factory:
         command = extension.get("command")
         if form != "edge" and not command:
             raise ValidationError("non-edge deployment requires extensions.command argv")
+        if command:
+            resolved = self._deployment_executor(raw)
+            required = DEPLOYMENT_PROTOCOL_CAPABILITIES
+            if bool(extension.get("denyNetwork", False)):
+                required |= frozenset({"isolation:network-deny"})
+            self._require_executor(resolved, required)
         name = str(raw["metadata"]["name"])
         desired_revision = default_registry.normalize(raw, actor=self.actor)["metadata"]["revision"]
         expected_version: int | None = None
@@ -1254,7 +1403,7 @@ class Factory:
         except NotFoundError:
             pass
         resource = self.apply_resource(raw)
-        state, execution_id, run_dir = self._launch_deployment(resource)
+        state, execution_id, run_dir, executor_name = self._launch_deployment(resource)
         self.resources.set_status(
             resource["metadata"]["uid"],
             {
@@ -1265,6 +1414,7 @@ class Factory:
                     previous_status.get("deploymentRevision") if previous_status else None
                 ),
                 "executionId": execution_id,
+                "executor": executor_name,
                 "runDirectory": str(run_dir) if run_dir else None,
             },
             expected_version=expected_version,
@@ -1290,13 +1440,21 @@ class Factory:
         )
         return {"deployment": resource, "state": state, "executionId": execution_id}
 
+    def _deployment_executor(self, resource: dict[str, Any]) -> ResolvedExecutor:
+        extension = resource["spec"].get("extensions", {})
+        name = str(extension.get("executor", "local"))
+        config = extension.get("executorConfig", {})
+        if not isinstance(config, dict):
+            raise ValidationError("deployment extensions.executorConfig must be an object")
+        return self._resolve_executor(name, resource, config)
+
     def _launch_deployment(
         self, resource: dict[str, Any], *, instance: str | None = None
-    ) -> tuple[str, str | None, Path | None]:
+    ) -> tuple[str, str | None, Path | None, str | None]:
         extension = resource["spec"].get("extensions", {})
         command = extension.get("command")
         if not command:
-            return "packaged", None, None
+            return "packaged", None, None, None
         if not isinstance(command, list) or not all(isinstance(item, str) for item in command):
             raise ValidationError("deployment command must be an argv string array")
         run_dir = (
@@ -1307,8 +1465,12 @@ class Factory:
         )
         if instance:
             run_dir /= instance
-        executor = LocalExecutor()
-        plan = executor.plan(
+        resolved = self._deployment_executor(resource)
+        required = DEPLOYMENT_PROTOCOL_CAPABILITIES
+        if bool(extension.get("denyNetwork", False)):
+            required |= frozenset({"isolation:network-deny"})
+        self._require_executor(resolved, required)
+        plan = resolved.executor.plan(
             argv=command,
             run_dir=run_dir,
             cwd=self.paths.root,
@@ -1316,8 +1478,9 @@ class Factory:
             timeout=float(extension.get("timeoutSeconds", 0)) or None,
             deny_network=bool(extension.get("denyNetwork", False)),
             requires_result=False,
+            **resolved.config,
         )
-        return "running", executor.submit(plan), run_dir
+        return "running", resolved.executor.submit(plan), run_dir, resolved.provider.name
 
     def deployment_status(self, name: str) -> dict[str, Any]:
         resource = self.find_resource("DeploymentSpec", name)
@@ -1328,10 +1491,13 @@ class Factory:
             resource = self.resources.get(uid, str(desired_revision))
         execution_id = status.get("executionId")
         if status.get("state") == "running" and execution_id:
-            executor = LocalExecutor()
+            resolved = self._deployment_executor(resource)
+            status_executor = str(status.get("executor", resolved.provider.name))
+            if status_executor != resolved.provider.name:
+                raise IntegrityError("deployment executor does not match its immutable revision")
             run_dir = Path(str(status.get("runDirectory") or self.paths.runs / "deployments" / uid))
-            executor.reconcile(run_dir)
-            observed = executor.status(str(execution_id))
+            resolved.executor.attach(str(execution_id), run_dir)
+            observed = resolved.executor.status(str(execution_id))
             if observed.state != "running":
                 updated = {
                     **status,
@@ -1357,16 +1523,19 @@ class Factory:
         execution_id = status.get("executionId")
         if not execution_id:
             raise IntegrityError("running deployment has no execution identity")
-        executor = LocalExecutor()
+        resolved = self._deployment_executor(resource)
+        status_executor = str(status.get("executor", resolved.provider.name))
+        if status_executor != resolved.provider.name:
+            raise IntegrityError("deployment executor does not match its immutable revision")
         run_dir = Path(
             str(
                 status.get("runDirectory")
                 or self.paths.runs / "deployments" / resource["metadata"]["uid"]
             )
         )
-        executor.reconcile(run_dir)
-        executor.cancel(str(execution_id))
-        observed = executor.status(str(execution_id))
+        resolved.executor.attach(str(execution_id), run_dir)
+        resolved.executor.cancel(str(execution_id))
+        observed = resolved.executor.status(str(execution_id))
         updated = {
             **status,
             "state": observed.state,
@@ -1394,7 +1563,7 @@ class Factory:
         target = self.resources.get(resource["metadata"]["uid"], str(previous))
         release_name = str(target["spec"]["releaseRef"]).removeprefix("release/")
         release = self.find_resource("Release", release_name)
-        state, execution_id, run_dir = self._launch_deployment(
+        state, execution_id, run_dir, executor_name = self._launch_deployment(
             target, instance=f"rollback-{expected_version + 1}"
         )
         updated = {
@@ -1403,6 +1572,7 @@ class Factory:
             "deploymentRevision": target["metadata"]["revision"],
             "previousDeploymentRevision": status["deploymentRevision"],
             "executionId": execution_id,
+            "executor": executor_name,
             "runDirectory": str(run_dir) if run_dir else None,
             "reason": "rollback",
         }

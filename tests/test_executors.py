@@ -2,8 +2,11 @@ import shutil
 from types import SimpleNamespace
 
 import pytest
+from omf.errors import CapabilityError, ConfigurationError, ValidationError
+from omf.executors import ExecutorContext, ExecutorProvider, ExecutorRegistry
 from omf.executors.kubernetes import KubernetesExecutor
 from omf.executors.local import LocalExecutor
+from omf.executors.registry import default_executor_registry
 from omf.executors.slurm import SlurmExecutor
 
 
@@ -21,6 +24,109 @@ def test_deterministic_plans_and_preflight(tmp_path, monkeypatch):
     kube = KubernetesExecutor()
     with pytest.raises(ValueError, match="immutable"):
         kube.plan(argv=["x"], run_dir=tmp_path, cwd=tmp_path, image="latest")
+
+
+def test_executor_registry_catalog_duplicates_unknown_and_discovery(tmp_path, monkeypatch):
+    registry = default_executor_registry(discover=False)
+    catalog = registry.catalog()
+    assert [item["name"] for item in catalog["providers"]] == [
+        "kubernetes",
+        "local",
+        "slurm",
+    ]
+    with pytest.raises(ConfigurationError, match="duplicate"):
+        registry.register(
+            ExecutorProvider("local", lambda _context: LocalExecutor()), source="test"
+        )
+    with pytest.raises(CapabilityError, match="unknown"):
+        registry.resolve(
+            "missing",
+            project_root=tmp_path,
+            state_root=tmp_path / ".omf",
+            actor="tester",
+            declaration={},
+        )
+
+    custom = ExecutorRegistry()
+    provider = ExecutorProvider(
+        "custom",
+        lambda context: LocalExecutor() if isinstance(context, ExecutorContext) else None,
+        config_contract={"type": "object", "additionalProperties": False},
+    )
+    entry_point = SimpleNamespace(
+        name="custom",
+        value="example.provider:provider",
+        dist=SimpleNamespace(name="example-provider"),
+        load=lambda: provider,
+    )
+    entry_points = SimpleNamespace(select=lambda **_kwargs: [entry_point])
+    monkeypatch.setattr("omf.executors.registry.metadata.entry_points", lambda: entry_points)
+    custom.discover()
+    assert custom.catalog()["providers"][0]["source"].startswith("entry-point:example-provider")
+
+    with pytest.raises(ValidationError, match="provider contract") as invalid:
+        custom.resolve(
+            "custom",
+            project_root=tmp_path,
+            state_root=tmp_path / ".omf",
+            actor="tester",
+            declaration={},
+            config={"submitted-secret": "must-not-be-returned"},
+        )
+    assert "must-not-be-returned" not in repr(invalid.value.as_dict())
+
+    injected = ExecutorRegistry()
+    injected.register(provider)
+    assert injected.catalog()["providers"][0]["source"] == "runtime"
+
+
+def test_executor_registry_rejects_invalid_plugins_and_controller_fields(tmp_path, monkeypatch):
+    registry = ExecutorRegistry()
+    with pytest.raises(ConfigurationError, match="normalized"):
+        registry.register(ExecutorProvider(" invalid ", lambda _context: LocalExecutor()))
+    with pytest.raises(ConfigurationError, match="invalid config contract"):
+        registry.register(
+            ExecutorProvider(
+                "invalid-schema",
+                lambda _context: LocalExecutor(),
+                config_contract={"type": "not-a-json-schema-type"},
+            )
+        )
+
+    provider = ExecutorProvider("valid", lambda _context: LocalExecutor())
+    registry.register(provider)
+    resolve = {
+        "project_root": tmp_path,
+        "state_root": tmp_path / ".omf",
+        "actor": "tester",
+        "declaration": {},
+    }
+    with pytest.raises(ValidationError, match="controller-owned"):
+        registry.resolve("valid", config={"argv": ["unexpected"]}, **resolve)
+
+    invalid_executor = ExecutorRegistry()
+    invalid_executor.register(ExecutorProvider("invalid", lambda _context: object()))
+    with pytest.raises(ConfigurationError, match="invalid adapter"):
+        invalid_executor.resolve("invalid", **resolve)
+
+    bad_entry_point = SimpleNamespace(
+        name="broken",
+        value="broken:provider",
+        load=lambda: (_ for _ in ()).throw(ImportError("unavailable")),
+    )
+    entry_points = SimpleNamespace(select=lambda **_kwargs: [bad_entry_point])
+    monkeypatch.setattr("omf.executors.registry.metadata.entry_points", lambda: entry_points)
+    with pytest.raises(ConfigurationError, match="could not be loaded"):
+        ExecutorRegistry().discover()
+
+    wrong_entry_point = SimpleNamespace(
+        name="declared-name",
+        value="wrong:provider",
+        load=lambda: ExecutorProvider("different-name", lambda _context: LocalExecutor()),
+    )
+    entry_points = SimpleNamespace(select=lambda **_kwargs: [wrong_entry_point])
+    with pytest.raises(ConfigurationError, match="does not match"):
+        ExecutorRegistry().discover()
 
 
 def test_local_executor_success_failure_logs_and_reconcile(tmp_path):
@@ -141,3 +247,33 @@ def test_slurm_and_kubernetes_adapter_lifecycle(tmp_path, monkeypatch):
         roles=[{"name": "trainer"}],
     )
     assert jobset.metadata["resource"]["kind"] == "JobSet"
+
+
+def test_slurm_module_transport_plan_is_explicit(tmp_path):
+    executor = SlurmExecutor(
+        shared_filesystem=True,
+        binding_resources={"gpus": 4},
+        placement={"partition": "gpu"},
+    )
+    plan = executor.plan(
+        argv=["python3", "train.py"],
+        run_dir=tmp_path / "run",
+        cwd=tmp_path,
+        timeout=61,
+        requires_result=True,
+    )
+    script = plan.metadata["script"]
+    assert script.index("#SBATCH --gpus=4") < script.index("set -eu")
+    assert "#SBATCH --partition='gpu'" in script
+    assert "#SBATCH --time=2" in script
+    assert "OMF_REQUEST_FILE" in script
+    assert "OMF_RESULT_FILE" in script
+    assert "protocol:omf.module/v1" in executor.capabilities
+    executor.attach("42", tmp_path / "run")
+
+    with pytest.raises(RuntimeError, match="shared filesystem"):
+        SlurmExecutor().plan(
+            argv=["x"], run_dir=tmp_path / "missing", cwd=tmp_path, requires_result=True
+        )
+    with pytest.raises(RuntimeError, match="network denial"):
+        executor.plan(argv=["x"], run_dir=tmp_path / "denied", cwd=tmp_path, deny_network=True)

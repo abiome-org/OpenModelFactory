@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import builtins
 import json
 from datetime import UTC, datetime
 from typing import Any
@@ -89,4 +90,20 @@ class OperationStore:
             query += " WHERE state=?"
             args = (state,)
         query += " ORDER BY id"
+        return [self.get(str(row[0])) for row in self.db.connection.execute(query, args)]
+
+    def recent(
+        self, *, states: set[str] | None = None, limit: int = 20
+    ) -> builtins.list[dict[str, Any]]:
+        """Return a bounded newest-first operation window."""
+        if limit < 1:
+            return []
+        query = "SELECT id FROM operations"
+        args: builtins.list[Any] = []
+        if states:
+            placeholders = ",".join("?" for _ in states)
+            query += f" WHERE state IN ({placeholders})"
+            args.extend(sorted(states))
+        query += " ORDER BY id DESC LIMIT ?"
+        args.append(limit)
         return [self.get(str(row[0])) for row in self.db.connection.execute(query, args)]

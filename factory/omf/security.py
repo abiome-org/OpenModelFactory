@@ -238,7 +238,10 @@ class SecretStore:
             ).fetchone()
             current = None if row is None else int(row[0])
             if current != expected_version:
-                raise ConflictError("secret version mismatch")
+                raise ConflictError(
+                    "secret version mismatch",
+                    details={"expectedVersion": expected_version, "currentVersion": current},
+                )
             version, created = (1, now) if row is None else (int(row[0]) + 1, str(row[1]))
             connection.execute(
                 "INSERT INTO secrets VALUES(?,?,?,?,?,?,?) ON CONFLICT(name) DO UPDATE SET purpose=excluded.purpose,nonce=excluded.nonce,ciphertext=excluded.ciphertext,updated_at=excluded.updated_at,version=excluded.version",
@@ -265,7 +268,10 @@ class SecretStore:
             if row is None:
                 raise NotFoundError("secret not found")
             if expected_version is not None and int(row[0]) != expected_version:
-                raise ConflictError("secret version mismatch")
+                raise ConflictError(
+                    "secret version mismatch",
+                    details={"expectedVersion": expected_version, "currentVersion": int(row[0])},
+                )
             connection.execute("DELETE FROM secrets WHERE name=?", (name,))
 
     def list(self) -> list[dict[str, Any]]:

@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import builtins
 import contextlib
 import json
 import sqlite3
@@ -59,6 +60,23 @@ _SCHEMA_V2 = """
 CREATE TABLE IF NOT EXISTS api_tokens(token_hash TEXT PRIMARY KEY, actor TEXT NOT NULL,
  scopes BLOB NOT NULL, expires_at TEXT, created_at TEXT NOT NULL, revoked_at TEXT);
 CREATE INDEX IF NOT EXISTS api_tokens_actor_idx ON api_tokens(actor,revoked_at);
+"""
+
+_SCHEMA_V3 = """
+CREATE INDEX IF NOT EXISTS resources_kind_uid_created_idx
+ ON resources(kind,uid,created_at,revision);
+CREATE INDEX IF NOT EXISTS resources_created_idx ON resources(created_at,uid);
+CREATE INDEX IF NOT EXISTS operations_state_id_idx ON operations(state,id);
+"""
+
+_SCHEMA_V4 = """
+CREATE TABLE IF NOT EXISTS event_order(position INTEGER PRIMARY KEY AUTOINCREMENT,
+ event_id TEXT NOT NULL UNIQUE REFERENCES events(id));
+INSERT OR IGNORE INTO event_order(event_id) SELECT id FROM events ORDER BY time,id;
+CREATE TRIGGER IF NOT EXISTS event_order_no_update BEFORE UPDATE ON event_order
+ BEGIN SELECT RAISE(ABORT,'immutable event order'); END;
+CREATE TRIGGER IF NOT EXISTS event_order_no_delete BEFORE DELETE ON event_order
+ BEGIN SELECT RAISE(ABORT,'immutable event order'); END;
 """
 
 
@@ -137,6 +155,28 @@ class Database:
                         connection.execute(statement)
                         statement = ""
                 connection.execute("INSERT INTO schema_migrations VALUES(2)")
+            if (
+                connection.execute("SELECT 1 FROM schema_migrations WHERE version=3").fetchone()
+                is None
+            ):
+                statement = ""
+                for line in _SCHEMA_V3.splitlines():
+                    statement += line + "\n"
+                    if sqlite3.complete_statement(statement):
+                        connection.execute(statement)
+                        statement = ""
+                connection.execute("INSERT INTO schema_migrations VALUES(3)")
+            if (
+                connection.execute("SELECT 1 FROM schema_migrations WHERE version=4").fetchone()
+                is None
+            ):
+                statement = ""
+                for line in _SCHEMA_V4.splitlines():
+                    statement += line + "\n"
+                    if sqlite3.complete_statement(statement):
+                        connection.execute(statement)
+                        statement = ""
+                connection.execute("INSERT INTO schema_migrations VALUES(4)")
 
     def rebuild_indices(self) -> None:
         with self.transaction(immediate=True) as connection:
@@ -209,6 +249,48 @@ class ResourceRepository:
             for row in self.db.connection.execute(query + " ORDER BY uid,revision", args)
         ]
 
+    def latest(
+        self, *, kind: str | None = None, limit: int | None = None
+    ) -> builtins.list[dict[str, Any]]:
+        """Return the newest immutable revision of each logical resource."""
+        if limit is not None and limit < 1:
+            return []
+        where = "WHERE kind=?" if kind is not None else ""
+        args: builtins.list[Any] = [kind] if kind is not None else []
+        query = f"""
+            WITH ranked AS (
+              SELECT data,created_at,uid,revision,
+                ROW_NUMBER() OVER (
+                  PARTITION BY uid ORDER BY created_at DESC,revision DESC
+                ) AS position
+              FROM resources {where}
+            )
+            SELECT data FROM ranked WHERE position=1
+            ORDER BY created_at DESC,uid DESC
+        """
+        if limit is not None:
+            query += " LIMIT ?"
+            args.append(limit)
+        return [json.loads(row[0]) for row in self.db.connection.execute(query, args)]
+
+    def inventory(self) -> builtins.list[dict[str, Any]]:
+        """Return bounded per-kind object/revision counts without loading resource bodies."""
+        rows = self.db.connection.execute(
+            """
+            SELECT kind,COUNT(DISTINCT uid),COUNT(*),MAX(created_at)
+            FROM resources GROUP BY kind ORDER BY kind
+            """
+        )
+        return [
+            {
+                "kind": str(row[0]),
+                "objects": int(row[1]),
+                "revisions": int(row[2]),
+                "latestAt": str(row[3]),
+            }
+            for row in rows
+        ]
+
     def get_status(self, uid: str) -> tuple[dict[str, Any], int]:
         row = self.db.connection.execute(
             "SELECT data,version FROM statuses WHERE uid=?", (uid,)
@@ -223,7 +305,10 @@ class ResourceRepository:
             row = connection.execute("SELECT version FROM statuses WHERE uid=?", (uid,)).fetchone()
             current = None if row is None else int(row[0])
             if current != expected_version:
-                raise ConflictError("status version mismatch")
+                raise ConflictError(
+                    "status version mismatch",
+                    details={"expectedVersion": expected_version, "currentVersion": current},
+                )
             version = 1 if current is None else current + 1
             connection.execute(
                 "INSERT INTO statuses VALUES(?,?,?) ON CONFLICT(uid) DO UPDATE SET data=excluded.data,version=excluded.version",
@@ -241,7 +326,10 @@ class AliasRepository:
             row = connection.execute("SELECT version FROM aliases WHERE name=?", (name,)).fetchone()
             current = None if row is None else int(row[0])
             if current != expected_version:
-                raise ConflictError("alias version mismatch")
+                raise ConflictError(
+                    "alias version mismatch",
+                    details={"expectedVersion": expected_version, "currentVersion": current},
+                )
             version = 1 if current is None else current + 1
             connection.execute(
                 "INSERT INTO aliases VALUES(?,?,?,?) ON CONFLICT(name) DO UPDATE SET uid=excluded.uid,revision=excluded.revision,version=excluded.version",

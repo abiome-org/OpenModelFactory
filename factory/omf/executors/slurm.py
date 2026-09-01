@@ -6,16 +6,34 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
-from omf.executors.base import ExecutionPlan, ExecutionState, ExecutionStatus, Executor
+from omf.executors.base import (
+    MODULE_PROTOCOL_CAPABILITIES,
+    ExecutionPlan,
+    ExecutionState,
+    ExecutionStatus,
+    Executor,
+)
 
 
 class SlurmExecutor(Executor):
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        shared_filesystem: bool = False,
+        binding_resources: dict[str, Any] | None = None,
+        placement: dict[str, Any] | None = None,
+    ) -> None:
+        self.shared_filesystem = shared_filesystem
+        self.binding_resources = binding_resources or {}
+        self.placement = placement or {}
         self._dirs: dict[str, Path] = {}
 
     @property
     def capabilities(self) -> frozenset[str]:
-        return frozenset({"gang", "preemption", "signals", "checkpoint-hooks"})
+        capabilities = {"gang", "preemption", "signals", "checkpoint-hooks"}
+        if self.shared_filesystem:
+            capabilities.update(MODULE_PROTOCOL_CAPABILITIES)
+        return frozenset(capabilities)
 
     def preflight(self) -> list[str]:
         return [f"missing tool: {x}" for x in ("sbatch", "sacct", "scancel") if not shutil.which(x)]
@@ -27,10 +45,22 @@ class SlurmExecutor(Executor):
         run_dir: Path,
         cwd: Path,
         resources: dict[str, Any] | None = None,
+        env: dict[str, str] | None = None,
+        timeout: float | None = None,
+        deny_network: bool = False,
+        requires_result: bool = False,
         **_: Any,
     ) -> ExecutionPlan:
-        r = resources or {}
-        lines = ["#!/bin/sh", "set -eu"]
+        if requires_result and not self.shared_filesystem:
+            raise RuntimeError("module execution requires a declared shared filesystem")
+        if deny_network:
+            raise RuntimeError("the built-in Slurm adapter cannot enforce network denial")
+        r = {**self.binding_resources, **(resources or {})}
+        lines = [
+            "#!/bin/sh",
+            f"#SBATCH --output={_quote(str(run_dir / 'slurm-%j.out'))}",
+            f"#SBATCH --error={_quote(str(run_dir / 'slurm-%j.err'))}",
+        ]
         for key, flag in (
             ("nodes", "nodes"),
             ("tasks", "ntasks"),
@@ -39,11 +69,35 @@ class SlurmExecutor(Executor):
         ):
             if key in r:
                 lines.append(f"#SBATCH --{flag}={int(r[key])}")
+        for key, flag in (
+            ("partition", "partition"),
+            ("account", "account"),
+            ("qos", "qos"),
+            ("constraint", "constraint"),
+            ("reservation", "reservation"),
+        ):
+            if key in self.placement:
+                lines.append(f"#SBATCH --{flag}={_quote(str(self.placement[key]))}")
+        if timeout is not None:
+            lines.append(f"#SBATCH --time={max(1, int((timeout + 59) // 60))}")
+        lines.append("set -eu")
+        environment = {
+            **(env or {}),
+            "OMF_REQUEST_FILE": str(run_dir / "request.json"),
+            "OMF_RESULT_FILE": str(run_dir / "result.json"),
+        }
+        for key, value in sorted(environment.items()):
+            lines.append(f"export {key}={_quote(value)}")
+        lines.append('export OMF_RUN_ID="${SLURM_JOB_ID}"')
         lines.append("exec " + " ".join(_quote(x) for x in argv))
         return ExecutionPlan(
             ("sbatch", "--parsable", str(run_dir / "job.sh")),
             run_dir,
             cwd,
+            env or {},
+            r,
+            timeout,
+            deny_network,
             metadata={"script": "\n".join(lines) + "\n"},
         )
 
@@ -84,6 +138,9 @@ class SlurmExecutor(Executor):
     def logs(self, execution_id: str) -> tuple[Path, Path]:
         d = self._dirs[execution_id]
         return d / f"slurm-{execution_id}.out", d / f"slurm-{execution_id}.err"
+
+    def attach(self, execution_id: str, run_dir: Path) -> None:
+        self._dirs[execution_id] = run_dir
 
 
 def _quote(value: str) -> str:

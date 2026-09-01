@@ -2,6 +2,7 @@ import subprocess
 from dataclasses import asdict
 from datetime import UTC, datetime, timedelta
 
+import yaml
 from fastapi.testclient import TestClient
 from omf.api import create_app
 from omf.config import ProjectPaths, bootstrap
@@ -32,6 +33,17 @@ spec:
 
 def test_api_health_auth_schemas_resources_and_doctor(tmp_path):
     paths = _paths(tmp_path)
+    (paths.root / "bindings").mkdir()
+    (paths.root / "bindings/local.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "apiVersion": "omf.dev/v1alpha1",
+                "kind": "Binding",
+                "metadata": {"name": "local", "namespace": "local/api-test"},
+                "spec": {"executor": "local", "resources": {}, "config": {}},
+            }
+        )
+    )
     with Factory(paths) as factory:
         token = factory.secrets.get("local-api-token", "api-authentication").decode()
         operation_id = factory.operations.create("test", {"value": 1})["id"]
@@ -40,6 +52,24 @@ def test_api_health_auth_schemas_resources_and_doctor(tmp_path):
         assert client.get("/v1/doctor").status_code == 403
         headers = {"Authorization": f"Bearer {token}"}
         assert client.get("/v1/doctor", headers=headers).json()["ready"]
+        providers = client.get("/v1/executors", headers=headers).json()["providers"]
+        assert {item["name"] for item in providers} >= {"local", "kubernetes", "slurm"}
+        preflight = client.post(
+            "/v1/executors/preflight",
+            headers=headers,
+            json={"binding": "bindings/local.yaml"},
+        )
+        assert preflight.status_code == 200
+        assert preflight.json()["ready"]
+        outside = paths.root.parent / "outside-binding.yaml"
+        outside.write_text("sensitive-marker: must-not-escape")
+        escaped = client.post(
+            "/v1/executors/preflight",
+            headers=headers,
+            json={"binding": "../outside-binding.yaml"},
+        )
+        assert escaped.status_code == 400
+        assert "must-not-escape" not in escaped.text
         assert "Project" in client.get("/v1/schemas", headers=headers).json()["kinds"]
         resource = {
             "apiVersion": "omf.dev/v1alpha1",
@@ -95,11 +125,108 @@ def test_api_health_auth_schemas_resources_and_doctor(tmp_path):
         ).json()
         read_headers = {"Authorization": f"Bearer {read_only['token']}"}
         assert client.get("/v1/doctor", headers=read_headers).status_code == 200
+        assert (
+            client.post(
+                "/v1/executors/preflight",
+                headers=read_headers,
+                json={"binding": "bindings/local.yaml"},
+            ).status_code
+            == 200
+        )
         assert client.post("/v1/resources", headers=read_headers, json=resource).status_code == 403
         assert client.delete(f"/v1/tokens/{read_only['tokenId']}", headers=headers).json()[
             "revoked"
         ]
         assert client.get("/v1/doctor", headers=read_headers).status_code == 403
+
+
+def test_agent_goal_and_knowledge_api_parity_scopes_and_etags(tmp_path):
+    paths = _paths(tmp_path)
+    with Factory(paths) as factory:
+        token = factory.secrets.get("local-api-token", "api-authentication").decode()
+        reader_token, _principal = factory.api_tokens.create(actor="reader", scopes={"read"})
+    headers = {"Authorization": f"Bearer {token}"}
+    reader_headers = {"Authorization": f"Bearer {reader_token}"}
+
+    with TestClient(create_app(paths)) as client:
+        capabilities = client.get("/v1/agent/capabilities", headers=headers)
+        assert capabilities.status_code == 200
+        assert capabilities.headers["etag"]
+        assert (
+            client.get(
+                "/v1/agent/capabilities",
+                headers={**headers, "If-None-Match": capabilities.headers["etag"]},
+            ).status_code
+            == 304
+        )
+
+        context = client.get("/v1/agent/context?limit=2&max_bytes=16384", headers=headers)
+        assert context.status_code == 200
+        assert context.json()["kind"] == "AgentContext"
+        assert (
+            client.get(
+                "/v1/agent/context?limit=2&max_bytes=16384",
+                headers={**headers, "If-None-Match": context.headers["etag"]},
+            ).status_code
+            == 304
+        )
+
+        goal = client.post(
+            "/v1/goals",
+            headers=headers,
+            json={
+                "name": "quality",
+                "objective": "Improve quality",
+                "success_criteria": ["score >= 0.9"],
+                "constraints": ["gpuHours <= 2"],
+                "budget": {"gpuHours": 2},
+            },
+        )
+        assert goal.status_code == 200
+        assert goal.json()["statusVersion"] == 1
+        assert client.get("/v1/goals?state=active", headers=reader_headers).json()["total"] == 1
+        assert client.post("/v1/goals", headers=reader_headers, json={}).status_code == 403
+
+        status = client.patch(
+            "/v1/goals/quality/status",
+            headers=headers,
+            json={"state": "blocked", "expected_version": 1, "reason": "awaiting evidence"},
+        )
+        assert status.json()["statusVersion"] == 2
+        stale = client.patch(
+            "/v1/goals/quality/status",
+            headers=headers,
+            json={"state": "active", "expected_version": 1, "reason": "stale"},
+        )
+        assert stale.status_code == 409
+        assert stale.json()["error"]["retryable"]
+        assert stale.json()["error"]["details"]["currentVersion"] == 2
+
+        knowledge = client.post(
+            "/v1/knowledge",
+            headers=headers,
+            json={
+                "name": "baseline",
+                "category": "observation",
+                "claim": "The baseline score is 0.4.",
+                "confidence": 0.9,
+                "evidence": [{"ref": "evaluation:baseline"}],
+                "scope": {"goal_refs": ["goal/quality"], "tags": ["quality"]},
+            },
+        )
+        assert knowledge.status_code == 200
+        assert knowledge.json()["kind"] == "Knowledge"
+        assert (
+            client.get("/v1/knowledge?focus=quality", headers=reader_headers).json()["total"] == 1
+        )
+        invalid = client.post(
+            "/v1/knowledge",
+            headers=headers,
+            json={"name": "invalid", "claim": "sensitive-input-must-not-echo"},
+        )
+        assert invalid.status_code == 422
+        assert invalid.json()["error"]["code"] == "request_validation_error"
+        assert "sensitive-input-must-not-echo" not in invalid.text
 
 
 def test_api_federation_outbox_reconciliation_and_capacity(tmp_path):

@@ -15,7 +15,7 @@ def db(tmp_path):
 def test_migration_idempotence_and_integrity(db):
     db.migrate()
     assert db.integrity_check()
-    assert db.connection.execute("select count(*) from schema_migrations").fetchone()[0] == 2
+    assert db.connection.execute("select count(*) from schema_migrations").fetchone()[0] == 4
 
 
 def test_resource_immutable_and_idempotent(db):

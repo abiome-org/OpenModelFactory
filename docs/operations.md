@@ -39,6 +39,23 @@ Use a process supervisor such as systemd, Kubernetes, or the site's scheduler.
 Run one writer service per SQLite metadata database. WAL permits concurrent
 readers, but a shared network filesystem must honor SQLite locking semantics.
 
+## Executor readiness
+
+Inventory provider code and inspect its source before authorizing it, then
+preflight the exact binding and workload:
+
+```sh
+omf --output json executor list
+omf --output json executor preflight bindings/site.yaml --workload workloads/train.yaml
+```
+
+Installed `omf.executors` entry points are trusted code loaded into the API
+process. Unknown providers, missing protocol transport, unavailable scheduler
+tools, and unenforceable isolation fail closed before OMF allocates a run. A
+successful scheduler preflight is not scale conformance; retain measured
+portable-workload, restart, cancellation, checkpoint, and scale evidence. See
+[the executor provider guide](executors.md) for backend-specific requirements.
+
 ## Backup and restore
 
 Create an online-consistent metadata backup:
@@ -55,7 +72,8 @@ Also replicate content-addressed manifests/blobs and securely back up
 3. restore identity keys with mode `0600`;
 4. restore the SQLite backup as `.omf/metadata.db`;
 5. restore or reconnect artifact stores;
-6. run `omf doctor`, verify dataset snapshots, and inspect signed event tails;
+6. run `omf doctor`, verify dataset snapshots, list active goals/knowledge, and
+   inspect signed event tails;
 7. resume deployments only after policy review.
 
 Never restore only a signing key into a metadata history from another trust
@@ -95,8 +113,9 @@ air-gapped supply-chain process.
 
 ## Deployment lifecycle and rollback
 
-Deployment commands run under durable local worker supervision. Inspect and
-cancel them with `omf deployment status <name>` and
+Deployment commands run through the explicit executor provider recorded in the
+immutable deployment revision (local by default). Inspect and cancel them with
+`omf deployment status <name>` and
 `omf deployment cancel <name>`. Each status response includes `statusVersion`;
 use that value as the compare-and-swap guard when restoring the previous
 immutable deployment revision:
@@ -130,6 +149,8 @@ evidence specified in `SPEC.md`; offline installation alone is not a claim.
 - Revoke compromised credentials and rotate site trust deliberately; historical
   signatures remain bound to the old key.
 - Preserve event, lineage, scheduler, and ingress logs under retention policy.
+- Preserve goal statuses and evidence-backed knowledge with metadata backups;
+  never reconstruct them from chat logs.
 - A failed or incomplete checkpoint is never a restore target.
 - Alias and deployment changes require a recorded passing policy decision.
 - Do not claim `OMF-Frontier` without a reproducible report from at least 1,024

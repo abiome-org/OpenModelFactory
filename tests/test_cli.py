@@ -27,6 +27,14 @@ spec: {owners: [local-user], extensions: {}}
     )
     assert result.exit_code == 0, result.output
     assert "initialize-database" in result.stdout
+    capabilities = runner.invoke(
+        app, ["--project", str(root), "--output", "json", "agent", "capabilities"]
+    )
+    assert capabilities.exit_code == 0
+    assert json.loads(capabilities.stdout)["catalogVersion"] == 1
+    context = runner.invoke(app, ["--project", str(root), "--output", "json", "agent", "context"])
+    assert context.exit_code == 0
+    assert json.loads(context.stdout)["recommendations"][0]["action"] == "project.bootstrap"
 
 
 def _full_project(tmp_path):
@@ -64,6 +72,40 @@ def test_cli_complete_local_lifecycle(tmp_path):
 
     assert invoke("bootstrap")["ready"]
     assert invoke("doctor")["ready"]
+    goal = invoke(
+        "goal",
+        "create",
+        "quality",
+        "--objective",
+        "Improve quality",
+        "--success",
+        "score >= 0.9",
+        "--budget",
+        "gpuHours=2",
+    )
+    assert goal["statusVersion"] == 1
+    assert invoke("goal", "list", "--state", "active")["total"] == 1
+    assert (
+        invoke(
+            "knowledge",
+            "record",
+            "baseline",
+            "--category",
+            "observation",
+            "--claim",
+            "The baseline score is 0.4.",
+            "--confidence",
+            "0.9",
+            "--evidence",
+            "evaluation:baseline",
+            "--goal-ref",
+            "goal/quality",
+        )["kind"]
+        == "Knowledge"
+    )
+    agent_context = invoke("agent", "context", "--limit", "2", "--max-bytes", "16384")
+    assert agent_context["goals"]["items"][0]["goal"]["metadata"]["name"] == "quality"
+    assert agent_context["knowledge"]["items"][0]["knowledge"]["metadata"]["name"] == "baseline"
     assert "Project" in invoke("schema", "list")["kinds"]
     assert invoke("schema", "show", "Project")["x-omf-kind"] == "Project"
     assert invoke("schema", "validate", root / "omf.yaml")["kind"] == "Project"
@@ -100,6 +142,14 @@ def test_cli_complete_local_lifecycle(tmp_path):
     validated_module = invoke("module", "validate", manifest)[0]
     assert validated_module["valid"]
     assert invoke("module", "test", manifest)[0]["passed"] == 1
+    assert {item["name"] for item in invoke("executor", "list")["providers"]} >= {"local"}
+    assert invoke(
+        "executor",
+        "preflight",
+        root / "bindings/local.yaml",
+        "--workload",
+        root / "workloads/example-statistical.yaml",
+    )["ready"]
     plan = invoke("sync", "push", "dataset/example-numbers", "--to", "secondary", "--plan")
     assert not plan["mutates"]
     assert invoke("sync", "push", "dataset/example-numbers", "--to", "secondary")["committed"]
@@ -206,6 +256,20 @@ def test_cli_complete_local_lifecycle(tmp_path):
     assert (
         invoke("secret", "set", "example", "--purpose", "test", "--value", "not-printed")["version"]
         == 1
+    )
+    assert (
+        invoke(
+            "secret",
+            "set",
+            "example",
+            "--purpose",
+            "test",
+            "--value",
+            "replacement",
+            "--expected-version",
+            "1",
+        )["version"]
+        == 2
     )
     assert "example" in {item["name"] for item in invoke("secret", "list")}
     assert invoke("backup", root / "backup.db")["integrity"]

@@ -7,7 +7,14 @@ import pytest
 import yaml
 from omf.config import ProjectPaths, bootstrap
 from omf.database import AliasRepository
-from omf.errors import IntegrityError, ValidationError
+from omf.errors import CapabilityError, IntegrityError
+from omf.executors import (
+    MODULE_PROTOCOL_CAPABILITIES,
+    ExecutorContext,
+    ExecutorProvider,
+    ExecutorRegistry,
+    LocalExecutor,
+)
 from omf.factory import Factory
 
 
@@ -156,6 +163,7 @@ def test_clean_clone_to_signed_release_and_edge_deployment(tmp_path):
                 break
             time.sleep(0.02)
         assert service_status["status"]["state"] == "succeeded"
+        assert service_status["status"]["executor"] == "local"
         first_deployment_revision = service_status["status"]["deploymentRevision"]
 
         service["spec"]["extensions"]["command"] = ["python3", "-c", "print('revision-two')"]
@@ -211,5 +219,52 @@ def test_non_local_binding_is_not_silently_executed_locally(tmp_path):
     binding_path = paths.root / "bindings/cluster.yaml"
     binding_path.write_text(yaml.safe_dump(binding))
 
-    with Factory(paths) as factory, pytest.raises(ValidationError, match="not integrated"):
-        factory.run(paths.root / "workloads/example-statistical.yaml", binding_path)
+    with Factory(paths) as factory:
+        with pytest.raises(CapabilityError, match="not ready") as failure:
+            factory.run(paths.root / "workloads/example-statistical.yaml", binding_path)
+        assert "protocol:omf.module/v1" in failure.value.details["missingCapabilities"]
+        assert factory.list_resources(kind="Run") == []
+        assert list(paths.runs.iterdir()) == []
+
+
+def test_injected_executor_runs_unchanged_workload(tmp_path):
+    paths = _project(tmp_path)
+    bootstrap(paths)
+    binding = yaml.safe_load((paths.root / "bindings/local.yaml").read_text())
+    binding["metadata"]["name"] = "remote"
+    binding["spec"]["executor"] = "test-remote"
+    binding_path = paths.root / "bindings/remote.yaml"
+    binding_path.write_text(yaml.safe_dump(binding))
+
+    class RecordingExecutor(LocalExecutor):
+        def plan(self, **kwargs):
+            self.planned = True
+            return super().plan(**kwargs)
+
+    created: list[RecordingExecutor] = []
+
+    def create(_context: ExecutorContext) -> LocalExecutor:
+        executor = RecordingExecutor()
+        executor.planned = False
+        created.append(executor)
+        return executor
+
+    registry = ExecutorRegistry()
+    registry.register(
+        ExecutorProvider(
+            "test-remote",
+            create,
+            capabilities=MODULE_PROTOCOL_CAPABILITIES | frozenset({"isolation:network-deny"}),
+        )
+    )
+    with Factory(paths, executors=registry) as factory:
+        factory.add_data(
+            paths.root / "data/numbers.jsonl",
+            name="example-numbers",
+            mode="copy",
+            rights={"license": "CC0-1.0", "trainingAllowed": True},
+        )
+        result = factory.run(paths.root / "workloads/example-statistical.yaml", binding_path)
+    assert result["state"] == "Succeeded"
+    assert len(created) == 1
+    assert created[0].planned

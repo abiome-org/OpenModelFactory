@@ -15,6 +15,7 @@ import yaml
 from rich.console import Console
 
 from omf import __version__
+from omf.agent import capability_catalog, initial_context
 from omf.api import create_app
 from omf.config import ProjectPaths, discover_project
 from omf.config import bootstrap as bootstrap_project
@@ -41,6 +42,10 @@ capacity_app = typer.Typer(no_args_is_help=True)
 operation_app = typer.Typer(no_args_is_help=True)
 token_app = typer.Typer(no_args_is_help=True)
 conformance_app = typer.Typer(no_args_is_help=True)
+agent_app = typer.Typer(no_args_is_help=True)
+goal_app = typer.Typer(no_args_is_help=True)
+knowledge_app = typer.Typer(no_args_is_help=True)
+executor_app = typer.Typer(no_args_is_help=True)
 
 app.add_typer(module_app, name="module")
 app.add_typer(data_app, name="data")
@@ -59,6 +64,10 @@ app.add_typer(capacity_app, name="capacity")
 app.add_typer(operation_app, name="operation")
 app.add_typer(token_app, name="token")
 app.add_typer(conformance_app, name="conformance")
+app.add_typer(agent_app, name="agent")
+app.add_typer(goal_app, name="goal")
+app.add_typer(knowledge_app, name="knowledge")
+app.add_typer(executor_app, name="executor")
 
 console = Console(stderr=False)
 
@@ -131,6 +140,8 @@ def _handle(function: Any) -> None:
             console.print(f"[red]{exc.code}[/red]: {exc.message}")
             if exc.details:
                 console.print(exc.details)
+            for item in exc.remediation:
+                console.print(f"[bold]next[/bold]: {item.get('command', item['description'])}")
         raise typer.Exit(code=1) from exc
 
 
@@ -150,6 +161,190 @@ def doctor() -> None:
     def run() -> dict[str, Any]:
         with _factory() as factory:
             return factory.doctor()
+
+    _handle(run)
+
+
+@executor_app.command("list")
+def executor_list() -> None:
+    """List built-in and trusted plugin providers with their configuration contracts."""
+
+    def run() -> dict[str, Any]:
+        with _factory() as factory:
+            return factory.executor_catalog()
+
+    _handle(run)
+
+
+@executor_app.command("preflight")
+def executor_preflight(
+    binding: Path,
+    workload: Path | None = typer.Option(None, "--workload"),
+) -> None:
+    """Check provider transport capabilities and prerequisites without allocating a run."""
+
+    def run() -> dict[str, Any]:
+        with _factory() as factory:
+            return factory.executor_preflight(binding, workload_path=workload)
+
+    _handle(run)
+
+
+@agent_app.command("capabilities")
+def agent_capabilities() -> None:
+    """List stable action contracts, preconditions, effects, risk, and cost class."""
+    _handle(capability_catalog)
+
+
+@agent_app.command("context")
+def agent_context(
+    focus: str | None = typer.Option(None, "--focus", help="Filter bounded detail by term"),
+    limit: int = typer.Option(20, "--limit", min=1, max=100),
+    since: str | None = typer.Option(None, "--since", help="Increment from an event cursor"),
+    max_bytes: int = typer.Option(65_536, "--max-bytes", min=16_384, max=1_048_576),
+) -> None:
+    """Return a bounded, digestible situation and deterministic next actions."""
+
+    def run() -> dict[str, Any]:
+        paths = _paths()
+        if not paths.database.exists():
+            return initial_context(
+                paths, focus=focus, limit=limit, since=since, max_bytes=max_bytes
+            )
+        with Factory(paths, actor=state.actor) as factory:
+            return factory.agent.context(focus=focus, limit=limit, since=since, max_bytes=max_bytes)
+
+    _handle(run)
+
+
+def _budget_values(values: list[str] | None) -> dict[str, float]:
+    result: dict[str, float] = {}
+    for value in values or []:
+        key, separator, raw = value.partition("=")
+        if not separator or not key:
+            raise typer.BadParameter("--budget must be KEY=NUMBER")
+        try:
+            parsed = float(raw)
+        except ValueError as exc:
+            raise typer.BadParameter("--budget must be KEY=NUMBER") from exc
+        if parsed < 0:
+            raise typer.BadParameter("--budget values cannot be negative")
+        result[key] = parsed
+    return result
+
+
+@goal_app.command("create")
+def goal_create(
+    name: str,
+    objective: str = typer.Option(..., "--objective"),
+    success: list[str] | None = typer.Option(None, "--success"),
+    constraint: list[str] | None = typer.Option(None, "--constraint"),
+    budget: list[str] | None = typer.Option(None, "--budget", help="KEY=NUMBER; repeatable"),
+    priority: int = typer.Option(50, "--priority", min=0, max=100),
+    parent_ref: str | None = typer.Option(None, "--parent-ref"),
+    resource_ref: list[str] | None = typer.Option(None, "--resource-ref"),
+    run_id: list[str] | None = typer.Option(None, "--run-id"),
+) -> None:
+    """Persist measurable intent and initialize its guarded lifecycle status."""
+
+    def run() -> dict[str, Any]:
+        with _factory() as factory:
+            return factory.agent.create_goal(
+                name,
+                objective=objective,
+                success_criteria=success or [],
+                constraints=constraint,
+                budget=_budget_values(budget),
+                priority=priority,
+                parent_ref=parent_ref,
+                scope={"resourceRefs": resource_ref or [], "runIds": run_id or []},
+            )
+
+    _handle(run)
+
+
+@goal_app.command("list")
+def goal_list(
+    state_filter: str | None = typer.Option(None, "--state"),
+    focus: str | None = typer.Option(None, "--focus"),
+    limit: int = typer.Option(20, "--limit", min=1, max=100),
+) -> None:
+    def run() -> dict[str, Any]:
+        with _factory() as factory:
+            return factory.agent.list_goals(state=state_filter, focus=focus, limit=limit)
+
+    _handle(run)
+
+
+@goal_app.command("status")
+def goal_status(
+    name: str,
+    status_state: str = typer.Option(..., "--state"),
+    expected_version: int = typer.Option(..., "--expected-version", min=0),
+    reason: str = typer.Option(..., "--reason"),
+) -> None:
+    """Compare-and-set a goal status without losing concurrent decisions."""
+
+    def run() -> dict[str, Any]:
+        with _factory() as factory:
+            return factory.agent.set_goal_status(
+                name,
+                state=status_state,
+                expected_version=expected_version,
+                reason=reason,
+            )
+
+    _handle(run)
+
+
+@knowledge_app.command("record")
+def knowledge_record(
+    name: str,
+    category: str = typer.Option(..., "--category"),
+    claim: str = typer.Option(..., "--claim"),
+    confidence: float = typer.Option(..., "--confidence", min=0, max=1),
+    evidence: list[str] | None = typer.Option(None, "--evidence"),
+    goal_ref: list[str] | None = typer.Option(None, "--goal-ref"),
+    resource_ref: list[str] | None = typer.Option(None, "--resource-ref"),
+    run_id: list[str] | None = typer.Option(None, "--run-id"),
+    tag: list[str] | None = typer.Option(None, "--tag"),
+    supersedes: list[str] | None = typer.Option(None, "--supersedes"),
+    expires_at: str | None = typer.Option(None, "--expires-at"),
+) -> None:
+    """Commit evidence-backed durable knowledge; never put secrets in claims."""
+
+    def run() -> dict[str, Any]:
+        with _factory() as factory:
+            return factory.agent.record_knowledge(
+                name,
+                category=category,
+                claim=claim,
+                confidence=confidence,
+                evidence=[{"ref": item} for item in evidence or []],
+                scope={
+                    "goalRefs": goal_ref or [],
+                    "resourceRefs": resource_ref or [],
+                    "runIds": run_id or [],
+                    "tags": tag or [],
+                },
+                supersedes=supersedes,
+                expires_at=expires_at,
+            )
+
+    _handle(run)
+
+
+@knowledge_app.command("list")
+def knowledge_list(
+    include_inactive: bool = typer.Option(False, "--all"),
+    focus: str | None = typer.Option(None, "--focus"),
+    limit: int = typer.Option(20, "--limit", min=1, max=100),
+) -> None:
+    def run() -> dict[str, Any]:
+        with _factory() as factory:
+            return factory.agent.list_knowledge(
+                active_only=not include_inactive, focus=focus, limit=limit
+            )
 
     _handle(run)
 
@@ -647,10 +842,15 @@ def lineage_show(
 
 
 @secret_app.command("set")
-def secret_set(name: str, purpose: str = typer.Option(...), value: str = typer.Option(...)) -> None:
+def secret_set(
+    name: str,
+    purpose: str = typer.Option(...),
+    value: str = typer.Option(...),
+    expected_version: int | None = typer.Option(None, "--expected-version", min=1),
+) -> None:
     def run() -> dict[str, Any]:
         with _factory() as factory:
-            version = factory.secrets.put(name, value, purpose)
+            version = factory.secrets.put(name, value, purpose, expected_version=expected_version)
             return {"name": name, "purpose": purpose, "version": version}
 
     _handle(run)

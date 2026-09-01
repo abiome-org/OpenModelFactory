@@ -1,0 +1,55 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "x-omf-kind": "Goal",
+  "type": "object",
+  "required": ["apiVersion", "kind", "metadata", "spec"],
+  "properties": {
+    "apiVersion": {"const": "omf.dev/v1alpha1"},
+    "kind": {"const": "Goal"},
+    "metadata": {"$ref": "#/$defs/metadata"},
+    "spec": {
+      "type": "object",
+      "required": ["objective", "successCriteria", "priority"],
+      "properties": {
+        "objective": {"type": "string", "minLength": 1, "maxLength": 4096},
+        "successCriteria": {
+          "type": "array",
+          "items": {"type": "string", "minLength": 1, "maxLength": 2048},
+          "minItems": 1,
+          "maxItems": 64
+        },
+        "constraints": {
+          "type": "array",
+          "items": {"type": "string", "minLength": 1, "maxLength": 2048},
+          "maxItems": 64
+        },
+        "budget": {
+          "type": "object",
+          "additionalProperties": {"type": "number", "minimum": 0}
+        },
+        "priority": {"type": "integer", "minimum": 0, "maximum": 100},
+        "parentRef": {"type": "string", "minLength": 1},
+        "scope": {
+          "type": "object",
+          "properties": {
+            "resourceRefs": {
+              "type": "array",
+              "items": {"type": "string", "minLength": 1},
+              "uniqueItems": true
+            },
+            "runIds": {
+              "type": "array",
+              "items": {"type": "string", "minLength": 1},
+              "uniqueItems": true
+            }
+          },
+          "additionalProperties": false
+        },
+        "extensions": {"$ref": "#/$defs/extension"}
+      },
+      "additionalProperties": false
+    },
+    "status": {"type": "object"}
+  },
+  "additionalProperties": false
+}
