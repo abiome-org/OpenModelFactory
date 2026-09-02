@@ -35,6 +35,9 @@ test has run on at least 1,024 actual accelerators.
 
 - [Specification](SPEC.md) — normative product, architecture, interface,
   conformance, and implementation requirements.
+- [Model-building manual](manual/README.md) — progressive, status-labeled
+  workflows for modules, data, evaluation, training, experiments, RLVR design,
+  execution, and release.
 - [Operations runbook](docs/operations.md) — service, S3, backup/restore,
   incident, and offline-install procedures.
 - [Executor provider guide](docs/executors.md) — portable workload boundary,

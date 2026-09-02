@@ -16,7 +16,8 @@ non-conflicting guidance from this file.
 1. `SPEC.md` is the normative product and conformance contract.
 2. `factory/omf/schemas/` defines versioned resource and wire contracts.
 3. `factory/omf/` and `tests/` are the executable implementation and evidence.
-4. `README.md` and `docs/` explain workflows and operational guidance.
+4. `manual/` provides status-labeled model-building workflows.
+5. `README.md` and `docs/` explain orientation and operational guidance.
 
 If these disagree, do not paper over the conflict in documentation. Restore the
 implementation and schemas to the specification, or explicitly revise the
@@ -90,6 +91,8 @@ contracts.
 - `install.sh`, `factory/omf/install_support.py`, and `templates/project/`:
   non-destructive directory installation and the managed agent operator guide
   installed into project workspaces.
+- `manual/`: task-oriented, CI-verified model-building and experimentation
+  guidance; distinguish executable paths from conditional work and blueprints.
 - `modules/`: user code and stable module protocol implementations.
 - `workloads/`: portable scientific DAGs; `bindings/`: physical execution;
   `policies/`: governance; `data/`: manifests and intentionally checked-in

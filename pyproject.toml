@@ -66,6 +66,7 @@ include = [
   "/factory",
   "/docs",
   "/install.sh",
+  "/manual",
   "/README.md",
   "/requirements.build.in",
   "/requirements.build.lock",
