@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import subprocess
+import sys
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import asdict
@@ -36,6 +38,7 @@ lineage_app = typer.Typer(no_args_is_help=True)
 secret_app = typer.Typer(no_args_is_help=True)
 api_app = typer.Typer(no_args_is_help=True)
 release_app = typer.Typer(no_args_is_help=True)
+experiment_app = typer.Typer(no_args_is_help=True)
 deployment_app = typer.Typer(no_args_is_help=True)
 federation_app = typer.Typer(no_args_is_help=True)
 capacity_app = typer.Typer(no_args_is_help=True)
@@ -58,6 +61,7 @@ app.add_typer(lineage_app, name="lineage")
 app.add_typer(secret_app, name="secret")
 app.add_typer(api_app, name="api")
 app.add_typer(release_app, name="release")
+app.add_typer(experiment_app, name="experiment")
 app.add_typer(deployment_app, name="deployment")
 app.add_typer(federation_app, name="federation")
 app.add_typer(capacity_app, name="capacity")
@@ -531,9 +535,31 @@ def sync_pull(
 def run_workload(
     workload: Path,
     binding: Path = typer.Option(Path("bindings/local.yaml"), "--binding"),
+    detach: bool = typer.Option(False, "--detach"),
 ) -> None:
     def run() -> dict[str, Any]:
         with _factory() as factory:
+            if detach:
+                operation = factory.create_run_operation(workload, binding)
+                log_path = factory.paths.state / "operations" / f"{operation['id']}.log"
+                with log_path.open("ab") as log:
+                    subprocess.Popen(
+                        [
+                            sys.executable,
+                            "-m",
+                            "omf.run_worker",
+                            "--project",
+                            str(factory.paths.root),
+                            "--operation",
+                            operation["id"],
+                        ],
+                        stdin=subprocess.DEVNULL,
+                        stdout=log,
+                        stderr=log,
+                        close_fds=True,
+                        start_new_session=True,
+                    )
+                return operation
             return factory.run(workload, binding)
 
     _handle(run)
@@ -569,6 +595,7 @@ def release_create(
     alias: str = typer.Option("candidate", "--alias"),
     approval: list[str] | None = typer.Option(None, "--approval"),
     vulnerability_report: Path | None = typer.Option(None, "--vulnerability-report"),
+    evaluation: str | None = typer.Option(None, "--evaluation"),
 ) -> None:
     def run() -> dict[str, Any]:
         with _factory() as factory:
@@ -581,6 +608,28 @@ def release_create(
                 alias=alias,
                 approvals=approval,
                 vulnerability_report=vulnerability_report,
+                evaluation_ref=evaluation,
+            )
+
+    _handle(run)
+
+
+@experiment_app.command("create")
+def experiment_create(
+    name: str,
+    baseline: str = typer.Option(..., "--baseline"),
+    candidate: str = typer.Option(..., "--candidate"),
+    metric: str = typer.Option(..., "--metric"),
+    direction: str = typer.Option("maximize", "--direction"),
+) -> None:
+    def run() -> dict[str, Any]:
+        with _factory() as factory:
+            return factory.create_experiment(
+                name=name,
+                baseline_ref=baseline,
+                candidate_ref=candidate,
+                metric=metric,
+                direction=direction,
             )
 
     _handle(run)
@@ -761,6 +810,17 @@ def operation_get(operation_id: str) -> None:
     def run() -> dict[str, Any]:
         with _factory() as factory:
             return factory.operations.get(operation_id)
+
+    _handle(run)
+
+
+@operation_app.command("reconcile")
+def operation_reconcile(operation_id: str) -> None:
+    """Execute pending work or reconcile completion evidence without uncertain replay."""
+
+    def run() -> dict[str, Any]:
+        with _factory() as factory:
+            return factory.execute_run_operation(operation_id)
 
     _handle(run)
 

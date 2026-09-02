@@ -2,8 +2,9 @@
 
 **Status: Tested now**
 
-Evaluator stages and boolean pass evidence are tested. Full `EvaluationSpec`
-suite scheduling through the CLI is an extension blueprint.
+Evaluator stages, admitted `EvaluationSpec` metrics, model-package conformance,
+and immutable pass evidence are tested. External benchmark harnesses remain
+optional evaluator modules.
 
 ## Freeze the decision protocol
 
@@ -21,22 +22,20 @@ revisions may be informative, but they are not a controlled direct comparison.
 
 ## Current executable pattern
 
-The [example workload](../workloads/example-statistical.yaml) places an
-`evaluate` stage after `train`. The evaluator returns a boolean output named
-`evaluate.passed` and an evaluation artifact. After the run, this command
-materializes immutable evidence from boolean outputs ending in `.passed` or
-`.pass`:
+The [from-scratch example](../workloads/example-from-scratch.yaml) references a
+versioned [evaluation protocol](../evaluations/example-affine.yaml) and places an
+`evaluate` stage after `train`. After the run, this command applies its metric
+thresholds and the model package's conformance vectors, then materializes one
+immutable `EvaluationResult`:
 
 ```sh
 omf --actor research-agent --output json evaluate run/<run-id>
 ```
 
-This command does **not** execute the normative `EvaluationSpec` as an external
-benchmark suite. The richer in-process evaluation primitive can retain repeats,
-distributions, confidence intervals, slices, failures, and resource usage, but
-it is not the same CLI path. A production evaluator module should emit those
-details as an immutable artifact and expose an unambiguous pass result for the
-current release gate.
+`EvaluationSpec` identifies output metrics and thresholds; evaluator modules own
+benchmark execution. A production evaluator should emit repeats, distributions,
+confidence intervals, slices, failures, and resource usage as immutable artifacts,
+plus an unambiguous pass result for the release gate.
 
 ## Package a benchmark responsibly
 

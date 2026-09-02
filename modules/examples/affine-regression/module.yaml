@@ -1,15 +1,13 @@
 apiVersion: omf.dev/v1alpha1
 kind: Module
 metadata:
-  name: statistical
+  name: affine-regression
   namespace: omf/examples
 spec:
   contractVersion: omf.module/v1
   moduleKind: trainer
   entryPoint:
-    command:
-      - python3
-      - main.py
+    command: [python3, main.py]
     codeRoot: .
   contracts:
     input:
@@ -30,18 +28,17 @@ spec:
   capabilities: []
   platforms: []
   resources: {}
-  determinism: bitwise
+  determinism: numerical
   lifecycle:
     checkpoint: true
-    sideEffects:
-      - declared-artifact-write
+    sideEffects: [declared-artifact-write]
     concurrency: 1
   access:
     secrets: []
     network: []
   provenance:
     license: Apache-2.0
-    sourceRef: repository:modules/examples/statistical
+    sourceRef: repository:modules/examples/affine-regression
   fixtures:
     - request:
         operation: validate

@@ -41,6 +41,15 @@ class ExecutionStatus:
     exit_code: int | None = None
 
 
+@dataclass(frozen=True)
+class DependencyLock:
+    """Exact opaque dependency declaration supplied to an executor provider."""
+
+    relative_path: str
+    digest: str
+    contents: bytes = field(repr=False)
+
+
 class Executor(ABC):
     @property
     @abstractmethod
@@ -67,3 +76,15 @@ class Executor(ABC):
         that use the local run directory for status or logs should override this method.
         """
         del execution_id, run_dir
+
+    def prepare_environment(
+        self,
+        *,
+        argv: list[str],
+        cwd: Path,
+        dependency: DependencyLock,
+        deny_network: bool = False,
+    ) -> dict[str, Any]:
+        """Pin an executable environment or fail before run allocation."""
+        del argv, cwd, dependency, deny_network
+        raise RuntimeError("executor cannot attest the declared module environment")

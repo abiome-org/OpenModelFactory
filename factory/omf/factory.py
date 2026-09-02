@@ -2,13 +2,17 @@
 
 from __future__ import annotations
 
+import contextlib
+import fcntl
 import hashlib
 import json
+import math
 import re
 import shutil
 import subprocess
 import tempfile
 import time
+from collections.abc import Iterator
 from copy import deepcopy
 from dataclasses import asdict
 from datetime import UTC, datetime
@@ -16,7 +20,7 @@ from pathlib import Path
 from typing import Any
 
 from omf.agent import AgentControl
-from omf.artifacts import ArtifactBuilder, ArtifactManifest
+from omf.artifacts import ArtifactBuilder, ArtifactManifest, AtomicCheckpointPublisher
 from omf.canonical import canonical_json, load_document, sha256_digest
 from omf.config import ProjectPaths, load_project
 from omf.conformance import build_report, verify_report
@@ -45,9 +49,12 @@ from omf.ids import uuid7
 from omf.lineage import LineageEdge, LineageStore
 from omf.modules import (
     ModuleManifest,
+    dependency_lock,
     extract_module_package,
     load_manifest,
     package_module,
+    validate_contract,
+    validate_contract_schema,
     validate_fixtures,
 )
 from omf.operations import OperationStore
@@ -61,11 +68,31 @@ from omf.stores.filesystem import FilesystemStore
 from omf.stores.s3 import S3Store
 from omf.sync import SyncEngine
 from omf.telemetry import TelemetrySink
-from omf.workloads import RunState, Stage, StateStore, WorkloadRunner, WorkloadSpec
+from omf.workloads import (
+    RunState,
+    Stage,
+    StateStore,
+    WorkloadRunner,
+    project_workload,
+)
 
 
 def _utc_now() -> str:
     return datetime.now(UTC).isoformat().replace("+00:00", "Z")
+
+
+@contextlib.contextmanager
+def _operation_lease(path: Path) -> Iterator[None]:
+    """Exclude concurrent workers and make a released running record detectably stale."""
+    with path.open("a+") as handle:
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise ConflictError("run operation is already executing") from exc
+        try:
+            yield
+        finally:
+            fcntl.flock(handle, fcntl.LOCK_UN)
 
 
 class Factory:
@@ -226,7 +253,19 @@ class Factory:
                 f"{self.namespace!r}"
             )
 
-    def apply_resource(self, value: dict[str, Any]) -> dict[str, Any]:
+    def apply_resource(self, value: dict[str, Any], *, _system: bool = False) -> dict[str, Any]:
+        generated_kinds = {
+            "Checkpoint",
+            "EvaluationResult",
+            "Experiment",
+            "Run",
+            "RunResult",
+            "SamplerState",
+        }
+        if value.get("kind") in generated_kinds and not _system:
+            raise ValidationError(
+                f"{value.get('kind')} resources are created only by the factory coordinator"
+            )
         self._validate_namespace(value)
         candidate = deepcopy(value)
         metadata_value = candidate.get("metadata", {})
@@ -388,7 +427,11 @@ class Factory:
         )
         extension: dict[str, Any] = {
             "mode": snapshot.mode,
-            "source": snapshot.source,
+            "source": (
+                snapshot.artifact.manifest_digest
+                if snapshot.artifact is not None
+                else snapshot.source
+            ),
             "cursorPolicy": snapshot.cursor_policy,
         }
         if snapshot.artifact is not None:
@@ -517,6 +560,11 @@ class Factory:
             "codeRoot": str(code_root.relative_to(self.paths.root)),
             "packageDigest": package_digest,
             "artifactManifest": artifact_digest,
+            "dependencyLock": {
+                "path": manifest.dependency_lock,
+                "digest": manifest.dependency_digest,
+                "size": len(manifest.dependency_contents),
+            },
             "fixtures": len(manifest.fixtures),
             "capabilities": sorted(manifest.capabilities),
         }
@@ -524,6 +572,7 @@ class Factory:
     def _capture_module_source(
         self, manifest_path: str | Path, *, extract_to: Path | None = None
     ) -> tuple[ModuleManifest, Path, str, str]:
+        manifest_path = Path(manifest_path).resolve()
         manifest, code_root = load_manifest(manifest_path, self.paths.root)
         validate_fixtures(manifest)
         with tempfile.NamedTemporaryFile(
@@ -531,14 +580,37 @@ class Factory:
         ) as temporary:
             package_path = Path(temporary.name)
         try:
-            package_digest = package_module(code_root, package_path)
+            package_digest = package_module(manifest_path.parent, package_path)
+            manifest_resource_path = manifest_path
+            if extract_to is not None:
+                bundle_root = extract_module_package(package_path, extract_to)
+                manifest_resource_path = bundle_root / "module.yaml"
+                manifest, code_root = load_manifest(manifest_resource_path, bundle_root)
+                validate_fixtures(manifest)
+            module_resource = default_registry.load(manifest_resource_path)
+            module_digest = sha256_digest(
+                {
+                    "apiVersion": module_resource["apiVersion"],
+                    "kind": module_resource["kind"],
+                    "metadata": {
+                        "name": module_resource["metadata"]["name"],
+                        "namespace": module_resource["metadata"]["namespace"],
+                    },
+                    "spec": module_resource["spec"],
+                }
+            )
             artifact = ArtifactBuilder(self.local_store).import_path(
                 package_path,
                 logical_kind="module-source",
-                provenance={"manifest": str(Path(manifest_path).resolve())},
+                provenance={
+                    "manifest": Path(manifest_path)
+                    .resolve()
+                    .relative_to(self.paths.root.resolve())
+                    .as_posix(),
+                    "moduleDigest": module_digest,
+                    "packageDigest": package_digest,
+                },
             )
-            if extract_to is not None:
-                code_root = extract_module_package(package_path, extract_to)
         finally:
             package_path.unlink(missing_ok=True)
         return manifest, code_root, package_digest, artifact.manifest_digest
@@ -556,7 +628,8 @@ class Factory:
             MODULE_PROTOCOL_CAPABILITIES
             | (frozenset({"isolation:network-deny"}) if not manifest.network else frozenset()),
         )
-        fixtures = manifest.fixtures or [{"request": {"operation": "validate"}, "result": {}}]
+        environment = self._prepare_module_environment(resolved.executor, manifest, code_root)
+        fixtures = manifest.fixtures
         results = []
         for index, fixture in enumerate(fixtures):
             request = dict(fixture["request"])
@@ -569,6 +642,7 @@ class Factory:
                 self.paths.runs / "module-tests" / f"{Path(manifest_path).stem}-{index}",
                 executor=resolved.executor,
                 executor_config=resolved.config,
+                environment=environment,
             )
             expected = fixture.get("result", {})
             actual = result.model_dump(mode="json")
@@ -587,13 +661,15 @@ class Factory:
         *,
         executor: Executor,
         executor_config: dict[str, Any],
+        environment: dict[str, Any],
     ) -> ProtocolResult:
+        validate_contract(manifest.schemas["input"], request.inputs, "input")
+        validate_contract(manifest.schemas["config"], request.config, "config")
+        validate_contract(manifest.schemas["state"], request.state, "state input")
         run_dir.mkdir(parents=True, exist_ok=True)
         request_path = run_dir / "request.json"
         request_path.write_bytes(canonical_json(request.model_dump(mode="json")))
-        argv = list(manifest.argv)
-        if "/" in argv[0]:
-            argv[0] = str((code_root / argv[0]).resolve())
+        argv = [str(item) for item in environment["command"]]
         plan = executor.plan(
             argv=argv,
             run_dir=run_dir,
@@ -602,6 +678,7 @@ class Factory:
             timeout=float(manifest.resources.get("timeout_seconds", 0)) or None,
             deny_network=not manifest.network,
             requires_result=True,
+            environment=environment,
             **executor_config,
         )
         execution_id = executor.submit(plan)
@@ -626,6 +703,8 @@ class Factory:
                 result.error.message if result.error else "module returned an error",
                 details=result.error.details if result.error else {},
             )
+        validate_contract(manifest.schemas["output"], result.outputs, "output")
+        validate_contract(manifest.schemas["state"], result.state, "state output")
         return result
 
     @staticmethod
@@ -638,6 +717,36 @@ class Factory:
         if not isinstance(options, dict):
             raise ValidationError("spec.config.executor must be an object")
         return dict(options)
+
+    @staticmethod
+    def _prepare_module_environment(
+        executor: Executor, manifest: ModuleManifest, code_root: Path
+    ) -> dict[str, Any]:
+        environment = executor.prepare_environment(
+            argv=manifest.argv,
+            cwd=code_root,
+            dependency=dependency_lock(manifest),
+            deny_network=not manifest.network,
+        )
+        if not isinstance(environment, dict):
+            raise IntegrityError("executor environment descriptor must be an object")
+        command = environment.get("command")
+        if (
+            not isinstance(command, list)
+            or not command
+            or not all(isinstance(item, str) and item for item in command)
+        ):
+            raise IntegrityError("executor environment descriptor requires command argv")
+        if environment.get("dependencyDigest") != manifest.dependency_digest:
+            raise IntegrityError("executor environment descriptor changed the dependency lock")
+        digest = environment.get("digest")
+        if not isinstance(digest, str) or re.fullmatch(r"sha256:[0-9a-f]{64}", digest) is None:
+            raise IntegrityError("executor environment descriptor requires a canonical digest")
+        try:
+            canonical_json(environment)
+        except (TypeError, ValueError, ValidationError) as exc:
+            raise IntegrityError("executor environment descriptor must be canonical JSON") from exc
+        return environment
 
     def _resolve_executor(
         self, name: str, declaration: dict[str, Any], config: dict[str, Any]
@@ -669,16 +778,6 @@ class Factory:
             ],
         )
 
-    @staticmethod
-    def _stages(workload: dict[str, Any]) -> list[Stage]:
-        stages_value = workload.get("stages")
-        if stages_value is None and isinstance(workload.get("spec"), dict):
-            stages_value = workload["spec"].get("graph", {}).get("stages")
-        stages = [Stage.model_validate(stage) for stage in stages_value or []]
-        if not stages:
-            raise ValidationError("workload has no stages")
-        return stages
-
     def _module_requirements(self, stages: list[Stage]) -> frozenset[str]:
         required = set(MODULE_PROTOCOL_CAPABILITIES)
         for stage in stages:
@@ -690,6 +789,20 @@ class Factory:
             if not manifest.network:
                 required.add("isolation:network-deny")
         return frozenset(required)
+
+    def _admit_module_environments(
+        self, stages: list[Stage], resolved: ResolvedExecutor
+    ) -> dict[str, tuple[ModuleManifest, Path, dict[str, Any]]]:
+        admitted: dict[str, tuple[ModuleManifest, Path, dict[str, Any]]] = {}
+        for stage in stages:
+            module_path = Path(stage.module)
+            if not module_path.is_absolute():
+                module_path = self.paths.root / module_path
+            manifest, code_root = load_manifest(module_path, self.paths.root)
+            validate_fixtures(manifest)
+            environment = self._prepare_module_environment(resolved.executor, manifest, code_root)
+            admitted[stage.name] = (manifest, code_root, environment)
+        return admitted
 
     def executor_catalog(self) -> dict[str, Any]:
         return self.executors.catalog()
@@ -717,7 +830,7 @@ class Factory:
         binding = load_document(binding_file.read_bytes())
         if not isinstance(binding, dict):
             raise ValidationError("binding must be an object")
-        default_registry.validate(binding)
+        default_registry.validate_as(binding, "Binding")
         self._validate_namespace(binding)
         required = MODULE_PROTOCOL_CAPABILITIES
         if workload_path is not None:
@@ -725,42 +838,386 @@ class Factory:
             workload = load_document(workload_file.read_bytes())
             if not isinstance(workload, dict):
                 raise ValidationError("workload must be an object")
-            required = self._module_requirements(self._stages(workload))
+            admitted = project_workload(workload)
+            self._validate_namespace(workload)
+            required = self._module_requirements(admitted.stages)
         name = str(binding["spec"]["executor"])
         resolved = self._resolve_executor(name, binding, self._executor_config(binding))
-        return self.executors.preflight(resolved, required_capabilities=required)
+        report = self.executors.preflight(resolved, required_capabilities=required)
+        if workload_path is not None and report["ready"]:
+            try:
+                self._admit_module_environments(admitted.stages, resolved)
+            except Exception as exc:
+                report["ready"] = False
+                report["issues"].append(str(exc))
+        return report
 
-    def run(self, workload_path: str | Path, binding_path: str | Path) -> dict[str, Any]:
-        workload_raw = load_document(Path(workload_path).read_bytes())
-        binding_raw = load_document(Path(binding_path).read_bytes())
+    def create_run_operation(
+        self, workload_path: str | Path, binding_path: str | Path
+    ) -> dict[str, Any]:
+        workload = self._project_file(workload_path, kind="workload")
+        binding = self._project_file(binding_path, kind="binding")
+        workload_raw = load_document(workload.read_bytes())
+        binding_raw = load_document(binding.read_bytes())
         if not isinstance(workload_raw, dict) or not isinstance(binding_raw, dict):
             raise ValidationError("workload and binding must be objects")
-        default_registry.validate(binding_raw)
+        admitted = project_workload(workload_raw)
+        stages = admitted.stages
+        default_registry.validate_as(binding_raw, "Binding")
+        self._validate_namespace(workload_raw)
+        self._validate_namespace(binding_raw)
+        resolved = self._resolve_executor(
+            str(binding_raw["spec"]["executor"]),
+            binding_raw,
+            self._executor_config(binding_raw),
+        )
+        self._require_executor(resolved, self._module_requirements(stages))
+        self._admit_module_environments(stages, resolved)
+        pinned_inputs = self._pin_stage_inputs(stages)
+        model_package = self._pin_model_package(admitted.model_package_ref, stages)
+        evaluation_specs = self._pin_named_resources(
+            admitted.evaluation_refs, "evaluationspec/", "EvaluationSpec"
+        )
+        mix = self._pin_mix(admitted.mix_ref, pinned_inputs)
+        module_packages: dict[str, str] = {}
+        for stage in stages:
+            module_path = self._project_file(stage.module, kind="module")
+            manifest, _code_root = load_manifest(module_path, self.paths.root)
+            validate_fixtures(manifest)
+            with tempfile.NamedTemporaryFile(dir=self.paths.packages, suffix=".tar") as package:
+                module_packages[stage.name] = package_module(module_path.parent, package.name)
+        operation_id = str(uuid7())
+        return self.operations.create(
+            "run",
+            {
+                "workload": workload.relative_to(self.paths.root).as_posix(),
+                "binding": binding.relative_to(self.paths.root).as_posix(),
+                "actor": self.actor,
+                "workloadDigest": sha256_digest(workload_raw),
+                "bindingDigest": sha256_digest(binding_raw),
+                "modulePackages": module_packages,
+                "resources": {
+                    "datasets": {
+                        reference: self._resource_uri(resource)
+                        for reference, resource in pinned_inputs.items()
+                    },
+                    "modelPackage": (
+                        self._resource_uri(model_package) if model_package is not None else None
+                    ),
+                    "evaluationSpecs": [
+                        self._resource_uri(resource) for resource in evaluation_specs
+                    ],
+                    "mix": self._resource_uri(mix) if mix is not None else None,
+                },
+            },
+            operation_id=operation_id,
+        )
+
+    def _verify_run_request(self, request: dict[str, Any]) -> None:
+        workload_path = self.paths.root / request["workload"]
+        binding_path = self.paths.root / request["binding"]
+        workload_raw = load_document(workload_path.read_bytes())
+        binding_raw = load_document(binding_path.read_bytes())
+        if (
+            sha256_digest(workload_raw) != request["workloadDigest"]
+            or sha256_digest(binding_raw) != request["bindingDigest"]
+        ):
+            raise IntegrityError("queued run desired state changed before admission")
+        if not isinstance(workload_raw, dict):
+            raise ValidationError("queued workload must be an object")
+        for stage in project_workload(workload_raw).stages:
+            module_path = self._project_file(stage.module, kind="module")
+            manifest, _code_root = load_manifest(module_path, self.paths.root)
+            validate_fixtures(manifest)
+            with tempfile.NamedTemporaryFile(dir=self.paths.packages, suffix=".tar") as package:
+                digest = package_module(module_path.parent, package.name)
+            if digest != request["modulePackages"].get(stage.name):
+                raise IntegrityError("queued module source changed before admission")
+
+    def execute_run_operation(self, operation_id: str) -> dict[str, Any]:
+        lease = self.paths.state / "operations" / f"{operation_id}.lock"
+        with _operation_lease(lease):
+            operation = self.operations.get(operation_id)
+            if operation["kind"] != "run" or operation["state"] not in {
+                "pending",
+                "running",
+                "recovering",
+            }:
+                raise ValidationError("operation is not an executable pending run")
+            request = operation["request"]
+            if request["actor"] != self.actor:
+                raise ValidationError("run operation actor does not match the executing controller")
+            if operation["state"] != "pending":
+                reconciled = self._reconcile_completed_run(operation_id)
+                if reconciled is not None:
+                    return self.operations.update(
+                        operation_id,
+                        expected_version=operation["version"],
+                        state="succeeded",
+                        result=reconciled,
+                    )
+                message = "run outcome is indeterminate; automatic replay is disabled"
+                try:
+                    run_resource = self._run_resource(operation_id)
+                except IntegrityError:
+                    run_resource = None
+                if run_resource is not None:
+                    self.resources.set_status(
+                        operation_id,
+                        {"state": "Failed", "reason": message, "outputs": {}},
+                        expected_version=None,
+                    )
+                self.operations.update(
+                    operation_id,
+                    expected_version=operation["version"],
+                    state="failed",
+                    error={
+                        "code": "indeterminate_execution",
+                        "message": message,
+                        "retryable": False,
+                    },
+                )
+                raise IntegrityError(message)
+            try:
+                self._verify_run_request(request)
+            except OMFError as exc:
+                error = exc.as_dict()["error"]
+                self.operations.update(
+                    operation_id,
+                    expected_version=operation["version"],
+                    state="failed",
+                    error={
+                        "code": error["code"],
+                        "message": error["message"],
+                        "retryable": error["retryable"],
+                    },
+                )
+                raise
+            except Exception:
+                self.operations.update(
+                    operation_id,
+                    expected_version=operation["version"],
+                    state="failed",
+                    error={
+                        "code": "run_admission_error",
+                        "message": "run admission failed",
+                        "retryable": False,
+                    },
+                )
+                raise
+            running = self.operations.update(
+                operation_id,
+                expected_version=operation["version"],
+                state="running",
+                result={"phase": "admission", "runId": operation_id},
+            )
+            try:
+                result = self._run_impl(
+                    self.paths.root / request["workload"],
+                    self.paths.root / request["binding"],
+                    operation_id=operation_id,
+                    expected_workload_digest=request["workloadDigest"],
+                    expected_binding_digest=request["bindingDigest"],
+                    expected_module_packages=request["modulePackages"],
+                    expected_resources=request["resources"],
+                )
+            except OMFError as exc:
+                error = exc.as_dict()["error"]
+                self.operations.update(
+                    operation_id,
+                    expected_version=running["version"],
+                    state="failed",
+                    error={
+                        "code": error["code"],
+                        "message": error["message"],
+                        "retryable": error["retryable"],
+                    },
+                )
+                raise
+            except Exception:
+                self.operations.update(
+                    operation_id,
+                    expected_version=running["version"],
+                    state="failed",
+                    error={
+                        "code": "run_worker_error",
+                        "message": "run worker failed",
+                        "retryable": False,
+                    },
+                )
+                raise
+            return self.operations.update(
+                operation_id,
+                expected_version=running["version"],
+                state="succeeded",
+                result=result,
+            )
+
+    def _reconcile_completed_run(self, operation_id: str) -> dict[str, Any] | None:
+        """Recover publication only from an immutable result; never rerun uncertain work."""
+        runs = [
+            resource
+            for resource in self.resources.list(kind="Run")
+            if resource["metadata"]["uid"] == operation_id
+            and resource["spec"]["operationId"] == operation_id
+        ]
+        if not runs:
+            return None
+        if len(runs) != 1:
+            raise IntegrityError("run resource identity is ambiguous")
+        run_resource = runs[0]
+        run_ref = self._resource_uri(run_resource)
+        results = [
+            resource
+            for resource in self.resources.list(kind="RunResult")
+            if resource["spec"]["runRef"] == run_ref
+        ]
+        if not results:
+            return None
+        if len(results) != 1:
+            raise IntegrityError("run result identity is ambiguous")
+        run_result = results[0]
+        admission = run_result["spec"]["admission"]
+        extensions = run_resource["spec"]["extensions"]
+        result = {
+            "runId": operation_id,
+            "state": "Succeeded",
+            "outputs": run_result["spec"]["outputs"],
+            "stages": run_result["spec"]["stages"],
+            "workloadDigest": admission["workloadDigest"],
+            "bindingDigest": extensions["bindingDigest"],
+            "resultRef": self._resource_uri(run_result),
+            "reproducibility": extensions["reproducibility"],
+        }
+        self.lineage.add(
+            LineageEdge(
+                f"run:{operation_id}",
+                result["resultRef"],
+                "generated",
+                "activity",
+                "entity",
+                run_id=operation_id,
+            )
+        )
+        try:
+            status, status_version = self.resources.get_status(operation_id)
+        except NotFoundError:
+            status, status_version = {}, None
+        desired_status = {
+            "state": "Succeeded",
+            "reason": "completed",
+            "outputs": result["outputs"],
+            "resultRef": result["resultRef"],
+        }
+        if status != desired_status:
+            self.resources.set_status(operation_id, desired_status, expected_version=status_version)
+        terminal_events = self.events.query(
+            run_id=operation_id, resource_uid=operation_id, type="RunStateChanged"
+        )
+        if not any(event.data.get("state") == "Succeeded" for event in terminal_events):
+            self._run_state_event(run_resource, operation_id, "Succeeded", "completed")
+        return result
+
+    def run(self, workload_path: str | Path, binding_path: str | Path) -> dict[str, Any]:
+        operation = self.create_run_operation(workload_path, binding_path)
+        completed = self.execute_run_operation(operation["id"])
+        return {**completed["result"], "operationId": operation["id"]}
+
+    def _run_impl(
+        self,
+        workload_path: str | Path,
+        binding_path: str | Path,
+        *,
+        operation_id: str,
+        expected_workload_digest: str,
+        expected_binding_digest: str,
+        expected_module_packages: dict[str, str],
+        expected_resources: dict[str, Any],
+    ) -> dict[str, Any]:
+        workload_file = self._project_file(workload_path, kind="workload")
+        binding_file = self._project_file(binding_path, kind="binding")
+        workload_raw = load_document(workload_file.read_bytes())
+        binding_raw = load_document(binding_file.read_bytes())
+        if not isinstance(workload_raw, dict) or not isinstance(binding_raw, dict):
+            raise ValidationError("workload and binding must be objects")
+        if (
+            sha256_digest(workload_raw) != expected_workload_digest
+            or sha256_digest(binding_raw) != expected_binding_digest
+        ):
+            raise IntegrityError("run desired state changed during admission")
+        admitted = project_workload(workload_raw)
+        default_registry.validate_as(binding_raw, "Binding")
+        self._validate_namespace(workload_raw)
         self._validate_namespace(binding_raw)
         executor_name = str(binding_raw["spec"]["executor"])
-        stages = self._stages(workload_raw)
+        stages = admitted.stages
         required = self._module_requirements(stages)
         resolved_executor = self._resolve_executor(
             executor_name, binding_raw, self._executor_config(binding_raw)
         )
         self._require_executor(resolved_executor, required)
-        run_id = str(uuid7())
+        initial_admission = self._admit_module_environments(stages, resolved_executor)
+        pinned_inputs = self._pin_stage_inputs(stages, expected_resources["datasets"])
+        model_package = self._pin_model_package(
+            admitted.model_package_ref, stages, expected_resources["modelPackage"]
+        )
+        evaluation_specs = self._pin_named_resources(
+            admitted.evaluation_refs,
+            "evaluationspec/",
+            "EvaluationSpec",
+            expected_resources["evaluationSpecs"],
+        )
+        metric_names = [
+            metric["name"] for suite in evaluation_specs for metric in suite["spec"]["metrics"]
+        ]
+        reserved_scores = {"conformancePassed", "passed"}
+        if len(metric_names) != len(set(metric_names)) or reserved_scores.intersection(
+            metric_names
+        ):
+            raise ValidationError("evaluation metric names must be unique and not reserved")
+        mix = self._pin_mix(admitted.mix_ref, pinned_inputs, expected_resources["mix"])
+        workload_resource = self.apply_resource(workload_raw)
+        binding_resource = self.apply_resource(binding_raw)
+        # The durable operation identity is also the run identity. A controller restart can
+        # therefore reconcile immutable completion evidence without allocating a second run.
+        run_id = operation_id
         run_dir = self.paths.runs / run_id
         admitted_modules: dict[str, tuple[ModuleManifest, Path, str]] = {}
         module_digests: dict[str, str] = {}
+        environments: dict[str, dict[str, Any]] = {}
         for stage in stages:
             module_path = Path(stage.module)
             if not module_path.is_absolute():
                 module_path = self.paths.root / module_path
-            manifest, code_root, _package_digest, artifact_digest = self._capture_module_source(
+            manifest, code_root, package_digest, artifact_digest = self._capture_module_source(
                 module_path, extract_to=run_dir / "sources" / stage.name
             )
+            if package_digest != expected_module_packages.get(stage.name):
+                raise IntegrityError("module source changed during admission")
+            environment = self._prepare_module_environment(
+                resolved_executor.executor, manifest, code_root
+            )
+            if environment["digest"] != initial_admission[stage.name][2]["digest"]:
+                raise IntegrityError("module environment changed after admission")
             admitted_modules[stage.name] = (manifest, code_root, artifact_digest)
             module_digests[stage.name] = artifact_digest
-        spec = WorkloadSpec(
-            stages=stages,
-            binding_digest=sha256_digest(binding_raw),
-            module_digests=module_digests,
+            environments[stage.name] = environment
+        spec = admitted.model_copy(
+            update={
+                "source_digest": workload_resource["metadata"]["revision"],
+                "binding_digest": binding_resource["metadata"]["revision"],
+                "module_digests": module_digests,
+                "environments": environments,
+                "input_revisions": {
+                    reference: self._resource_uri(resource)
+                    for reference, resource in pinned_inputs.items()
+                },
+                "model_package_ref": (
+                    self._resource_uri(model_package) if model_package is not None else None
+                ),
+                "evaluation_refs": [self._resource_uri(item) for item in evaluation_specs],
+                "mix_ref": self._resource_uri(mix) if mix is not None else None,
+            },
         )
         state_store = StateStore(run_dir / "state.json")
         state_store.initialize(spec)
@@ -774,14 +1231,24 @@ class Factory:
                 "metadata": {"name": f"run-{run_id}", "namespace": self.namespace, "uid": run_id},
                 "spec": {
                     "runId": run_id,
-                    "workloadRef": str(Path(workload_path).resolve()),
-                    "bindingRef": str(Path(binding_path).resolve()),
+                    "operationId": operation_id,
+                    "workloadRef": self._resource_uri(workload_resource),
+                    "bindingRef": self._resource_uri(binding_resource),
                     "extensions": {
                         "workloadDigest": spec.digest,
+                        "operationId": operation_id,
                         "bindingDigest": spec.binding_digest,
+                        "admittedInputs": spec.input_revisions,
+                        "modelPackageRef": spec.model_package_ref,
+                        "evaluationRefs": spec.evaluation_refs,
+                        "mixRef": spec.mix_ref,
+                        "moduleDigests": spec.module_digests,
+                        "environments": spec.environments,
+                        "reproducibility": spec.reproducibility,
                     },
                 },
-            }
+            },
+            _system=True,
         )
         self.events.append(
             type="RunAdmitted",
@@ -796,10 +1263,22 @@ class Factory:
             workload_digest=spec.digest,
             binding_digest=spec.binding_digest,
         )
+        if model_package is not None:
+            self.lineage.add(
+                LineageEdge(
+                    self._resource_uri(model_package),
+                    f"run:{run_id}",
+                    "used",
+                    "entity",
+                    "activity",
+                    run_id=run_id,
+                )
+            )
         outputs: dict[str, Any] = {}
 
         def execute(stage: Stage) -> dict[str, Any]:
             manifest, code_root, module_digest = admitted_modules[stage.name]
+            environment = spec.environments[stage.name]
             self.lineage.add(
                 LineageEdge(
                     f"artifact:{module_digest}",
@@ -812,7 +1291,9 @@ class Factory:
             )
             stage_inputs = {
                 name: self._resolve_stage_input(
-                    outputs.get(reference, reference), run_dir / "stages" / stage.name / "inputs"
+                    self._resolve_output_reference(reference, outputs, stages),
+                    run_dir / "stages" / stage.name / "inputs" / name,
+                    pinned_inputs,
                 )
                 for name, reference in stage.inputs.items()
             }
@@ -833,8 +1314,14 @@ class Factory:
                 run_dir / "stages" / stage.name,
                 executor=resolved_executor.executor,
                 executor_config=resolved_executor.config,
+                environment=environment,
             )
             stage_outputs = dict(result.outputs)
+            checkpoint_artifacts = [
+                item for item in result.artifacts if str(item.get("kind")) == "checkpoint"
+            ]
+            if len(checkpoint_artifacts) > 1:
+                raise ValidationError("one stage result may emit only one aggregate checkpoint")
             for artifact_index, artifact_value in enumerate(result.artifacts):
                 artifact_path = Path(str(artifact_value["path"]))
                 if not artifact_path.is_absolute():
@@ -845,20 +1332,106 @@ class Factory:
                     raise ValidationError("module artifact path escapes the stage run directory")
                 artifact = ArtifactBuilder(self.local_store).import_path(
                     artifact_path,
-                    logical_kind=str(artifact_value.get("kind", "stage-output")),
+                    logical_kind=(
+                        "checkpoint-shard"
+                        if str(artifact_value.get("kind")) == "checkpoint"
+                        else str(artifact_value.get("kind", "stage-output"))
+                    ),
                     provenance={"runId": run_id, "stage": stage.name},
                 )
                 artifact_name = str(artifact_value.get("name", f"artifact-{artifact_index}"))
-                stage_outputs[artifact_name] = artifact.manifest_digest
+                if artifact_name in stage_outputs:
+                    raise IntegrityError(f"stage artifact collides with output: {artifact_name}")
+                artifact_digest = artifact.manifest_digest
+                if str(artifact_value.get("kind")) == "checkpoint":
+                    if not manifest.checkpoint:
+                        raise ValidationError(
+                            "module emitted a checkpoint without declaring support"
+                        )
+                    if not result.state:
+                        raise ValidationError("checkpoint publication requires protocol state")
+                    with tempfile.NamedTemporaryFile(
+                        dir=run_dir / "stages" / stage.name,
+                        prefix=".omf-checkpoint-state-",
+                        delete=False,
+                    ) as state_file:
+                        state_file.write(canonical_json(result.state))
+                        state_path = Path(state_file.name)
+                    try:
+                        state_artifact = ArtifactBuilder(self.local_store).import_path(
+                            state_path,
+                            logical_kind="checkpoint-state",
+                            provenance={"runId": run_id, "stage": stage.name},
+                        )
+                    finally:
+                        state_path.unlink(missing_ok=True)
+                    checkpoint_components = {
+                        "module-state": artifact,
+                        "protocol-state": state_artifact,
+                    }
+                    checkpoint_replay = {
+                        "status": "not-claimed",
+                        "reason": "sampler-state-not-observed",
+                    }
+                    checkpoint_manifest = AtomicCheckpointPublisher(self.local_store).publish(
+                        checkpoint_components,
+                        {
+                            "workload": spec.source_digest,
+                            "binding": str(spec.binding_digest),
+                            "module": module_digest,
+                            "environment": environment["digest"],
+                        },
+                        checkpoint_replay,
+                    )
+                    artifact_digest = checkpoint_manifest.manifest_digest
+                    checkpoint = self.apply_resource(
+                        {
+                            "apiVersion": "omf.dev/v1alpha1",
+                            "kind": "Checkpoint",
+                            "metadata": {
+                                "name": f"checkpoint-{run_id[:8]}-{stage.name}",
+                                "namespace": self.namespace,
+                            },
+                            "spec": {
+                                "runRef": self._resource_uri(run_resource),
+                                "artifactRef": artifact_digest,
+                                "components": {
+                                    role: component.manifest_digest
+                                    for role, component in checkpoint_components.items()
+                                },
+                                "replay": checkpoint_replay,
+                                "extensions": {"stage": stage.name},
+                            },
+                        },
+                        _system=True,
+                    )
+                    self.events.append(
+                        type="CheckpointCommitted",
+                        source=f"omf://{self.namespace}",
+                        subject=self._resource_uri(checkpoint),
+                        resource_uid=checkpoint["metadata"]["uid"],
+                        revision=checkpoint["metadata"]["revision"],
+                        actor=self.actor,
+                        run_id=run_id,
+                        data={"artifactRef": artifact_digest, "stage": stage.name},
+                        dataschema="https://schemas.omf.dev/events/checkpoint-committed/v1",
+                    )
+                stage_outputs[artifact_name] = artifact_digest
                 self.lineage.add(
                     LineageEdge(
                         f"run:{run_id}/stage:{stage.name}",
-                        f"artifact:{artifact.manifest_digest}",
+                        f"artifact:{artifact_digest}",
                         "generated",
                         "activity",
                         "entity",
                         run_id=run_id,
                     )
+                )
+            missing_outputs = sorted(set(stage.outputs) - stage_outputs.keys())
+            if missing_outputs:
+                raise IntegrityError(
+                    f"stage {stage.name!r} did not produce declared outputs",
+                    details={"outputs": missing_outputs},
                 )
             for name, value in stage_outputs.items():
                 outputs[f"{stage.name}.{name}"] = value
@@ -879,9 +1452,45 @@ class Factory:
             )
             self._run_state_event(run_resource, run_id, terminal, str(exc))
             raise
+        run_result = self.apply_resource(
+            {
+                "apiVersion": "omf.dev/v1alpha1",
+                "kind": "RunResult",
+                "metadata": {"name": f"result-{run_id}", "namespace": self.namespace},
+                "spec": {
+                    "runRef": self._resource_uri(run_resource),
+                    "outputs": outputs,
+                    "stages": result_state["stages"],
+                    "admission": {
+                        "workloadDigest": spec.digest,
+                        "bindingRef": self._resource_uri(binding_resource),
+                        "modelPackageRef": spec.model_package_ref,
+                        "moduleDigests": spec.module_digests,
+                        "environments": spec.environments,
+                    },
+                    "extensions": {"runId": run_id},
+                },
+            },
+            _system=True,
+        )
+        self.lineage.add(
+            LineageEdge(
+                f"run:{run_id}",
+                self._resource_uri(run_result),
+                "generated",
+                "activity",
+                "entity",
+                run_id=run_id,
+            )
+        )
         self.resources.set_status(
             run_id,
-            {"state": terminal, "reason": "completed", "outputs": outputs},
+            {
+                "state": terminal,
+                "reason": "completed",
+                "outputs": outputs,
+                "resultRef": self._resource_uri(run_result),
+            },
             expected_version=None,
         )
         self._run_state_event(run_resource, run_id, terminal, "completed")
@@ -892,12 +1501,178 @@ class Factory:
             "stages": result_state["stages"],
             "workloadDigest": spec.digest,
             "bindingDigest": spec.binding_digest,
+            "resultRef": self._resource_uri(run_result),
+            "reproducibility": spec.reproducibility,
         }
 
-    def _resolve_stage_input(self, value: Any, target_root: Path) -> Any:
+    def _pin_stage_inputs(
+        self,
+        stages: list[Stage],
+        expected_revisions: dict[str, str] | None = None,
+    ) -> dict[str, dict[str, Any]]:
+        pinned: dict[str, dict[str, Any]] = {}
+        for stage in stages:
+            for reference in stage.inputs.values():
+                if reference.startswith("dataset/") and reference not in pinned:
+                    if expected_revisions is not None and reference not in expected_revisions:
+                        raise IntegrityError("queued dataset reference was not pinned")
+                    resource = (
+                        self._resource_by_uri("DatasetSnapshot", expected_revisions[reference])
+                        if expected_revisions is not None
+                        else self.find_resource(
+                            "DatasetSnapshot", reference.removeprefix("dataset/")
+                        )
+                    )
+                    if self._snapshot_from_resource(resource).mode != "copy":
+                        raise CapabilityError(
+                            "only copied dataset snapshots can be executed reproducibly"
+                        )
+                    snapshot = self._snapshot_from_resource(resource)
+                    if snapshot.artifact is None or not ArtifactBuilder(self.local_store).verify(
+                        snapshot.artifact
+                    ):
+                        raise IntegrityError(
+                            "admitted dataset artifact failed integrity verification"
+                        )
+                    pinned[reference] = resource
+        return pinned
+
+    def _pin_model_package(
+        self,
+        reference: str | None,
+        stages: list[Stage],
+        expected_revision: str | None = None,
+    ) -> dict[str, Any] | None:
+        if reference is None:
+            if expected_revision is not None:
+                raise IntegrityError("queued model package does not match the workload")
+            return None
+        prefix = "modelpackage/"
+        if not reference.startswith(prefix) or "@" in reference:
+            raise ValidationError("modelPackageRef must use modelpackage/<name>")
+        resource = (
+            self._resource_by_uri("ModelPackage", expected_revision)
+            if expected_revision is not None
+            else self.find_resource("ModelPackage", reference.removeprefix(prefix))
+        )
+        package_spec = resource["spec"]
+        signatures = package_spec["signatures"]
+        for name in ("input", "output", "state"):
+            contract = signatures[name]
+            validate_contract_schema(contract, f"model package {name}")
+            if contract.get("type") != "object":
+                raise ValidationError(
+                    f"model package {name} contract must describe an object for omf.module/v1"
+                )
+        validate_contract_schema(package_spec["architecture"]["parameterSchema"], "parameters")
+        if package_spec["adapters"].get("optimized"):
+            raise ValidationError("optimized model adapters are not executable in this profile")
+        for vector in package_spec["conformanceVectors"]:
+            validate_contract(signatures["input"], vector["inputs"], "model package input")
+            validate_contract(signatures["output"], vector["expected"], "model package output")
+            for tolerance in vector.get("tolerances", {}).values():
+                if not isinstance(tolerance, dict) or any(
+                    not isinstance(value, (int, float))
+                    or isinstance(value, bool)
+                    or not math.isfinite(float(value))
+                    or float(value) < 0
+                    for value in tolerance.values()
+                ):
+                    raise ValidationError(
+                        "model package tolerances must be finite and non-negative"
+                    )
+        workload_stages = {stage.name: stage for stage in stages}
+        stage_outputs = {stage.name: set(stage.outputs) for stage in stages}
+        adapters = package_spec["adapters"]
+        for name in ("trainingReference", "inferenceReference"):
+            if adapters[name]["stage"] not in stage_outputs:
+                raise ValidationError(f"ModelPackage {name} references an unknown workload stage")
+        training = adapters["trainingReference"]
+        training_stage = workload_stages[training["stage"]]
+        if training["operation"] != training_stage.operation or any(
+            training_stage.config.get(key) != value for key, value in training["config"].items()
+        ):
+            raise ValidationError(
+                "ModelPackage trainingReference does not match the workload stage"
+            )
+        inference = adapters["inferenceReference"]
+        state_output = inference.get("stateOutput")
+        if not state_output or "." not in state_output:
+            raise ValidationError(
+                "ModelPackage inferenceReference requires stage.output stateOutput"
+            )
+        stage_name, output_name = state_output.split(".", 1)
+        if stage_name not in stage_outputs or output_name not in stage_outputs[stage_name]:
+            raise ValidationError("ModelPackage stateOutput is not declared by the workload")
+        return resource
+
+    def _pin_named_resources(
+        self,
+        references: list[str],
+        prefix: str,
+        kind: str,
+        expected_revisions: list[str] | None = None,
+    ) -> list[dict[str, Any]]:
+        if expected_revisions is not None and len(expected_revisions) != len(references):
+            raise IntegrityError(f"queued {kind} references do not match the workload")
+        resources = []
+        for index, reference in enumerate(references):
+            if not reference.startswith(prefix) or "@" in reference:
+                raise ValidationError(f"{kind} reference must use {prefix}<name>")
+            resources.append(
+                self._resource_by_uri(kind, expected_revisions[index])
+                if expected_revisions is not None
+                else self.find_resource(kind, reference.removeprefix(prefix))
+            )
+        return resources
+
+    def _pin_mix(
+        self,
+        reference: str | None,
+        pinned_inputs: dict[str, dict[str, Any]],
+        expected_revision: str | None = None,
+    ) -> dict[str, Any] | None:
+        if reference is None:
+            if expected_revision is not None:
+                raise IntegrityError("queued MixSpec does not match the workload")
+            return None
+        resources = self._pin_named_resources(
+            [reference],
+            "mixspec/",
+            "MixSpec",
+            [expected_revision] if expected_revision is not None else None,
+        )
+        mix = resources[0]
+        for source in mix["spec"]["sources"]:
+            dataset_ref = source.get("datasetRef")
+            if dataset_ref not in pinned_inputs:
+                raise ValidationError("MixSpec source is not an admitted workload dataset input")
+        return mix
+
+    @staticmethod
+    def _resolve_output_reference(
+        reference: str, outputs: dict[str, Any], stages: list[Stage]
+    ) -> Any:
+        producer = reference.partition(".")[0]
+        if producer not in {stage.name for stage in stages}:
+            return reference
+        try:
+            return outputs[reference]
+        except KeyError as exc:
+            raise IntegrityError(f"stage output reference is unavailable: {reference}") from exc
+
+    def _resolve_stage_input(
+        self,
+        value: Any,
+        target_root: Path,
+        pinned_inputs: dict[str, dict[str, Any]],
+    ) -> Any:
         if not isinstance(value, str) or not value.startswith("dataset/"):
             return value
-        dataset = self.find_resource("DatasetSnapshot", value.removeprefix("dataset/"))
+        try:
+            dataset = pinned_inputs[value]
+        except KeyError as exc:
+            raise IntegrityError("dataset input was not pinned at admission") from exc
         snapshot = self._snapshot_from_resource(dataset)
         stage_activity = f"run:{target_root.parents[2].name}/stage:{target_root.parent.name}"
         self.lineage.add(
@@ -913,8 +1688,9 @@ class Factory:
         if snapshot.mode == "copy" and snapshot.artifact is not None:
             target = target_root / dataset["metadata"]["name"]
             target.parent.mkdir(parents=True, exist_ok=True)
-            if not target.exists():
-                ArtifactBuilder(self.local_store).restore(snapshot.artifact, target)
+            if target.exists():
+                raise IntegrityError("dataset materialization target already exists")
+            ArtifactBuilder(self.local_store).restore(snapshot.artifact, target)
             payload = target / "payload"
             return {
                 "resource": self._resource_uri(dataset),
@@ -962,11 +1738,144 @@ class Factory:
             "execution": json.loads(state_path.read_text()) if state_path.exists() else None,
         }
 
+    def _resource_by_uri(self, kind: str, uri: str) -> dict[str, Any]:
+        for resource in self.resources.list(kind=kind):
+            if self._resource_uri(resource) == uri:
+                return resource
+        raise NotFoundError(f"pinned {kind} resource not found")
+
+    def _run_resource(self, run_id: str) -> dict[str, Any]:
+        matches = [
+            resource
+            for resource in self.resources.list(kind="Run")
+            if resource["metadata"]["uid"] == run_id
+        ]
+        if len(matches) != 1:
+            raise IntegrityError("run resource identity is ambiguous")
+        return matches[0]
+
+    def _run_result(self, run_id: str, status: dict[str, Any]) -> dict[str, Any]:
+        reference = status.get("resultRef")
+        if not isinstance(reference, str):
+            raise IntegrityError("succeeded run has no immutable result")
+        result = self._resource_by_uri("RunResult", reference)
+        if result["spec"]["runRef"] != self._resource_uri(self._run_resource(run_id)):
+            raise IntegrityError("run result does not identify the admitted run")
+        return result
+
+    @staticmethod
+    def _conformance_equal(expected: Any, actual: Any, tolerance: dict[str, Any]) -> bool:
+        if isinstance(expected, bool) or isinstance(actual, bool):
+            return bool(expected == actual)
+        if isinstance(expected, (int, float)) and isinstance(actual, (int, float)):
+            return math.isclose(
+                float(expected),
+                float(actual),
+                abs_tol=float(tolerance.get("absolute", 0.0)),
+                rel_tol=float(tolerance.get("relative", 0.0)),
+            )
+        if isinstance(expected, list) and isinstance(actual, list):
+            return len(expected) == len(actual) and all(
+                Factory._conformance_equal(left, right, tolerance)
+                for left, right in zip(expected, actual, strict=True)
+            )
+        if isinstance(expected, dict) and isinstance(actual, dict):
+            return expected.keys() == actual.keys() and all(
+                Factory._conformance_equal(expected[key], actual[key], tolerance)
+                for key in expected
+            )
+        return bool(expected == actual)
+
+    def _evaluate_model_conformance(
+        self,
+        run_id: str,
+        run_resource: dict[str, Any],
+        run_result: dict[str, Any],
+        model_package: dict[str, Any],
+    ) -> tuple[bool, list[dict[str, Any]], int]:
+        package_spec = model_package["spec"]
+        adapter = package_spec["adapters"]["inferenceReference"]
+        stage = str(adapter["stage"])
+        admission = run_resource["spec"]["extensions"]
+        try:
+            source_digest = admission["moduleDigests"][stage]
+            state = run_result["spec"]["outputs"][adapter["stateOutput"]]
+        except KeyError as exc:
+            raise IntegrityError(
+                "model package adapter does not match admitted run outputs"
+            ) from exc
+        binding = self._resource_by_uri("Binding", run_resource["spec"]["bindingRef"])
+        resolved = self._resolve_executor(
+            str(binding["spec"]["executor"]), binding, self._executor_config(binding)
+        )
+        self._require_executor(resolved, MODULE_PROTOCOL_CAPABILITIES)
+        source_manifest = self.local_store.read_manifest(source_digest)
+        if not ArtifactBuilder(self.local_store).verify(source_manifest):
+            raise IntegrityError("admitted conformance adapter source failed verification")
+        failures: list[dict[str, Any]] = []
+        vectors = package_spec["conformanceVectors"]
+        with tempfile.TemporaryDirectory(dir=self.paths.packages) as temporary_name:
+            temporary = Path(temporary_name)
+            archive = temporary / "archive"
+            ArtifactBuilder(self.local_store).restore(source_manifest, archive)
+            code_root = extract_module_package(archive / "payload", temporary / "source")
+            manifest, code_root = load_manifest(code_root / "module.yaml", code_root)
+            self._require_executor(
+                resolved,
+                MODULE_PROTOCOL_CAPABILITIES
+                | (frozenset({"isolation:network-deny"}) if not manifest.network else frozenset()),
+            )
+            environment = self._prepare_module_environment(resolved.executor, manifest, code_root)
+            if environment["digest"] != admission["environments"][stage]["digest"]:
+                raise IntegrityError("conformance adapter environment differs from run admission")
+            signatures = package_spec["signatures"]
+            validate_contract(signatures["state"], state, "model package state")
+            for index, vector in enumerate(vectors):
+                validate_contract(signatures["input"], vector["inputs"], "model package input")
+                request = ProtocolRequest.model_validate(
+                    {
+                        "operation": adapter["operation"],
+                        "inputs": vector["inputs"],
+                        "state": state,
+                        "config": adapter["config"],
+                        "context": {
+                            "runId": run_id,
+                            "conformanceVector": vector["name"],
+                            "inference": {
+                                "method": vector["method"],
+                                "seed": vector.get("seed"),
+                            },
+                        },
+                    }
+                )
+                result = self._execute_module(
+                    manifest,
+                    code_root,
+                    request,
+                    self.paths.runs / run_id / "evaluations" / "conformance" / str(index),
+                    executor=resolved.executor,
+                    executor_config=resolved.config,
+                    environment=environment,
+                )
+                validate_contract(signatures["output"], result.outputs, "model package output")
+                for output, expected in vector["expected"].items():
+                    if output not in result.outputs or not self._conformance_equal(
+                        expected,
+                        result.outputs.get(output),
+                        vector.get("tolerances", {}).get(output, {}),
+                    ):
+                        failures.append(
+                            {"kind": "conformance", "vector": vector["name"], "output": output}
+                        )
+        return not failures, failures, len(vectors)
+
     def evaluate(self, subject: str) -> dict[str, Any]:
         """Materialize immutable evaluation evidence from evaluator stages in a run."""
         run_id = subject.removeprefix("run/")
         run_status = self.run_status(run_id)
-        outputs = run_status["status"].get("outputs", {})
+        run_resource = self._run_resource(run_id)
+        run_result = self._run_result(run_id, run_status["status"])
+        outputs = run_result["spec"]["outputs"]
         passing = {
             key: value
             for key, value in outputs.items()
@@ -977,7 +1886,44 @@ class Factory:
             failures.append({"kind": "run", "message": "source run did not succeed"})
         if not passing:
             failures.append({"kind": "protocol", "message": "no evaluator pass result found"})
-        passed = not failures and all(passing.values())
+        metric_scores: dict[str, Any] = {}
+        for reference in run_resource["spec"]["extensions"].get("evaluationRefs", []):
+            suite = self._resource_by_uri("EvaluationSpec", reference)
+            for metric in suite["spec"]["metrics"]:
+                value = outputs.get(metric["output"])
+                metric_scores[metric["name"]] = value
+                if isinstance(value, (bool, int, float)):
+                    numeric = float(value)
+                else:
+                    failures.append(
+                        {"kind": "metric", "metric": metric["name"], "message": "missing value"}
+                    )
+                    continue
+                if "minimum" in metric and numeric < float(metric["minimum"]):
+                    failures.append({"kind": "threshold", "metric": metric["name"]})
+                if "maximum" in metric and numeric > float(metric["maximum"]):
+                    failures.append({"kind": "threshold", "metric": metric["name"]})
+        model_package_ref = run_resource["spec"]["extensions"].get("modelPackageRef")
+        if model_package_ref:
+            model_package = self._resource_by_uri("ModelPackage", model_package_ref)
+            conformance_passed, conformance_failures, vector_count = (
+                self._evaluate_model_conformance(run_id, run_resource, run_result, model_package)
+            )
+            failures.extend(conformance_failures)
+        else:
+            explicit = {
+                key: value
+                for key, value in outputs.items()
+                if key.lower().endswith((".conformancepassed", ".conformance_passed"))
+                and isinstance(value, bool)
+            }
+            conformance_passed = bool(explicit) and all(explicit.values())
+            vector_count = 0
+            if not conformance_passed:
+                failures.append(
+                    {"kind": "conformance", "message": "no model conformance evidence found"}
+                )
+        passed = not failures and all(passing.values()) and conformance_passed
         resource = self.apply_resource(
             {
                 "apiVersion": "omf.dev/v1alpha1",
@@ -988,16 +1934,33 @@ class Factory:
                 },
                 "spec": {
                     "evaluationRef": f"run/{run_id}",
-                    "scores": {**passing, "passed": passed},
+                    "scores": {
+                        **passing,
+                        **metric_scores,
+                        "conformancePassed": conformance_passed,
+                        "passed": passed,
+                    },
                     "provenance": {
                         "runId": run_id,
+                        "runRef": self._resource_uri(run_resource),
+                        "runResultRef": self._resource_uri(run_result),
                         "runStatusVersion": run_status["statusVersion"],
                     },
                     "uncertainty": {},
                     "failures": failures,
-                    "extensions": {"passed": passed, "runId": run_id},
+                    "extensions": {
+                        "passed": passed,
+                        "conformancePassed": conformance_passed,
+                        "conformanceVectors": vector_count,
+                        "evaluationRefs": run_resource["spec"]["extensions"].get(
+                            "evaluationRefs", []
+                        ),
+                        "modelPackageRef": model_package_ref,
+                        "runId": run_id,
+                    },
                 },
-            }
+            },
+            _system=True,
         )
         metadata = resource["metadata"]
         self.events.append(
@@ -1034,6 +1997,7 @@ class Factory:
         alias: str = "candidate",
         approvals: list[str] | None = None,
         vulnerability_report: str | Path | None = None,
+        evaluation_ref: str | None = None,
     ) -> dict[str, Any]:
         """Build a signed complete release and optionally move a policy-gated alias."""
         run_id = run_id.removeprefix("run/")
@@ -1041,18 +2005,39 @@ class Factory:
         status = run["status"]
         if status.get("state") != "Succeeded":
             raise ValidationError("only a succeeded run can produce a release")
+        run_resource = self._run_resource(run_id)
+        run_result = self._run_result(run_id, status)
+        model_package_ref = run_resource["spec"]["extensions"].get("modelPackageRef")
         evaluations = [
             item
             for item in self.resources.list(kind="EvaluationResult")
-            if item["spec"].get("extensions", {}).get("runId") == run_id
+            if item["spec"].get("evaluationRef") == f"run/{run_id}"
+            and item["spec"].get("provenance", {}).get("runId") == run_id
+            and item["spec"].get("provenance", {}).get("runRef") == self._resource_uri(run_resource)
+            and item["spec"].get("provenance", {}).get("runResultRef")
+            == self._resource_uri(run_result)
+            and item["spec"].get("extensions", {}).get("runId") == run_id
+            and item["spec"].get("extensions", {}).get("modelPackageRef") == model_package_ref
+            and item["spec"].get("extensions", {}).get("evaluationRefs")
+            == run_resource["spec"]["extensions"].get("evaluationRefs", [])
         ]
         if not evaluations:
             raise ValidationError("evaluate the run before creating a release")
-        evaluation = evaluations[-1]
+        if evaluation_ref is not None:
+            evaluations = [
+                item
+                for item in evaluations
+                if evaluation_ref in {item["metadata"]["revision"], self._resource_uri(item)}
+            ]
+            if not evaluations:
+                raise ValidationError("requested evaluation revision is not eligible for this run")
+        if len(evaluations) != 1:
+            raise ValidationError("multiple evaluations exist; select an exact evaluation revision")
+        evaluation = evaluations[0]
         if not evaluation["spec"]["extensions"]["passed"]:
             raise ValidationError("a failing evaluation cannot produce a release")
         artifacts: list[tuple[str, str, ArtifactManifest]] = []
-        for output_name, value in status.get("outputs", {}).items():
+        for output_name, value in run_result["spec"]["outputs"].items():
             if isinstance(value, str) and value.startswith("sha256:"):
                 artifacts.append((output_name, value, self.local_store.read_manifest(value)))
         artifact_digests = sorted({digest for _name, digest, _manifest in artifacts})
@@ -1083,8 +2068,8 @@ class Factory:
         if len(state_candidates) > 1:
             raise ValidationError("a release may reference only one aggregate state artifact")
         state_digest = state_candidates[0] if state_candidates else model_digest
-        execution = run.get("execution") or {}
-        module_digests = execution.get("digests", {}).get("modules", {})
+        admission = run_resource["spec"]["extensions"]
+        module_digests = admission["moduleDigests"]
         required_scan_subjects = {model_digest, *module_digests.values()}
         vulnerability_summary, vulnerability_artifact, vulnerabilities_valid = (
             self._load_vulnerability_report(vulnerability_report, required_scan_subjects)
@@ -1092,10 +2077,7 @@ class Factory:
         datasets = self.resources.list(kind="DatasetSnapshot")
         rights_valid = all(bool(item["spec"].get("rights")) for item in datasets)
         approval_list = approvals or []
-        stage_states = execution.get("stages", {})
-        conformance_passed = bool(stage_states) and all(
-            stage.get("status") == "succeeded" for stage in stage_states.values()
-        )
+        conformance_passed = bool(evaluation["spec"]["extensions"].get("conformancePassed"))
         evidence = {
             "evaluation_passed": True,
             "lineage_complete": bool(self.lineage.by_run(run_id)),
@@ -1114,10 +2096,11 @@ class Factory:
             raise IntegrityError(f"promotion denied by gates: {', '.join(denied)}")
         manifest = {
             "model": {"digest": model_digest},
+            "modelPackage": {"ref": model_package_ref},
             "state": {"digest": state_digest},
             "runtime": {"name": "omf.module/v1"},
             "workload": {"runId": run_id},
-            "binding": {"digest": self.run_status(run_id)["execution"]["digests"]["binding"]},
+            "binding": {"digest": admission["bindingDigest"]},
             "dataSummary": [
                 {
                     "name": item["metadata"]["name"],
@@ -1134,7 +2117,8 @@ class Factory:
             "conformance": {
                 "moduleProtocol": "omf.module/v1",
                 "passed": conformance_passed,
-                "stages": stage_states,
+                "evaluationRevision": evaluation["metadata"]["revision"],
+                "vectors": evaluation["spec"]["extensions"].get("conformanceVectors", 0),
             },
             "sbom": self._release_sbom(run_id, module_digests),
             "provenance": {"runId": run_id, "lineageComplete": evidence["lineage_complete"]},
@@ -1164,7 +2148,8 @@ class Factory:
                         "promotionDecision": asdict(decision),
                     },
                 },
-            }
+            },
+            _system=True,
         )
         metadata = resource["metadata"]
         release_uri = self._resource_uri(resource)
@@ -1225,6 +2210,66 @@ class Factory:
                 policy_decision=decision,
             )
         return resource
+
+    def create_experiment(
+        self,
+        *,
+        name: str,
+        baseline_ref: str,
+        candidate_ref: str,
+        metric: str,
+        direction: str,
+    ) -> dict[str, Any]:
+        if direction not in {"maximize", "minimize"}:
+            raise ValidationError("experiment direction must be maximize or minimize")
+        baseline = self._resource_by_uri("EvaluationResult", baseline_ref)
+        candidate = self._resource_by_uri("EvaluationResult", candidate_ref)
+        baseline_evaluations = baseline["spec"].get("extensions", {}).get("evaluationRefs", [])
+        candidate_evaluations = candidate["spec"].get("extensions", {}).get("evaluationRefs", [])
+        if baseline_evaluations != candidate_evaluations:
+            raise ValidationError("experiment subjects use different evaluation revisions")
+        try:
+            baseline_score = baseline["spec"]["scores"][metric]
+            candidate_score = candidate["spec"]["scores"][metric]
+        except KeyError as exc:
+            raise ValidationError("experiment metric is missing or non-numeric") from exc
+        if (
+            not isinstance(baseline_score, (int, float))
+            or isinstance(baseline_score, bool)
+            or not math.isfinite(float(baseline_score))
+            or not isinstance(candidate_score, (int, float))
+            or isinstance(candidate_score, bool)
+            or not math.isfinite(float(candidate_score))
+        ):
+            raise ValidationError("experiment metric is missing or non-numeric")
+        baseline_value = float(baseline_score)
+        candidate_value = float(candidate_score)
+        delta = candidate_value - baseline_value
+        decision = (
+            "tie"
+            if delta == 0
+            else "candidate"
+            if (delta > 0) == (direction == "maximize")
+            else "baseline"
+        )
+        return self.apply_resource(
+            {
+                "apiVersion": "omf.dev/v1alpha1",
+                "kind": "Experiment",
+                "metadata": {"name": name, "namespace": self.namespace},
+                "spec": {
+                    "baselineRef": baseline_ref,
+                    "candidateRef": candidate_ref,
+                    "evaluationRefs": baseline_evaluations,
+                    "metric": metric,
+                    "direction": direction,
+                    "decision": decision,
+                    "delta": delta,
+                    "extensions": {},
+                },
+            },
+            _system=True,
+        )
 
     def _load_vulnerability_report(
         self, report_path: str | Path | None, required_subjects: set[str]

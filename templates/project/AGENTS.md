@@ -2,9 +2,10 @@
 # Operating this Open Model Factory
 
 This directory is an OMF desired-state workspace. Git records code, modules,
-workloads, bindings, policies, and deployment intent. Governed stores hold data,
-checkpoints, model packages, and releases. `.omf/` holds local runtime state,
-identity, metadata, logs, and caches; never edit it by hand or commit it.
+model packages, evaluations, mixes, workloads, bindings, policies, and deployment
+intent. Governed stores hold data, checkpoints, model packages, and releases.
+`.omf/` holds local runtime state, identity, metadata, logs, and caches; never edit
+it by hand or commit it.
 
 This uppercase root file uses the [AGENTS.md standard](https://agents.md/).
 When a subtree contains another `AGENTS.md`, its conflicting instructions take

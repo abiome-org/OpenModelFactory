@@ -21,9 +21,11 @@ class OperationStore:
     def __init__(self, database: Database) -> None:
         self.db = database
 
-    def create(self, kind: str, request: dict[str, Any]) -> dict[str, Any]:
+    def create(
+        self, kind: str, request: dict[str, Any], *, operation_id: str | None = None
+    ) -> dict[str, Any]:
         operation = {
-            "id": str(uuid7()),
+            "id": operation_id or str(uuid7()),
             "kind": kind,
             "state": "pending",
             "request": request,

@@ -6,6 +6,7 @@ import hashlib
 import json
 import math
 import re
+from pathlib import PurePosixPath
 from typing import Any
 
 import rfc8785
@@ -80,6 +81,16 @@ def load_document(data: str | bytes) -> Any:
     except (TypeError, ValueError) as exc:
         raise ValidationError(f"document is not JSON-compatible: {exc}") from exc
     return value
+
+
+def portable_relative_path(value: str, field: str) -> PurePosixPath:
+    """Validate one normalized repository-relative POSIX path."""
+    path = PurePosixPath(value)
+    if path.is_absolute() or ".." in path.parts or "\\" in value:
+        raise ValidationError(f"{field} must be a repository-relative POSIX path")
+    if value != "." and path.as_posix() != value:
+        raise ValidationError(f"{field} must be normalized")
+    return path
 
 
 # Descriptive compatibility names for callers that prefer verb-based APIs.

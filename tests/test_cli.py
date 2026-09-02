@@ -50,6 +50,9 @@ spec: {owners: [local-user], extensions: {}}
     )
     shutil.copytree("modules", root / "modules")
     shutil.copytree("workloads", root / "workloads")
+    workload = yaml.safe_load((root / "workloads/example-statistical.yaml").read_text())
+    workload["metadata"]["namespace"] = "local/cli-full"
+    (root / "workloads/example-statistical.yaml").write_text(yaml.safe_dump(workload))
     (root / "bindings").mkdir()
     binding = yaml.safe_load(Path("bindings/local.yaml").read_text())
     binding["metadata"]["namespace"] = "local/cli-full"
@@ -163,7 +166,34 @@ def test_cli_complete_local_lifecycle(tmp_path):
     run_id = run["runId"]
     run_status = invoke("runs", "status", run_id)
     assert run_status["status"]["state"] == "Succeeded"
-    assert invoke("evaluate", f"run/{run_id}")["spec"]["scores"]["passed"]
+    evaluation = invoke("evaluate", f"run/{run_id}")
+    assert evaluation["spec"]["scores"]["passed"]
+    evaluation_ref = (
+        f"omf://local/cli-full/evaluationresult/{evaluation['metadata']['name']}"
+        f"@{evaluation['metadata']['revision']}"
+    )
+    invalid_experiment = runner.invoke(
+        app,
+        [
+            "--project",
+            str(root),
+            "--output",
+            "json",
+            "experiment",
+            "create",
+            "self-comparison",
+            "--baseline",
+            evaluation_ref,
+            "--candidate",
+            evaluation_ref,
+            "--metric",
+            "passed",
+            "--direction",
+            "sideways",
+        ],
+    )
+    assert invalid_experiment.exit_code == 1
+    assert json.loads(invalid_experiment.stdout)["error"]["code"] == "validation_error"
     vulnerability_report = root / "vulnerability-report.yaml"
     vulnerability_report.write_text(
         yaml.safe_dump(
@@ -248,7 +278,10 @@ def test_cli_complete_local_lifecycle(tmp_path):
         "gpu",
     )
     assert placed["peer_id"] == "eu-cell"
-    assert invoke("operation", "list") == []
+    operations = invoke("operation", "list")
+    assert len(operations) == 1
+    assert operations[0]["kind"] == "run"
+    assert operations[0]["state"] == "succeeded"
     api_token = invoke("token", "create", "--actor", "reader", "--scope", "read")
     assert api_token["actor"] == "reader"
     assert api_token["token"] not in repr(invoke("token", "list"))

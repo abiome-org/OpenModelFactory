@@ -1,0 +1,35 @@
+apiVersion: omf.dev/v1alpha1
+kind: WorkloadSpec
+metadata:
+  name: example-from-scratch
+  namespace: local/open-model-factory
+spec:
+  parameters: {}
+  reproducibility: lineage
+  modelPackageRef: modelpackage/example-affine
+  evaluationRefs: [evaluationspec/example-affine]
+  mixRef: mixspec/example-affine
+  graph:
+    stages:
+      - name: train
+        module: modules/examples/affine-regression/module.yaml
+        operation: run
+        inputs:
+          dataset: dataset/example-affine
+        config:
+          action: train
+          initialSlope: 0.0
+          initialIntercept: 0.0
+          learningRate: 0.02
+          steps: 500
+        outputs: [modelState, loss, model, checkpoint]
+      - name: evaluate
+        needs: [train]
+        module: modules/examples/affine-regression/module.yaml
+        operation: run
+        inputs:
+          modelState: train.modelState
+        config:
+          action: evaluate
+          tolerance: 0.01
+        outputs: [passed, maximumError]

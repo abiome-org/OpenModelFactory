@@ -447,9 +447,11 @@ index. A mutable object-store prefix is not an artifact identity.
 | `WorkloadSpec` | Scientific graph and immutable semantic parameters |
 | `Binding` | Executor, resources, placement, transport, and operational tuning |
 | `Run` | One attempt of a workload with a binding |
+| `RunResult` | Immutable terminal outputs and exact admitted execution identity |
 | `Checkpoint` | Atomic executable model and optimizer/process state |
 | `EvaluationSpec` | Versioned protocol, data, environment, metrics, and inference policy |
 | `EvaluationResult` | Scores, uncertainty, traces, failures, and provenance |
+| `Experiment` | Comparison of candidate and baseline under exact evaluation revisions |
 | `DeploymentSpec` | Model release, runtime, objective, routing, and scaling policy |
 | `FeedbackSpec` | Governed capture and conversion of operational signals into candidate assets |
 | `Review` | Attributable human or agent qualitative assessment |
@@ -530,10 +532,14 @@ factory/
 modules/
 connectors/
 data/
+model-packages/
+evaluations/
+mixes/
 workloads/
 bindings/
 policies/
 deployments/
+starter-packs/
 .omf/
 ```
 
@@ -542,8 +548,11 @@ deployments/
 - `factory/` contains the open implementation and SDK or a reproducible lock to
   them.
 - `modules/` and any module-referenced paths contain user code.
-- `connectors/`, `data/`, `workloads/`, `bindings/`, `policies/`, and
-  `deployments/` contain versioned desired-state manifests.
+- `connectors/`, `data/`, `model-packages/`, `evaluations/`, `mixes/`,
+  `workloads/`, `bindings/`, `policies/`, and `deployments/` contain versioned
+  desired-state manifests.
+- `starter-packs/` contains optional, copyable framework, model-family, or
+  modality conveniences. Factory core MUST NOT depend on them.
 - `.omf/` contains only recreatable local databases, caches, sockets, logs, and
   runtime state and MUST be ignored by Git.
 - Raw data and secret files MUST be ignored by default. A user may explicitly
@@ -609,6 +618,7 @@ operations and equivalent machine APIs:
 | `omf run` | Validate, package, synchronize prerequisites, admit, and execute a workload |
 | `omf lineage` | Query upstream derivation and downstream impact |
 | `omf evaluate` | Run or inspect a versioned evaluation suite |
+| `omf experiment create` | Compare exact evaluation-result revisions under one protocol |
 | `omf deploy` | Policy-check, promote, deploy, observe, and roll back a release |
 
 Mutating commands MUST support a dry-run/plan mode. Long-running commands MUST
@@ -925,9 +935,11 @@ Checkpoint publication follows this minimum protocol:
 1. Quiesce or capture a declared consistent state.
 2. Write all content-addressed shards to staging.
 3. Verify shard digests and completeness.
-4. Write an immutable checkpoint manifest containing model, optimizer,
-   scheduler, RNG, sampler, workload, binding, code, environment, and parent
-   checkpoint references.
+4. Write an immutable checkpoint manifest with role-mapped, verified component
+   artifact references plus workload, binding, code, environment, and parent
+   checkpoint context. Record replay as either bound to an observed sampler
+   state and mix revision or explicitly `not-claimed`; never fabricate omitted
+   model, optimizer, scheduler, RNG, or sampler state.
 5. Atomically publish the manifest or compare-and-set its committed status.
 6. Emit `CheckpointCommitted` only after commit.
 

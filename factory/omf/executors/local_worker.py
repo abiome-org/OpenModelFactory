@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import hashlib
 import json
 import os
 import signal
@@ -12,6 +13,8 @@ import threading
 import time
 from pathlib import Path
 from types import FrameType
+
+from omf.canonical import sha256_digest
 
 _child: subprocess.Popen[bytes] | None = None
 _stop_reason: str | None = None
@@ -38,11 +41,14 @@ def _handle_stop(signum: int, _frame: FrameType | None) -> None:
     timer.start()
 
 
-def _write_completion(path: Path, *, exit_code: int, reason: str) -> None:
+def _write_completion(
+    path: Path, *, exit_code: int, reason: str, evidence: dict[str, object] | None = None
+) -> None:
     value = {
         "exitCode": exit_code,
         "reason": reason,
         "finished": time.time(),
+        "evidence": evidence or {},
     }
     temporary = path.with_suffix(path.suffix + ".tmp")
     temporary.write_text(json.dumps(value, sort_keys=True, separators=(",", ":")))
@@ -53,6 +59,9 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--completion", required=True, type=Path)
     parser.add_argument("--timeout", type=float)
+    parser.add_argument("--attested-executable", nargs=2, action="append", default=[])
+    parser.add_argument("--environment-digest")
+    parser.add_argument("--argv-digest", required=True)
     parser.add_argument("command", nargs=argparse.REMAINDER)
     args = parser.parse_args()
     command = list(args.command)
@@ -60,6 +69,31 @@ def main() -> int:
         command.pop(0)
     if not command:
         parser.error("a command is required after --")
+    evidence: dict[str, object] = {
+        "environmentDigest": args.environment_digest,
+        "argvDigest": sha256_digest(command),
+        "executables": [],
+    }
+    if evidence["argvDigest"] != args.argv_digest:
+        _write_completion(
+            args.completion, exit_code=1, reason="argv-digest-mismatch", evidence=evidence
+        )
+        return 1
+    observed = []
+    for path_value, expected in args.attested_executable:
+        path = Path(path_value)
+        actual = "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest()
+        observed.append({"path": str(path), "digest": actual})
+        if actual != expected:
+            evidence["executables"] = observed
+            _write_completion(
+                args.completion,
+                exit_code=1,
+                reason="executable-digest-mismatch",
+                evidence=evidence,
+            )
+            return 1
+    evidence["executables"] = observed
 
     signal.signal(signal.SIGTERM, _handle_stop)
     signal.signal(signal.SIGINT, _handle_stop)
@@ -76,7 +110,7 @@ def main() -> int:
         except subprocess.TimeoutExpired:
             _signal_child(signal.SIGKILL)
             exit_code = _child.wait()
-    _write_completion(args.completion, exit_code=exit_code, reason=reason)
+    _write_completion(args.completion, exit_code=exit_code, reason=reason, evidence=evidence)
     return exit_code if 0 <= exit_code <= 255 else 1
 
 

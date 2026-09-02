@@ -1,0 +1,15 @@
+apiVersion: omf.dev/v1alpha1
+kind: MixSpec
+metadata:
+  name: example-affine
+  namespace: local/open-model-factory
+spec:
+  sources:
+    - datasetRef: dataset/example-affine
+      weight: 1.0
+  curriculum: {schedule: constant}
+  replay: {replacement: false, seed: 17, rng: counter-sha256/v1}
+  exhaustion: stop
+  extensions:
+    normalization: sum-to-one
+    sharding: global-ranges

@@ -27,7 +27,7 @@ class SchemaRegistry:
         for entry in root.iterdir():
             if entry.name.endswith(".json") and entry.name != "base.json":
                 schema = json.loads(entry.read_text(encoding="utf-8"))
-                schema["$defs"] = base["$defs"]
+                schema["$defs"] = {**base["$defs"], **schema.get("$defs", {})}
                 schema["properties"]["specDigest"] = {
                     "type": "string",
                     "pattern": "^sha256:[0-9a-f]{64}$",
@@ -77,6 +77,13 @@ class SchemaRegistry:
                 f"resource failed validation ({len(errors)} error(s))", details=details
             )
         return deepcopy(resource)
+
+    def validate_as(self, resource: Any, expected_kind: str) -> dict[str, Any]:
+        """Validate a resource at a boundary that requires one exact kind."""
+        value = self.validate(resource)
+        if value["kind"] != expected_kind:
+            raise ValidationError(f"expected {expected_kind} resource, received {value['kind']}")
+        return value
 
     def load(self, data: str | bytes | Path) -> dict[str, Any]:
         """Load and validate YAML/JSON text or a path."""

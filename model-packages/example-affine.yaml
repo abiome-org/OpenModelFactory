@@ -1,0 +1,66 @@
+apiVersion: omf.dev/v1alpha1
+kind: ModelPackage
+metadata:
+  name: example-affine
+  namespace: local/open-model-factory
+spec:
+  architecture:
+    family: affine-map
+    parameterSchema:
+      type: object
+      required: [slope, intercept]
+  signatures:
+    input:
+      type: object
+      required: [input]
+      properties: {input: {type: number}}
+      additionalProperties: false
+    output:
+      type: object
+      required: [prediction]
+      properties: {prediction: {type: number}}
+      additionalProperties: false
+    state:
+      type: object
+      required: [slope, intercept, format]
+      properties:
+        slope: {type: number}
+        intercept: {type: number}
+        format: {const: json-affine/v1}
+      additionalProperties: false
+    batching: {mode: independent}
+  preprocessing: []
+  postprocessing: []
+  initialization:
+    declaredBy: workload
+  checkpointMapping:
+    format: json-affine/v1
+  adapters:
+    trainingReference:
+      stage: train
+      operation: run
+      config: {action: train}
+    inferenceReference:
+      stage: train
+      operation: run
+      stateOutput: train.modelState
+      config: {action: infer}
+  conformanceVectors:
+    - name: positive
+      method: predict
+      inputs: {input: 3.0}
+      expected: {prediction: 7.0}
+      tolerances:
+        prediction: {absolute: 0.01, relative: 0.001}
+  capabilities:
+    precision: [binary64]
+    parallelism: [single-process]
+    devices: [cpu]
+    export: [json-affine/v1]
+  provenance:
+    sourceRef: repository:modules/examples/affine-regression
+    license: Apache-2.0
+    dependencies: {lockDigest: sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855}
+    security: {network: denied, secrets: []}
+    build: {method: source}
+  migrations: []

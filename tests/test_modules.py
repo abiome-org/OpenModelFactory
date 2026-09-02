@@ -1,9 +1,11 @@
 import io
+import shutil
 import tarfile
 
 import pytest
+import yaml
 from omf.errors import ValidationError
-from omf.modules import extract_module_package, package_module
+from omf.modules import extract_module_package, load_manifest, package_module
 
 
 def test_reproducible_package_and_links_rejected(tmp_path):
@@ -36,3 +38,42 @@ def test_safe_module_extraction_and_traversal_rejection(tmp_path):
     with pytest.raises(ValidationError, match="unsafe"):
         extract_module_package(unsafe, tmp_path / "unsafe-out")
     assert not (tmp_path / "escape").exists()
+
+
+def test_module_dependency_lock_is_verified(tmp_path):
+    project = tmp_path / "project"
+    module = project / "modules/example"
+    shutil.copytree("modules/examples/statistical", module)
+    load_manifest(module / "module.yaml", project)
+    (module / "requirements.lock").write_text("tampered\n")
+    with pytest.raises(ValidationError, match="digest does not match"):
+        load_manifest(module / "module.yaml", project)
+
+
+def test_module_contract_dynamic_references_are_rejected(tmp_path):
+    project = tmp_path / "project"
+    module = project / "modules/example"
+    shutil.copytree("modules/examples/statistical", module)
+    manifest_path = module / "module.yaml"
+    manifest = yaml.safe_load(manifest_path.read_text())
+    manifest["spec"]["contracts"]["input"] = {"$dynamicRef": "#input"}
+    manifest_path.write_text(yaml.safe_dump(manifest))
+
+    with pytest.raises(ValidationError, match="references are not supported"):
+        load_manifest(manifest_path, project)
+
+
+def test_module_contract_allows_instance_property_named_ref(tmp_path):
+    project = tmp_path / "project"
+    module = project / "modules/example"
+    shutil.copytree("modules/examples/statistical", module)
+    manifest_path = module / "module.yaml"
+    manifest = yaml.safe_load(manifest_path.read_text())
+    manifest["spec"]["contracts"]["input"] = {
+        "type": "object",
+        "properties": {"$ref": {"type": "string"}},
+    }
+    manifest_path.write_text(yaml.safe_dump(manifest))
+
+    loaded, _root = load_manifest(manifest_path, project)
+    assert "$ref" in loaded.schemas["input"]["properties"]

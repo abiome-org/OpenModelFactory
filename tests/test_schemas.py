@@ -15,14 +15,21 @@ def _value(schema, root):
         return schema["const"]
     if "enum" in schema:
         return schema["enum"][0]
-    if "oneOf" in schema:
+    if "oneOf" in schema and schema.get("type") != "object" and "properties" not in schema:
         return _value(schema["oneOf"][0], root)
     typ = schema.get("type")
     if typ == "object" or "properties" in schema:
-        return {
+        value = {
             key: _value(schema.get("properties", {})[key], root)
             for key in schema.get("required", [])
         }
+        if "oneOf" in schema:
+            choice = schema["oneOf"][0]
+            for key in choice.get("required", []):
+                value[key] = _value(schema["properties"][key], root)
+        if not value and schema.get("minProperties", 0):
+            value["component"] = _value(schema.get("additionalProperties", {}), root)
+        return value
     if typ == "array":
         return [_value(schema.get("items", {}), root)] * schema.get("minItems", 0)
     if typ == "integer":
@@ -33,7 +40,8 @@ def _value(schema, root):
         return True
     if schema.get("format") == "uuid":
         return "00000000-0000-4000-8000-000000000000"
-    if schema.get("pattern", "").endswith(":[0-9a-f]+$"):
+    pattern = schema.get("pattern", "")
+    if pattern.startswith("^sha256:") or pattern.endswith(":[0-9a-f]+$"):
         return "sha256:" + "0" * 64
     return "x"
 
@@ -83,3 +91,44 @@ def test_checked_in_deployment_manifest_is_valid():
     value = SchemaRegistry().load(Path("deployments/example-edge.yaml"))
     assert value["kind"] == "DeploymentSpec"
     assert value["metadata"]["namespace"] == "local/open-model-factory"
+
+
+def test_checked_in_workload_and_modules_use_canonical_resources():
+    registry = SchemaRegistry()
+    workload = registry.load(Path("workloads/example-statistical.yaml"))
+    statistical = registry.load(Path("modules/examples/statistical/module.yaml"))
+    text_frequency = registry.load(Path("modules/examples/text-frequency/module.yaml"))
+    from_scratch = registry.load(Path("workloads/example-from-scratch.yaml"))
+    affine = registry.load(Path("modules/examples/affine-regression/module.yaml"))
+    model_package = registry.load(Path("model-packages/example-affine.yaml"))
+    assert workload["kind"] == "WorkloadSpec"
+    assert from_scratch["kind"] == "WorkloadSpec"
+    assert statistical["kind"] == text_frequency["kind"] == affine["kind"] == "Module"
+    assert model_package["kind"] == "ModelPackage"
+
+    with pytest.raises(ValidationError, match="unsupported apiVersion"):
+        registry.validate({"stages": []})
+
+
+def test_module_and_workload_references_are_typed_and_relocatable():
+    registry = SchemaRegistry()
+    module = registry.load(Path("modules/examples/statistical/module.yaml"))
+    workload = registry.load(Path("workloads/example-statistical.yaml"))
+
+    invalid_module = deepcopy(module)
+    invalid_module["spec"]["entryPoint"]["codeRoot"] = "/tmp/module"
+    with pytest.raises(ValidationError):
+        registry.validate(invalid_module)
+
+    invalid_environment = deepcopy(module)
+    invalid_environment["spec"]["environment"] = {}
+    with pytest.raises(ValidationError):
+        registry.validate(invalid_environment)
+
+    invalid_workload = deepcopy(workload)
+    invalid_workload["spec"]["graph"]["stages"][0]["module"] = "../module.yaml"
+    with pytest.raises(ValidationError):
+        registry.validate(invalid_workload)
+
+    with pytest.raises(ValidationError, match="expected Module"):
+        registry.validate_as(workload, "Module")

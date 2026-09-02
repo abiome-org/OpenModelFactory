@@ -20,8 +20,12 @@ Every chapter declares one of these statuses:
   yet provide the claimed end-to-end workflow. Blueprints contain no invented
   commands.
 
-The example is intentionally a tiny statistical model. It proves lifecycle
-mechanics, not model quality, benchmark coverage, RLVR readiness, or scale.
+The example is intentionally a tiny from-scratch affine model implemented with
+the Python standard library. It proves model-package and MixSpec admission,
+training, checkpoint publication, evaluation, and experiment mechanics—not mix
+delivery/replay, model quality, benchmark coverage, RLVR readiness, or scale.
+Framework- and modality-specific conveniences belong in optional starter packs,
+not factory core.
 
 ## Learning path
 
@@ -71,31 +75,38 @@ ACTOR="${OMF_ACTOR:-local-user}"
 omf --actor "$ACTOR" --output json bootstrap
 omf --actor "$ACTOR" --output json doctor
 omf --actor "$ACTOR" --output json module validate \
-  modules/examples/statistical/module.yaml
+  modules/examples/affine-regression/module.yaml
 omf --actor "$ACTOR" --output json module test \
-  modules/examples/statistical/module.yaml
+  modules/examples/affine-regression/module.yaml
 
 omf --actor "$ACTOR" --output json data add \
-  data/fixtures/numbers.jsonl \
-  --name example-numbers \
+  data/fixtures/affine.jsonl \
+  --name example-affine \
   --mode copy \
   --rights data/fixtures/rights.yaml
-omf --actor "$ACTOR" --output json data verify example-numbers
+omf --actor "$ACTOR" --output json data verify example-affine
+
+omf --actor "$ACTOR" --output json resource apply \
+  model-packages/example-affine.yaml
+omf --actor "$ACTOR" --output json resource apply \
+  evaluations/example-affine.yaml
+omf --actor "$ACTOR" --output json resource apply \
+  mixes/example-affine.yaml
 
 omf --actor "$ACTOR" --output json store add secondary \
   --driver filesystem \
   --endpoint .omf/manual-secondary
-omf --actor "$ACTOR" --output json sync push dataset/example-numbers \
+omf --actor "$ACTOR" --output json sync push dataset/example-affine \
   --to secondary --plan
-omf --actor "$ACTOR" --output json sync push dataset/example-numbers \
+omf --actor "$ACTOR" --output json sync push dataset/example-affine \
   --to secondary
 
 omf --actor "$ACTOR" --output json executor preflight \
   bindings/local.yaml \
-  --workload workloads/example-statistical.yaml
+  --workload workloads/example-from-scratch.yaml
 
 run_json="$(omf --actor "$ACTOR" --output json run \
-  workloads/example-statistical.yaml \
+  workloads/example-from-scratch.yaml \
   --binding bindings/local.yaml)"
 printf '%s\n' "$run_json"
 run_id="$(printf '%s' "$run_json" | \

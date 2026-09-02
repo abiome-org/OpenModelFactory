@@ -227,8 +227,12 @@ for existing_directory in \
   "${TARGET_ANCHOR}/connectors" \
   "${TARGET_ANCHOR}/data" \
   "${TARGET_ANCHOR}/deployments" \
+  "${TARGET_ANCHOR}/evaluations" \
   "${TARGET_ANCHOR}/bindings" \
+  "${TARGET_ANCHOR}/mixes" \
+  "${TARGET_ANCHOR}/model-packages" \
   "${TARGET_ANCHOR}/policies" \
+  "${TARGET_ANCHOR}/starter-packs" \
   "${TARGET_ANCHOR}/workloads" \
   "${TARGET_ANCHOR}/modules"; do
   assert_safe_directory "${existing_directory}"
@@ -632,8 +636,12 @@ for directory in \
   connectors \
   data \
   deployments \
+  evaluations \
   bindings \
+  mixes \
+  model-packages \
   policies \
+  starter-packs \
   workloads \
   modules; do
   ensure_directory "${TARGET_ANCHOR}/${directory}"

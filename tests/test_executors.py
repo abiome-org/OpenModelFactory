@@ -1,9 +1,11 @@
 import shutil
+import time
 from types import SimpleNamespace
 
 import pytest
 from omf.errors import CapabilityError, ConfigurationError, ValidationError
 from omf.executors import ExecutorContext, ExecutorProvider, ExecutorRegistry
+from omf.executors.base import DependencyLock
 from omf.executors.kubernetes import KubernetesExecutor
 from omf.executors.local import LocalExecutor
 from omf.executors.registry import default_executor_registry
@@ -104,6 +106,10 @@ def test_executor_registry_rejects_invalid_plugins_and_controller_fields(tmp_pat
     with pytest.raises(ValidationError, match="controller-owned"):
         registry.resolve("valid", config={"argv": ["unexpected"]}, **resolve)
 
+    builtins = default_executor_registry(discover=False)
+    with pytest.raises(ValidationError, match="provider contract"):
+        builtins.resolve("kubernetes", config={"typo": True}, **resolve)
+
     invalid_executor = ExecutorRegistry()
     invalid_executor.register(ExecutorProvider("invalid", lambda _context: object()))
     with pytest.raises(ConfigurationError, match="invalid adapter"):
@@ -191,6 +197,96 @@ def test_local_executor_enforces_timeout_without_controller_and_records_plain_co
     )
     executor._processes[plain].wait(timeout=5)
     assert executor.status(plain).state == "succeeded"
+
+
+def test_local_executor_attests_executable_under_network_wrapper(tmp_path, monkeypatch):
+    executor = LocalExecutor()
+    monkeypatch.setattr(executor, "_network_namespace_available", lambda _path=None: True)
+    environment = executor.prepare_environment(
+        argv=["python3", "-c", "pass"],
+        cwd=tmp_path,
+        dependency=DependencyLock("requirements.lock", "sha256:test", b""),
+        deny_network=True,
+    )
+    environment["executables"][0]["digest"] = "sha256:" + "0" * 64
+    plan = executor.plan(
+        argv=environment["command"],
+        run_dir=tmp_path / "attested",
+        cwd=tmp_path,
+        deny_network=True,
+        requires_result=False,
+        environment=environment,
+    )
+    assert plan.argv[0] == environment["executables"][0]["path"]
+    assert plan.metadata["executables"] == environment["executables"]
+
+    execution_id = executor.submit(plan)
+    for _ in range(100):
+        status = executor.status(execution_id)
+        if status.state != "running":
+            break
+        time.sleep(0.01)
+    assert status.state == "failed"
+    assert status.reason == "executable-digest-mismatch"
+
+
+def test_local_environment_resolves_relative_path_entries(tmp_path, monkeypatch):
+    binary_directory = tmp_path / "bin"
+    binary_directory.mkdir()
+    executable = binary_directory / "tool"
+    executable.write_bytes(b"binary")
+    executable.chmod(0o755)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("PATH", "bin")
+
+    environment = LocalExecutor().prepare_environment(
+        argv=["tool"],
+        cwd=tmp_path,
+        dependency=DependencyLock("requirements.lock", "sha256:test", b""),
+    )
+    assert environment["command"][0] == str(executable.resolve())
+    assert environment["executables"][0]["path"] == str(executable.resolve())
+
+
+def test_local_environment_rejects_nonempty_opaque_dependency_lock(tmp_path):
+    with pytest.raises(CapabilityError, match="cannot realize a non-empty dependency lock"):
+        LocalExecutor().prepare_environment(
+            argv=["python3", "-c", "pass"],
+            cwd=tmp_path,
+            dependency=DependencyLock(
+                "environment.lock", "sha256:" + "1" * 64, b"\x00provider-specific\xff"
+            ),
+        )
+
+
+def test_builtin_preflight_rejects_unconsumed_binding_values():
+    local = LocalExecutor(
+        binding_resources={"cpu": 2, "memory": "1Gi", "accelerators": ["gpu"], "typo": 1},
+        binding_spec={
+            "placement": {"zone": "x"},
+            "transport": {"kind": "x"},
+            "extensions": {"x": True},
+            "config": {
+                "executor": {},
+                "stores": {"artifacts": "remote"},
+                "isolation": {"driver": "none"},
+                "recovery": {"attempts": 2},
+                "typo": True,
+            },
+        },
+    )
+    issues = local.preflight()
+    assert len(issues) >= 8
+
+    slurm = SlurmExecutor(
+        shared_filesystem=True,
+        binding_resources={"nodes": 0, "gpus": True, "unknown": 1},
+        placement={"partition": "", "unknown": "x"},
+        binding_spec={"transport": {"x": True}, "extensions": {"x": True}, "config": "bad"},
+    )
+    issues = slurm.preflight()
+    assert any("positive integer" in issue for issue in issues)
+    assert any("non-empty string" in issue for issue in issues)
 
 
 def test_slurm_and_kubernetes_adapter_lifecycle(tmp_path, monkeypatch):

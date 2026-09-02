@@ -11,8 +11,11 @@ from omf.executors.base import ExecutionPlan, ExecutionState, ExecutionStatus, E
 
 
 class KubernetesExecutor(Executor):
-    def __init__(self, context: str | None = None) -> None:
+    def __init__(
+        self, context: str | None = None, *, binding_spec: dict[str, Any] | None = None
+    ) -> None:
         self.context = context
+        self.binding_spec = binding_spec or {}
         self._dirs: dict[str, Path] = {}
 
     @property
@@ -23,6 +26,21 @@ class KubernetesExecutor(Executor):
         return ["kubectl", *(["--context", self.context] if self.context else [])]
 
     def preflight(self) -> list[str]:
+        unsupported = [
+            field
+            for field in ("resources", "placement", "transport", "extensions")
+            if self.binding_spec.get(field)
+        ]
+        config = self.binding_spec.get("config", {})
+        if isinstance(config, dict):
+            unsupported.extend(key for key, value in config.items() if key != "executor" and value)
+        elif config:
+            unsupported.append("config")
+        if unsupported:
+            return [
+                "built-in Kubernetes lifecycle adapter does not consume Binding fields: "
+                + ", ".join(sorted(unsupported))
+            ]
         if not shutil.which("kubectl"):
             return ["missing tool: kubectl"]
         result = subprocess.run([*self._base(), "cluster-info"], capture_output=True)

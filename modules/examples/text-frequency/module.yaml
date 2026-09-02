@@ -1,28 +1,48 @@
-kind: model
-code_root: .
-argv:
-  - python3
-  - main.py
-schemas:
-  input: omf.example.text/v1
-  output: omf.example.frequency-model/v1
-capabilities:
-  - cpu
-platforms:
-  - linux
-  - darwin
-resources:
-  cpu_seconds: 30
-  address_space: 536870912
-  timeout_seconds: 30
-determinism: bitwise
-checkpoint: false
-side_effects: []
-concurrency: 1
-secrets: []
-network: []
-fixtures:
-  - request:
-      operation: validate
-    result:
-      status: ok
+apiVersion: omf.dev/v1alpha1
+kind: Module
+metadata:
+  name: text-frequency
+  namespace: omf/examples
+spec:
+  contractVersion: omf.module/v1
+  moduleKind: model
+  entryPoint:
+    command:
+      - python3
+      - main.py
+    codeRoot: .
+  contracts:
+    input:
+      type: object
+      additionalProperties: true
+    output:
+      type: object
+      additionalProperties: true
+    config:
+      type: object
+      additionalProperties: true
+    state:
+      type: object
+      additionalProperties: true
+  environment:
+    dependencyLock: requirements.lock
+    dependencyDigest: sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+  capabilities: []
+  platforms: []
+  resources: {}
+  determinism: bitwise
+  lifecycle:
+    checkpoint: false
+    sideEffects: []
+    concurrency: 1
+  access:
+    secrets: []
+    network: []
+  provenance:
+    license: Apache-2.0
+    sourceRef: repository:modules/examples/text-frequency
+  fixtures:
+    - request:
+        operation: validate
+      result:
+        status: ok

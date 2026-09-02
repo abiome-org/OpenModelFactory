@@ -176,6 +176,11 @@ evidence specified in `SPEC.md`; offline installation alone is not a claim.
 - Preserve goal statuses and evidence-backed knowledge with metadata backups;
   never reconstruct them from chat logs.
 - A failed or incomplete checkpoint is never a restore target.
+- A stale running operation is reconciled only from an immutable `RunResult`.
+  Without one, OMF marks the outcome indeterminate and does not automatically
+  replay potentially non-idempotent module work. Inspect it with
+  `omf operation get <operation-id>`, then run
+  `omf operation reconcile <operation-id>` under the original actor identity.
 - Alias and deployment changes require a recorded passing policy decision.
 - Do not claim `OMF-Frontier` without a reproducible report from at least 1,024
   actual accelerators.

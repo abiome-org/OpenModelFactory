@@ -1,6 +1,7 @@
 from omf.executors.base import (
     DEPLOYMENT_PROTOCOL_CAPABILITIES,
     MODULE_PROTOCOL_CAPABILITIES,
+    DependencyLock,
     ExecutionPlan,
     ExecutionStatus,
     Executor,
@@ -19,6 +20,7 @@ from omf.executors.slurm import SlurmExecutor
 __all__ = [
     "DEPLOYMENT_PROTOCOL_CAPABILITIES",
     "MODULE_PROTOCOL_CAPABILITIES",
+    "DependencyLock",
     "ExecutionPlan",
     "ExecutionStatus",
     "Executor",

@@ -89,6 +89,10 @@ def test_api_health_auth_schemas_resources_and_doctor(tmp_path):
         operations = client.get("/v1/operations?state=pending", headers=headers).json()
         assert [item["id"] for item in operations] == [operation_id]
         assert client.get(f"/v1/operations/{operation_id}", headers=headers).json()["version"] == 1
+        assert (
+            client.post(f"/v1/operations/{operation_id}/reconcile", headers=headers).status_code
+            == 400
+        )
 
         created = client.post(
             "/v1/tokens",

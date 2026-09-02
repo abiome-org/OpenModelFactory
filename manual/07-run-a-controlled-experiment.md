@@ -2,9 +2,9 @@
 
 **Status: Tested now**
 
-OMF can execute and retain two immutable runs. Comparison and statistical
-decision logic are currently operator- or module-owned; there is no
-`omf experiment` or `omf compare` command.
+OMF can execute and retain two immutable runs and compare one numeric metric
+when both `EvaluationResult` resources identify the same exact evaluation
+revisions. Rich statistical decisions remain evaluator- or analysis-module-owned.
 
 ## Lock the comparison set
 
@@ -24,6 +24,19 @@ omf --output json resource list --kind EvaluationResult
 ```
 
 ## Build the comparison
+
+Copy the exact baseline and candidate `EvaluationResult` URIs from `resource
+list`, then apply the predeclared metric direction:
+
+```sh
+omf --actor research-agent --output json experiment create candidate-v1 \
+  --baseline 'omf://<namespace>/evaluationresult/<baseline>@<revision>' \
+  --candidate 'omf://<namespace>/evaluationresult/<candidate>@<revision>' \
+  --metric <metric-name> --direction minimize
+```
+
+The command rejects results admitted under different evaluation revisions. It
+does not infer significance, equivalence margins, or uncertainty policy.
 
 Use immutable outputs to populate a table such as:
 

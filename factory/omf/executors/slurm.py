@@ -22,10 +22,12 @@ class SlurmExecutor(Executor):
         shared_filesystem: bool = False,
         binding_resources: dict[str, Any] | None = None,
         placement: dict[str, Any] | None = None,
+        binding_spec: dict[str, Any] | None = None,
     ) -> None:
         self.shared_filesystem = shared_filesystem
         self.binding_resources = binding_resources or {}
         self.placement = placement or {}
+        self.binding_spec = binding_spec or {}
         self._dirs: dict[str, Path] = {}
 
     @property
@@ -36,7 +38,36 @@ class SlurmExecutor(Executor):
         return frozenset(capabilities)
 
     def preflight(self) -> list[str]:
-        return [f"missing tool: {x}" for x in ("sbatch", "sacct", "scancel") if not shutil.which(x)]
+        issues = [
+            f"missing tool: {x}" for x in ("sbatch", "sacct", "scancel") if not shutil.which(x)
+        ]
+        supported_resources = {"nodes", "tasks", "cpus", "gpus"}
+        if unknown := sorted(set(self.binding_resources) - supported_resources):
+            issues.append(f"unsupported Slurm binding resources: {', '.join(unknown)}")
+        for key in sorted(set(self.binding_resources) & supported_resources):
+            value = self.binding_resources[key]
+            if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+                issues.append(f"Slurm resource {key} must be a positive integer")
+        supported_placement = {"partition", "account", "qos", "constraint", "reservation"}
+        if unknown := sorted(set(self.placement) - supported_placement):
+            issues.append(f"unsupported Slurm placement fields: {', '.join(unknown)}")
+        for key in sorted(set(self.placement) & supported_placement):
+            if not isinstance(self.placement[key], str) or not self.placement[key]:
+                issues.append(f"Slurm placement {key} must be a non-empty string")
+        for field in ("transport", "extensions"):
+            if self.binding_spec.get(field):
+                issues.append(f"built-in Slurm executor does not support Binding.spec.{field}")
+        config = self.binding_spec.get("config", {})
+        if isinstance(config, dict):
+            if unsupported := sorted(
+                key for key, value in config.items() if key != "executor" and value
+            ):
+                issues.append(
+                    f"unsupported built-in Slurm Binding config: {', '.join(unsupported)}"
+                )
+        elif config:
+            issues.append("Slurm Binding.spec.config must be an object")
+        return issues
 
     def plan(
         self,

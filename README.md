@@ -26,12 +26,15 @@ Modal, Vast.ai, site schedulers, and future runners without changing a workload.
 Provider inventory, configuration contracts, and fail-closed preflight are
 available to both agents and operators.
 
-The maturity label remains **Alpha**, intentionally. Slurm and Kubernetes
-adapters, signed federation primitives, capacity measurement, and air-gap
-procedures are present, but this repository does not claim cluster, federated,
-air-gap, or frontier conformance without the measured signed evidence required
-by `SPEC.md`. In particular, no `OMF-Frontier` claim exists until a reproducible
-test has run on at least 1,024 actual accelerators.
+The maturity label remains **Alpha**, intentionally. The checked-in path is a
+tested local reference, not an `OMF-Core` conformance claim: normative sampler
+replay, interrupted checkpoint restore, and two-adapter train/serve parity remain
+fail-closed extension boundaries. Slurm and Kubernetes adapters, signed federation
+primitives, capacity measurement, and air-gap procedures are present, but this
+repository does not claim cluster, federated, air-gap, or frontier conformance
+without the measured signed evidence required by `SPEC.md`. In particular, no
+`OMF-Frontier` claim exists until a reproducible test has run on at least 1,024
+actual accelerators.
 
 - [Specification](SPEC.md) — normative product, architecture, interface,
   conformance, and implementation requirements.
@@ -42,6 +45,8 @@ test has run on at least 1,024 actual accelerators.
   incident, and offline-install procedures.
 - [Executor provider guide](docs/executors.md) — portable workload boundary,
   plugin contract, backend guidance, and conformance checklist.
+- [Architecture map](docs/architecture.md) — concise ownership and extension
+  boundaries without duplicating the normative specification.
 
 ## Install into a directory
 
@@ -91,9 +96,9 @@ authenticated local API service.
 
 ## North-star workflow
 
-The following path uses only files included in a clean clone through training
-and evaluation. Replace the example module, data, and workload with your own as
-the project evolves.
+After installing the clone as described above, the following path uses only
+checked-in files through training and evaluation. Replace the example module,
+data, and workload with your own as the project evolves.
 
 ```sh
 git clone <repo-url> my-model-factory
@@ -108,17 +113,22 @@ omf module validate
 omf module test
 
 # Import the checked-in non-sensitive fixture as an immutable snapshot.
-omf data add data/fixtures/numbers.jsonl --name example-numbers --mode copy \
+omf data add data/fixtures/affine.jsonl --name example-affine --mode copy \
   --rights data/fixtures/rights.yaml
+
+# Commit the portable package, evaluation, and mix contracts.
+omf resource apply model-packages/example-affine.yaml
+omf resource apply evaluations/example-affine.yaml
+omf resource apply mixes/example-affine.yaml
 
 # Sync it to a second local holding site. Replace this with S3 when needed.
 omf store add secondary --driver filesystem --endpoint .omf/secondary-store
-omf sync push dataset/example-numbers --to secondary --plan
-omf sync push dataset/example-numbers --to secondary
+omf sync push dataset/example-affine --to secondary --plan
+omf sync push dataset/example-affine --to secondary
 
 # Run the scientific workload through the verified local binding.
-omf executor preflight bindings/local.yaml --workload workloads/example-statistical.yaml
-omf run workloads/example-statistical.yaml --binding bindings/local.yaml
+omf executor preflight bindings/local.yaml --workload workloads/example-from-scratch.yaml
+omf run workloads/example-from-scratch.yaml --binding bindings/local.yaml
 
 # Use the emitted runId to inspect and evaluate the run.
 omf lineage show run:<run-id>/stage:train
@@ -221,10 +231,14 @@ modules/                 # all user model, data, train, eval, and runtime code
   evaluators/
 connectors/              # versioned data-source and holding-site declarations
 data/                    # dataset manifests; payloads are ignored by default
+model-packages/          # canonical model signatures, adapters, and conformance vectors
+evaluations/             # versioned evaluation protocols and thresholds
+mixes/                   # portable data-mixture and replay intent
 workloads/               # scientific workload definitions
 bindings/                # local, cluster, and federation resource mappings
 policies/                # rights, safety, budget, promotion, and retention
 deployments/             # batch, service, actor, edge, or control deployments
+starter-packs/           # optional framework/model/modality conveniences
 .omf/                    # recreatable cache and local runtime state; not in Git
 ```
 
@@ -235,8 +249,8 @@ does not constrain language or project organization.
 
 | Content | Source of truth |
 | --- | --- |
-| Code, workloads, modules, bindings, policies | Git repository |
-| Data, checkpoints, model packages, releases | User-selected artifact stores |
+| Code, desired-state manifests, model definitions, bindings, policies | Git repository |
+| Data payloads, checkpoints, built model payloads, releases | User-selected artifact stores |
 | Derivation and decisions | Signed event and lineage records |
 | Goals and evidence-backed accumulated knowledge | Immutable resources, CAS status, signed events, and lineage |
 | Credentials and encryption keys | Local or site secret service, never Git |
@@ -253,21 +267,22 @@ For every admitted run, the implementation:
 1. validates module, data, binding, protocol, and namespace compatibility;
 2. packages and executes immutable admitted module source and identifies inputs
    by digest;
-3. syncs only missing verified chunks and commits manifests last;
-4. provides a worker-count-independent replayable sampler;
-5. executes model-neutral DAG stages through `omf.module/v1`;
-6. publishes only independently verified atomic checkpoints;
-7. materializes immutable evaluation evidence;
-8. retains signed events, bidirectional lineage, telemetry, and review evidence;
-9. emits an SPDX 2.3 SBOM and enforces rights, signatures, conformance,
+3. independently verifies copied input artifacts before materialization;
+4. executes model-neutral DAG stages through `omf.module/v1`;
+5. atomically publishes a checkpoint when a checkpoint-capable module emits
+   verified state and shard artifacts;
+6. materializes immutable evaluation evidence;
+7. retains signed events, bidirectional lineage, telemetry, and review evidence;
+8. emits an SPDX 2.3 SBOM and enforces rights, signatures, conformance,
    vulnerability evidence, approvals, and separation of duties at promotion;
-10. creates a complete signed release and packages or starts an explicit
+9. creates a complete signed release and packages or starts an explicit
     deployment without a separate production fork.
 
 The executor registry resolves the binding exactly; unknown providers and
 missing protocol transport fail before a run is allocated and never fall back
-to local. Slurm can transport the complete module protocol over an explicitly
-declared shared filesystem, subject to workload isolation requirements. The
+to local. Slurm has shared-filesystem module transport but remains
+scheduler-lifecycle-only until an installed provider attests the execution
+environment and required isolation. The
 built-in Kubernetes adapter exposes deterministic Job/JobSet lifecycle
 primitives but intentionally does not claim module source, request/result, or
 artifact transport. Trusted entry-point packages can provide Modal, Vast.ai,
@@ -313,5 +328,7 @@ evaluates it, creates and independently verifies a signed release, policy-gates
 an alias promotion, and creates an edge deployment package. Additional tests
 exercise interrupted sync, tamper detection, concurrent event ordering and
 lineage cycle prevention, S3 semantics, subprocess environments, federation
-restart/reconciliation, executor plans, checkpoint atomicity, and sampler
-replay. See `tests/` and CI for executable evidence.
+restart/reconciliation, executor plans, role-mapped atomic checkpoint
+publication, and the standalone deterministic sampler. The reference checkpoint
+explicitly does not claim sampler replay or restore conformance. See `tests/` and
+CI for executable evidence.

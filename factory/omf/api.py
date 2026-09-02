@@ -8,7 +8,7 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
-from fastapi import Depends, FastAPI, Header, Query, Request, Response
+from fastapi import BackgroundTasks, Depends, FastAPI, Header, Query, Request, Response
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field
@@ -59,6 +59,7 @@ class RunRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     workload: str
     binding: str = "bindings/local.yaml"
+    detach: bool = False
 
 
 class ExecutorPreflightRequest(BaseModel):
@@ -87,6 +88,16 @@ class ReleaseRequest(BaseModel):
     alias: str = "candidate"
     approvals: list[str] = Field(default_factory=list)
     vulnerability_report: str | None = None
+    evaluation_ref: str | None = None
+
+
+class ExperimentRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    name: str
+    baseline_ref: str
+    candidate_ref: str
+    metric: str
+    direction: str = "maximize"
 
 
 class DeploymentRequest(BaseModel):
@@ -521,8 +532,24 @@ def create_app(paths: ProjectPaths, *, executors: ExecutorRegistry | None = None
     ) -> dict[str, Any]:
         return service.test_module(paths.root / request.manifest)
 
+    def execute_run_operation(operation_id: str) -> None:
+        with Factory(paths, executors=factory.executors) as reader:
+            actor = str(reader.operations.get(operation_id)["request"]["actor"])
+        with Factory(paths, actor=actor, executors=factory.executors) as service:
+            service.execute_run_operation(operation_id)
+
     @app.post("/v1/runs")
-    def run(request: RunRequest, service: Factory = Depends(authorized)) -> dict[str, Any]:
+    def run(
+        request: RunRequest,
+        background: BackgroundTasks,
+        service: Factory = Depends(authorized),
+    ) -> dict[str, Any]:
+        if request.detach:
+            operation = service.create_run_operation(
+                paths.root / request.workload, paths.root / request.binding
+            )
+            background.add_task(execute_run_operation, operation["id"])
+            return operation
         return service.run(paths.root / request.workload, paths.root / request.binding)
 
     @app.get("/v1/runs/{run_id}")
@@ -548,6 +575,19 @@ def create_app(paths: ProjectPaths, *, executors: ExecutorRegistry | None = None
             vulnerability_report=(
                 paths.root / request.vulnerability_report if request.vulnerability_report else None
             ),
+            evaluation_ref=request.evaluation_ref,
+        )
+
+    @app.post("/v1/experiments")
+    def experiment(
+        request: ExperimentRequest, service: Factory = Depends(authorized)
+    ) -> dict[str, Any]:
+        return service.create_experiment(
+            name=request.name,
+            baseline_ref=request.baseline_ref,
+            candidate_ref=request.candidate_ref,
+            metric=request.metric,
+            direction=request.direction,
         )
 
     @app.post("/v1/deployments")
@@ -635,6 +675,12 @@ def create_app(paths: ProjectPaths, *, executors: ExecutorRegistry | None = None
     @app.get("/v1/operations/{operation_id}")
     def operation(operation_id: str, service: Factory = Depends(authorized)) -> dict[str, Any]:
         return service.operations.get(operation_id)
+
+    @app.post("/v1/operations/{operation_id}/reconcile")
+    def operation_reconcile(
+        operation_id: str, service: Factory = Depends(authorized)
+    ) -> dict[str, Any]:
+        return service.execute_run_operation(operation_id)
 
     @app.post("/v1/federation/trust")
     def federation_trust(

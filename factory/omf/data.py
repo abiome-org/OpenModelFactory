@@ -112,8 +112,8 @@ class DataService:
                     "path": relative,
                     "digest": "sha256:" + digest.hexdigest(),
                     "size": info.st_size,
-                    "mtime_ns": info.st_mtime_ns,
-                    "inode": info.st_ino,
+                    "mtime_ns": str(info.st_mtime_ns),
+                    "inode": str(info.st_ino),
                     "mode": stat.S_IMODE(info.st_mode),
                 }
             )
@@ -141,7 +141,7 @@ class DataService:
                     digest.update(block)
             if (info.st_size, info.st_mtime_ns, "sha256:" + digest.hexdigest()) != (
                 expected["size"],
-                expected["mtime_ns"],
+                int(expected["mtime_ns"]),
                 expected["digest"],
             ):
                 raise IntegrityError("registered dataset drift detected")

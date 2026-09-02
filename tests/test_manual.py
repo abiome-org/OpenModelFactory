@@ -58,12 +58,19 @@ def _manual_project(tmp_path: Path) -> Path:
     (root / "bindings").mkdir()
     shutil.copy2("bindings/local.yaml", root / "bindings/local.yaml")
     (root / "workloads").mkdir()
-    shutil.copy2("workloads/example-statistical.yaml", root / "workloads/example-statistical.yaml")
+    shutil.copy2(
+        "workloads/example-from-scratch.yaml", root / "workloads/example-from-scratch.yaml"
+    )
     (root / "modules/examples").mkdir(parents=True)
-    shutil.copytree("modules/examples/statistical", root / "modules/examples/statistical")
+    shutil.copytree(
+        "modules/examples/affine-regression", root / "modules/examples/affine-regression"
+    )
     (root / "data/fixtures").mkdir(parents=True)
-    shutil.copy2("data/fixtures/numbers.jsonl", root / "data/fixtures/numbers.jsonl")
+    shutil.copy2("data/fixtures/affine.jsonl", root / "data/fixtures/affine.jsonl")
     shutil.copy2("data/fixtures/rights.yaml", root / "data/fixtures/rights.yaml")
+    for directory in ("model-packages", "evaluations", "mixes"):
+        (root / directory).mkdir()
+        shutil.copy2(f"{directory}/example-affine.yaml", root / directory / "example-affine.yaml")
 
     subprocess.run(["git", "init", "-q"], cwd=root, check=True)
     subprocess.run(["git", "config", "user.name", "OMF manual test"], cwd=root, check=True)
@@ -110,7 +117,7 @@ def test_canonical_manual_lifecycle_executes_end_to_end(tmp_path):
 
     with Factory(ProjectPaths(root)) as factory:
         assert factory.doctor()["ready"]
-        assert factory.verify_data("example-numbers")
+        assert factory.verify_data("example-affine")
         assert factory.find_resource("ArtifactStore", "secondary")["kind"] == "ArtifactStore"
         runs = factory.list_resources(kind="Run")
         assert len(runs) == 1
@@ -147,3 +154,11 @@ def test_source_distribution_contains_the_manual(tmp_path):
         }
     expected = {path.as_posix() for path in MANUAL.glob("*.md")}
     assert expected <= members
+    assert {
+        "workloads/example-from-scratch.yaml",
+        "modules/examples/affine-regression/module.yaml",
+        "model-packages/example-affine.yaml",
+        "evaluations/example-affine.yaml",
+        "mixes/example-affine.yaml",
+        "data/fixtures/affine.jsonl",
+    } <= members

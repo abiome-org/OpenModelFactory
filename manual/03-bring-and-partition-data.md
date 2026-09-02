@@ -64,12 +64,13 @@ not imply deletion.
 
 ## Mixture boundary
 
-`MixSpec` defines immutable source revisions, weights or schedules, sampling,
-curriculum, replay, and amendment history in the specification and schema. The
-current example workload does not consume a `MixSpec` through an end-to-end CLI
-path. Until a sampler integration exists, implement mixture behavior in a
-versioned module and record its exact source snapshots, weights, seed, and state
-as outputs and lineage; do not claim normative mixture replay.
+`MixSpec` defines source revisions, weights or schedules, sampling, curriculum,
+replay, and amendment intent. The current from-scratch path admits and pins a
+`MixSpec` alongside its exact dataset inputs, but the trainer still reads the
+dataset directly. Until a sampler integration emits observed `SamplerState`,
+implement mixture delivery in a versioned module and record its exact source
+snapshots, weights, seed, and state as outputs and lineage; do not claim normative
+mixture replay.
 
 ## Evidence before the next chapter
 

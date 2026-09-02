@@ -11,11 +11,11 @@ for the tested commands.
 
 ## Read the graph before spending compute
 
-The current [example workload](../workloads/example-statistical.yaml) uses the
-executable top-level `stages:` shorthand. Each stage declares a module,
-operation, inputs, semantic configuration, dependencies, and expected outputs.
-The training stage consumes `dataset/example-numbers`; the evaluator consumes
-the training result.
+The current [from-scratch workload](../workloads/example-from-scratch.yaml) uses
+the canonical `graph.stages` form. Each stage declares a module, operation,
+inputs, semantic configuration, dependencies, and expected outputs. It also
+references a `ModelPackage`, `EvaluationSpec`, and `MixSpec`. The training stage
+consumes `dataset/example-affine`; the evaluator consumes the trained state.
 
 The [local binding](../bindings/local.yaml) owns physical execution, resources,
 stores, isolation, and recovery. Do not put provider or scheduler settings in
@@ -26,7 +26,7 @@ Inventory and preflight the exact pair before allocation:
 ```sh
 omf --output json executor list
 omf --output json executor preflight bindings/local.yaml \
-  --workload workloads/example-statistical.yaml
+  --workload workloads/example-from-scratch.yaml
 ```
 
 Preflight must report `ready: true` and all module transport/isolation
@@ -39,7 +39,7 @@ Run the committed graph with an attributable actor, retain the returned
 
 ```sh
 omf --actor research-agent --output json run \
-  workloads/example-statistical.yaml --binding bindings/local.yaml
+  workloads/example-from-scratch.yaml --binding bindings/local.yaml
 omf --output json runs status <run-id>
 omf --output json lineage show run:<run-id>/stage:train
 omf --actor research-agent --output json evaluate run/<run-id>
@@ -48,6 +48,10 @@ omf --actor research-agent --output json evaluate run/<run-id>
 A successful submit is not success. Require terminal `Succeeded`, complete
 declared outputs, readable artifact manifests, non-empty input/module lineage,
 and an evaluation result tied to that exact run.
+
+The example checkpoint binds verified `module-state` and `protocol-state`
+components. Its replay status is `not-claimed` because this workload has no
+observed sampler state; checkpoint publication is not a restore/replay claim.
 
 ## Baseline record
 

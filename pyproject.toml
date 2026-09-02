@@ -63,17 +63,28 @@ packages = ["factory/omf"]
 [tool.hatch.build.targets.sdist]
 include = [
   "/AGENTS.md",
+  "/bindings",
+  "/data/fixtures",
+  "/deployments",
   "/factory",
   "/docs",
+  "/evaluations",
   "/install.sh",
   "/manual",
+  "/mixes",
+  "/model-packages",
+  "/modules/examples",
+  "/omf.yaml",
+  "/policies",
   "/README.md",
   "/requirements.build.in",
   "/requirements.build.lock",
   "/requirements.lock",
   "/requirements.runtime.lock",
   "/SPEC.md",
+  "/starter-packs",
   "/templates",
+  "/workloads",
   "/LICENSE",
 ]
 
@@ -84,8 +95,8 @@ testpaths = ["tests"]
 [tool.coverage.run]
 branch = true
 source = ["omf"]
-# This worker is exercised as a real child process by executor integration tests.
-omit = ["*/executors/local_worker.py"]
+# These workers execute as real child processes beyond in-process coverage tracing.
+omit = ["*/executors/local_worker.py", "*/run_worker.py"]
 
 [tool.coverage.report]
 fail_under = 85

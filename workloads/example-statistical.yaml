@@ -1,27 +1,37 @@
-stages:
-  - name: train
-    module: modules/examples/statistical/module.yaml
-    operation: run
-    inputs:
-      dataset: dataset/example-numbers
-    config:
-      action: train
-    outputs:
-      - mean
-      - count
-      - model
-  - name: evaluate
-    needs:
-      - train
-    module: modules/examples/statistical/module.yaml
-    operation: run
-    inputs:
-      mean: train.mean
-    config:
-      action: evaluate
-      expected: 3.0
-      tolerance: 0.0
-    outputs:
-      - passed
-      - absoluteError
-      - evaluation
+apiVersion: omf.dev/v1alpha1
+kind: WorkloadSpec
+metadata:
+  name: example-statistical
+  namespace: local/open-model-factory
+spec:
+  parameters: {}
+  reproducibility: lineage
+  graph:
+    stages:
+      - name: train
+        module: modules/examples/statistical/module.yaml
+        operation: run
+        inputs:
+          dataset: dataset/example-numbers
+        config:
+          action: train
+        outputs:
+          - mean
+          - count
+          - model
+      - name: evaluate
+        needs:
+          - train
+        module: modules/examples/statistical/module.yaml
+        operation: run
+        inputs:
+          mean: train.mean
+        config:
+          action: evaluate
+          expected: 3.0
+          tolerance: 0.0
+        outputs:
+          - passed
+          - conformancePassed
+          - absoluteError
+          - evaluation

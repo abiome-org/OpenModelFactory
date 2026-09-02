@@ -386,6 +386,21 @@ _ACTIONS: tuple[ActionDefinition, ...] = (
         ("EvaluationResult committed.", "Evaluation event and lineage emitted."),
     ),
     ActionDefinition(
+        "experiment.create",
+        "Compare one numeric metric under identical immutable evaluation revisions.",
+        "omf experiment create <name> --baseline <ref> --candidate <ref> --metric <name>",
+        "POST",
+        "/v1/experiments",
+        "write",
+        True,
+        False,
+        "content-idempotent",
+        "low",
+        "metadata",
+        ("evaluation.baseline-exists", "evaluation.candidate-exists", "protocol.same"),
+        ("Immutable Experiment decision committed.",),
+    ),
+    ActionDefinition(
         "release.create",
         "Build and optionally promote a signed complete release through fail-closed gates.",
         "omf release create <run-id> --name <name> --intended-use <use>",
@@ -698,6 +713,26 @@ _ACTIONS += (
         "metadata",
         ("operation.exists", "caller.authorized-for-operation-payloads"),
         ("No state change; response may include request or result data.",),
+    ),
+    ActionDefinition(
+        "operation.reconcile",
+        "Execute a pending run or safely reconcile a stale running operation.",
+        "omf operation reconcile <operation-id>",
+        "POST",
+        "/v1/operations/{operation_id}/reconcile",
+        "write",
+        True,
+        False,
+        "operation-keyed-no-replay",
+        "high",
+        "compute",
+        ("operation.exists", "operation.kind=run", "operation.actor=caller"),
+        (
+            (
+                "Pending work executes once under an exclusive lease; stale work reconciles from "
+                "an immutable result or fails indeterminate without replay."
+            ),
+        ),
     ),
     ActionDefinition(
         "federation.identity",

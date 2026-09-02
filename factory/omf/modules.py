@@ -11,20 +11,29 @@ import tarfile
 from pathlib import Path, PurePosixPath
 from typing import Any
 
+from jsonschema import Draft202012Validator
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-from omf.canonical import load_document
+from omf.canonical import load_document, portable_relative_path
 from omf.errors import ValidationError
+from omf.executors.base import DependencyLock
+from omf.schema_registry import default_registry
 
 
 class ModuleManifest(BaseModel):
+    """Validated runtime projection of the canonical Module resource."""
+
     model_config = ConfigDict(extra="forbid")
+    name: str
+    namespace: str
+    contract_version: str
     kind: str
     code_root: str = "."
     argv: list[str]
     schemas: dict[str, Any] = Field(default_factory=dict)
-    environment_digest: str | None = None
-    dependency_digest: str | None = None
+    dependency_lock: str
+    dependency_digest: str
+    dependency_contents: bytes = Field(repr=False)
     capabilities: set[str] = Field(default_factory=set)
     platforms: set[str] = Field(default_factory=set)
     resources: dict[str, Any] = Field(default_factory=dict)
@@ -34,6 +43,7 @@ class ModuleManifest(BaseModel):
     concurrency: int = 1
     secrets: list[str] = Field(default_factory=list)
     network: list[str] = Field(default_factory=list)
+    provenance: dict[str, str]
     fixtures: list[dict[str, Any]] = Field(default_factory=list)
 
     @field_validator("argv")
@@ -51,7 +61,38 @@ def load_manifest(path: str | Path, project_root: str | Path) -> tuple[ModuleMan
     except ValueError as exc:
         raise ValidationError("manifest is outside project root") from exc
     raw = load_document(manifest_path.read_bytes())
-    manifest = ModuleManifest.model_validate(raw)
+    resource = default_registry.validate_as(raw, "Module")
+    spec = resource["spec"]
+    entry_point = spec["entryPoint"]
+    environment = spec["environment"]
+    lifecycle = spec["lifecycle"]
+    access = spec["access"]
+    manifest = ModuleManifest.model_validate(
+        {
+            "name": resource["metadata"]["name"],
+            "namespace": resource["metadata"]["namespace"],
+            "contract_version": spec["contractVersion"],
+            "kind": spec["moduleKind"],
+            "code_root": entry_point.get("codeRoot", "."),
+            "argv": entry_point["command"],
+            "schemas": spec["contracts"],
+            "dependency_lock": environment.get("dependencyLock"),
+            "dependency_digest": environment.get("dependencyDigest"),
+            "dependency_contents": b"",
+            "capabilities": spec.get("capabilities", []),
+            "platforms": spec.get("platforms", []),
+            "resources": spec.get("resources", {}),
+            "determinism": spec.get("determinism", "declared"),
+            "checkpoint": lifecycle["checkpoint"],
+            "side_effects": lifecycle["sideEffects"],
+            "concurrency": lifecycle["concurrency"],
+            "secrets": access["secrets"],
+            "network": access["network"],
+            "provenance": spec["provenance"],
+            "fixtures": spec.get("fixtures", []),
+        }
+    )
+    portable_relative_path(manifest.code_root, "module code root")
     lexical = manifest_path.parent / manifest.code_root
     if lexical.is_symlink():
         raise ValidationError("module code root may not be a symlink")
@@ -62,15 +103,63 @@ def load_manifest(path: str | Path, project_root: str | Path) -> tuple[ModuleMan
         raise ValidationError("module code root escapes project root") from exc
     if not code.is_dir():
         raise ValidationError("module code root must be a directory")
+    portable_relative_path(manifest.dependency_lock, "module dependency lock")
+    lock_path = (code / manifest.dependency_lock).resolve()
+    try:
+        lock_path.relative_to(code)
+    except ValueError as exc:
+        raise ValidationError("module dependency lock escapes code root") from exc
+    if not lock_path.is_file() or lock_path.is_symlink():
+        raise ValidationError("module dependency lock must be a regular file")
+    lock_contents = lock_path.read_bytes()
+    actual_digest = "sha256:" + hashlib.sha256(lock_contents).hexdigest()
+    if actual_digest != manifest.dependency_digest:
+        raise ValidationError("module dependency lock digest does not match")
+    manifest = manifest.model_copy(update={"dependency_contents": lock_contents})
+    for name, contract in manifest.schemas.items():
+        validate_contract_schema(contract, f"module {name}")
+    if manifest.resources:
+        raise ValidationError(
+            "module resource requirements are not executable; declare placement in Binding"
+        )
+    if manifest.network:
+        raise ValidationError(
+            "module network destinations require an executor with allowlist enforcement"
+        )
+    if manifest.capabilities or manifest.platforms or manifest.secrets:
+        raise ValidationError(
+            "module capability, platform, and secret requirements need provider negotiation"
+        )
     executable = manifest.argv[0]
+    if executable.startswith("/"):
+        raise ValidationError("module executable must not be an absolute path")
     if "/" in executable:
+        portable_relative_path(executable, "module executable")
         target = (code / executable).resolve()
-        if not target.is_file() or not os.access(target, os.X_OK):
+        if code not in target.parents or not target.is_file() or not os.access(target, os.X_OK):
             raise ValidationError("module executable is missing or not executable")
     return manifest, code
 
 
-_EXCLUDED = {".git", ".omf", "secrets"}
+def dependency_lock(manifest: ModuleManifest) -> DependencyLock:
+    """Return the already-confined and digest-verified lock as opaque provider input."""
+    return DependencyLock(
+        relative_path=manifest.dependency_lock,
+        digest=manifest.dependency_digest,
+        contents=manifest.dependency_contents,
+    )
+
+
+_EXCLUDED = {
+    ".git",
+    ".mypy_cache",
+    ".omf",
+    ".pytest_cache",
+    ".ruff_cache",
+    ".venv",
+    "__pycache__",
+    "secrets",
+}
 
 
 def package_module(code_root: str | Path, output: str | Path) -> str:
@@ -163,3 +252,60 @@ def validate_fixtures(manifest: ModuleManifest) -> None:
     for fixture in manifest.fixtures:
         if "request" not in fixture or "result" not in fixture:
             raise ValidationError("fixtures require request and result")
+
+
+def validate_contract(contract: Any, value: Any, name: str) -> None:
+    """Validate a protocol value without including untrusted values in errors."""
+    errors = sorted(
+        Draft202012Validator(contract).iter_errors(value),
+        key=lambda error: tuple(str(item) for item in error.absolute_path),
+    )
+    if errors:
+        raise ValidationError(
+            f"module {name} contract failed",
+            details={
+                "errors": [
+                    {
+                        "path": "$"
+                        + "".join(
+                            f"[{item}]" if isinstance(item, int) else f".{item}"
+                            for item in error.absolute_path
+                        ),
+                        "constraint": str(error.validator),
+                    }
+                    for error in errors
+                ]
+            },
+        )
+
+
+def validate_contract_schema(contract: Any, name: str) -> None:
+    """Validate an embedded, self-contained JSON Schema at admission."""
+    reject_schema_references(contract, name)
+    try:
+        Draft202012Validator.check_schema(contract)
+    except Exception as exc:
+        raise ValidationError(f"{name} contract is not a valid JSON Schema") from exc
+
+
+def reject_schema_references(value: Any, name: str) -> None:
+    """Reject actual JSON Schema reference keywords without inspecting instance literals."""
+    if isinstance(value, dict):
+        if isinstance(value.get("$ref"), str) or isinstance(value.get("$dynamicRef"), str):
+            raise ValidationError(f"module {name} contract references are not supported")
+        for keyword, child in value.items():
+            if keyword in {"const", "default", "enum", "examples"}:
+                continue
+            if keyword in {
+                "$defs",
+                "dependentSchemas",
+                "patternProperties",
+                "properties",
+            } and isinstance(child, dict):
+                for schema in child.values():
+                    reject_schema_references(schema, name)
+            else:
+                reject_schema_references(child, name)
+    elif isinstance(value, list):
+        for child in value:
+            reject_schema_references(child, name)

@@ -157,6 +157,7 @@ class ExecutorRegistry:
             "timeout",
             "deny_network",
             "requires_result",
+            "environment",
         }
         conflicts = sorted(reserved & options.keys())
         if conflicts:
@@ -216,15 +217,26 @@ class ExecutorRegistry:
         }
 
 
-def _local_provider(_context: ExecutorContext) -> Executor:
-    return LocalExecutor()
+def _local_provider(context: ExecutorContext) -> Executor:
+    spec = context.declaration.get("spec", {})
+    if not isinstance(spec, dict):
+        raise ValidationError("local binding spec must be an object")
+    binding_spec = spec if context.declaration.get("kind") == "Binding" else {}
+    resources = binding_spec.get("resources", {})
+    if not isinstance(resources, dict):
+        raise ValidationError("local binding resources must be an object")
+    return LocalExecutor(binding_resources=resources, binding_spec=binding_spec)
 
 
 def _kubernetes_provider(context: ExecutorContext) -> Executor:
     value = context.config.get("context")
     if value is not None and not isinstance(value, str):
         raise ValidationError("kubernetes executor context must be a string")
-    return KubernetesExecutor(context=value)
+    spec = context.declaration.get("spec", {})
+    if not isinstance(spec, dict):
+        raise ValidationError("Kubernetes binding spec must be an object")
+    binding_spec = spec if context.declaration.get("kind") == "Binding" else {}
+    return KubernetesExecutor(context=value, binding_spec=binding_spec)
 
 
 def _slurm_provider(context: ExecutorContext) -> Executor:
@@ -234,14 +246,16 @@ def _slurm_provider(context: ExecutorContext) -> Executor:
     spec = context.declaration.get("spec", {})
     if not isinstance(spec, Mapping):
         raise ValidationError("slurm binding spec must be an object")
-    resources = spec.get("resources", {})
-    placement = spec.get("placement", {})
+    binding_spec = spec if context.declaration.get("kind") == "Binding" else {}
+    resources = binding_spec.get("resources", {})
+    placement = binding_spec.get("placement", {})
     if not isinstance(resources, dict) or not isinstance(placement, dict):
         raise ValidationError("slurm binding resources and placement must be objects")
     return SlurmExecutor(
         shared_filesystem=shared,
         binding_resources=resources,
         placement=placement,
+        binding_spec=dict(binding_spec),
     )
 
 
@@ -266,9 +280,14 @@ def default_executor_registry(*, discover: bool = True) -> ExecutorRegistry:
             {
                 "type": "object",
                 "properties": {
-                    "context": {"type": "string"},
-                    "image": {"type": "string", "description": "Immutable image digest."},
+                    "context": {"type": "string", "minLength": 1},
+                    "image": {
+                        "type": "string",
+                        "pattern": "@sha256:[0-9a-f]{64}$",
+                        "description": "Immutable image digest.",
+                    },
                 },
+                "additionalProperties": False,
             },
         ),
         source="builtin",

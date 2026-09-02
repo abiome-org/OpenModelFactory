@@ -94,6 +94,16 @@ capabilities:
 | `transport:request-result` | Deliver `request.json`; retrieve `result.json` before success |
 | `transport:artifacts` | Retrieve declared artifacts into the stage run directory |
 
+Execution-environment claims are separate capabilities. The local profile accepts
+only a zero-byte dependency lock and records the selected executable digest. Its
+worker rechecks that pathname immediately before process creation and advertises
+this honestly as `environment:executable-drift-detection`, not byte-sealed
+attestation: trusted host administration could still replace the executable in
+the final check/exec interval. Non-empty dependency locks fail admission until a
+provider with a compatible resolver is installed. Slurm and Kubernetes advertise
+no environment realization in their built-in forms. None of these built-ins claim
+a content-addressed runtime closure or bitwise environment reproducibility.
+
 The controller writes `request.json` and passes local `run_dir`, admitted-source
 `cwd`, argv, limits, timeout, and network policy to `Executor.plan`. A remote
 provider must then:
@@ -117,8 +127,8 @@ adapter must actually provide the isolation boundary.
 
 | Provider | What is implemented | Complete workload status |
 | --- | --- | --- |
-| `local` | POSIX process groups, limits, timeout, durable status/logs, local protocol and artifact transport | Ready when host preflight and requested network isolation pass |
-| `slurm` | `sbatch`/`sacct`/`scancel`, deterministic scripts, request/result environment, shared-filesystem transport | Requires `sharedFilesystem: true`; built-in adapter cannot enforce network denial |
+| `local` | POSIX process groups, limits, timeout, durable status/logs, local protocol/artifact transport, and executable drift detection | Ready only for zero-byte dependency locks when host preflight and requested network isolation pass |
+| `slurm` | `sbatch`/`sacct`/`scancel`, deterministic scripts, request/result environment, shared-filesystem transport | Scheduler-lifecycle-only for modules because the built-in adapter cannot attest environments or enforce network denial |
 | `kubernetes` | Immutable-image Job/JobSet plans and scheduler lifecycle | Not workload-ready: source, request/result, and artifact transport are intentionally absent |
 
 These statements are capability facts, not product preferences. A site can

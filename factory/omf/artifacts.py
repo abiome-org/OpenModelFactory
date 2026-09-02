@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import re
 import stat
 import tempfile
 from collections.abc import Iterable
@@ -178,45 +179,74 @@ class ArtifactBuilder:
         return manifest
 
     def verify(self, manifest: ArtifactManifest) -> bool:
-        def verify_content(chunks: Iterable[ChunkDescriptor], expected: str) -> bool:
+        def verify_content(
+            chunks: Iterable[ChunkDescriptor], expected: str, expected_size: int
+        ) -> bool:
             calculated = hashlib.sha256()
+            offset = 0
             for chunk in chunks:
-                if not self.store.verify_chunk(chunk.digest, chunk.size):
+                if chunk.offset != offset or not self.store.verify_chunk(chunk.digest, chunk.size):
                     return False
+                offset += chunk.size
                 with self.store.read_chunk(chunk.digest) as source:
                     while block := source.read(1024 * 1024):
                         calculated.update(block)
-            return expected == "sha256:" + calculated.hexdigest()
+            return offset == expected_size and expected == "sha256:" + calculated.hexdigest()
 
-        if not verify_content(manifest.chunks, manifest.digest):
+        if not verify_content(manifest.chunks, manifest.digest, manifest.size):
             return False
-        return all(verify_content(entry.chunks, entry.digest) for entry in manifest.entries)
+        return all(
+            verify_content(entry.chunks, entry.digest, entry.size) for entry in manifest.entries
+        )
 
     def restore(self, manifest: ArtifactManifest, target: str | Path) -> None:
         destination = Path(target)
         parent = destination.parent.resolve()
         parent.mkdir(parents=True, exist_ok=True)
         temporary = Path(tempfile.mkdtemp(prefix=f".{destination.name}.", dir=parent))
+
+        def restore_content(
+            chunks: Iterable[ChunkDescriptor],
+            expected_digest: str,
+            expected_size: int,
+            sink: BinaryIO,
+        ) -> None:
+            whole = hashlib.sha256()
+            offset = 0
+            for chunk in chunks:
+                if chunk.offset != offset:
+                    raise IntegrityError("artifact chunk layout check failed")
+                chunk_hash = hashlib.sha256()
+                size = 0
+                with self.store.read_chunk(chunk.digest) as source:
+                    while block := source.read(1024 * 1024):
+                        size += len(block)
+                        chunk_hash.update(block)
+                        whole.update(block)
+                        sink.write(block)
+                actual = "sha256:" + chunk_hash.hexdigest()
+                if size != chunk.size or actual != chunk.digest:
+                    raise IntegrityError("artifact chunk integrity check failed")
+                offset += size
+            if offset != expected_size or "sha256:" + whole.hexdigest() != expected_digest:
+                raise IntegrityError("artifact payload integrity check failed")
+
         try:
             if manifest.entries:
+                with tempfile.TemporaryFile() as index_sink:
+                    restore_content(manifest.chunks, manifest.digest, manifest.size, index_sink)
                 for entry in manifest.entries:
                     output = temporary / entry.path
                     if temporary.resolve() not in output.resolve().parents:
                         raise ValidationError("tree path escapes destination")
                     output.parent.mkdir(parents=True, exist_ok=True)
-                    with output.open("wb") as sink:
-                        for chunk in entry.chunks:
-                            with self.store.read_chunk(chunk.digest) as source:
-                                while block := source.read(1024 * 1024):
-                                    sink.write(block)
+                    with output.open("wb") as output_sink:
+                        restore_content(entry.chunks, entry.digest, entry.size, output_sink)
                     os.chmod(output, entry.mode)
             else:
                 output = temporary / "payload"
-                with output.open("wb") as sink:
-                    for chunk in manifest.chunks:
-                        with self.store.read_chunk(chunk.digest) as source:
-                            while block := source.read(1024 * 1024):
-                                sink.write(block)
+                with output.open("wb") as output_sink:
+                    restore_content(manifest.chunks, manifest.digest, manifest.size, output_sink)
             if destination.exists():
                 raise ValidationError("restore destination already exists")
             os.replace(temporary, destination)
@@ -228,21 +258,41 @@ class ArtifactBuilder:
 
 
 class AtomicCheckpointPublisher:
-    """Publish a checkpoint only after every shard is independently verified."""
+    """Publish a role-mapped checkpoint only after every component is verified."""
 
     def __init__(self, store: ArtifactStore) -> None:
         self.store = store
 
     def publish(
-        self, shards: Iterable[ArtifactManifest], state_references: dict[str, str]
+        self,
+        components: dict[str, ArtifactManifest],
+        context: dict[str, str],
+        replay: dict[str, str],
     ) -> ArtifactManifest:
-        shard_list = tuple(shards)
-        if not all(
-            all(self.store.verify_chunk(c.digest, c.size) for c in s.chunks) for s in shard_list
+        if not components or any(
+            re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", role) is None for role in components
         ):
-            raise IntegrityError("checkpoint shard verification failed")
+            raise ValidationError("checkpoint components require normalized role names")
+        if replay.get("status") not in {"not-claimed", "bound"}:
+            raise ValidationError("checkpoint replay status must be explicit")
+        if replay["status"] == "not-claimed" and not replay.get("reason"):
+            raise ValidationError("checkpoint replay non-claim requires a reason")
+        if replay["status"] == "bound" and not all(
+            replay.get(field) for field in ("samplerStateRef", "mixRef")
+        ):
+            raise ValidationError("bound checkpoint replay requires sampler and mix revisions")
+        verifier = ArtifactBuilder(self.store)
+        if not all(
+            verifier.verify(component)
+            and self.store.read_manifest(component.manifest_digest) == component
+            for component in components.values()
+        ):
+            raise IntegrityError("checkpoint component verification failed")
+        component_refs = {
+            role: component.manifest_digest for role, component in sorted(components.items())
+        }
         payload = canonical_json(
-            {"shards": [s.manifest_digest for s in shard_list], "state": state_references}
+            {"components": component_refs, "context": context, "replay": replay}
         )
         digest = "sha256:" + hashlib.sha256(payload).hexdigest()
         self.store.write_chunk(digest, __import__("io").BytesIO(payload), len(payload))
@@ -253,8 +303,9 @@ class AtomicCheckpointPublisher:
             (ChunkDescriptor(digest, len(payload), 0),),
             logical_kind="checkpoint",
             provenance={
-                "stateReferences": state_references,
-                "shards": [s.manifest_digest for s in shard_list],
+                "components": component_refs,
+                "context": context,
+                "replay": replay,
             },
         )
         self.store.publish_manifest(manifest)

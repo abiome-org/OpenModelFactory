@@ -66,6 +66,35 @@ def test_chunk_corruption_and_idempotence(tmp_path):
         store.write_chunk(digest, io.BytesIO(b"x"), 1)
 
 
+def test_restore_rejects_chunk_tampering(tmp_path):
+    store = FilesystemStore(tmp_path / "store")
+    source = tmp_path / "source"
+    source.write_bytes(b"payload")
+    builder = ArtifactBuilder(store)
+    manifest = builder.import_path(source)
+    digest_hex = manifest.chunks[0].digest.removeprefix("sha256:")
+    (tmp_path / "store/blobs" / digest_hex[:2] / digest_hex).write_bytes(b"tampered")
+
+    with pytest.raises(IntegrityError, match="chunk integrity"):
+        builder.restore(manifest, tmp_path / "restored")
+    assert not (tmp_path / "restored").exists()
+
+
+def test_directory_restore_rejects_tree_index_tampering(tmp_path):
+    store = FilesystemStore(tmp_path / "store")
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "payload").write_bytes(b"payload")
+    builder = ArtifactBuilder(store)
+    manifest = builder.import_path(source)
+    digest_hex = manifest.chunks[0].digest.removeprefix("sha256:")
+    (tmp_path / "store/blobs" / digest_hex[:2] / digest_hex).write_bytes(b"tampered")
+
+    with pytest.raises(IntegrityError, match="chunk integrity"):
+        builder.restore(manifest, tmp_path / "restored")
+    assert not (tmp_path / "restored").exists()
+
+
 def test_quarantine_then_gc(tmp_path):
     store = FilesystemStore(tmp_path / "store")
     digest = "sha256:" + __import__("hashlib").sha256(b"x").hexdigest()
@@ -81,13 +110,32 @@ def test_atomic_checkpoint_publishes_only_verified_shards(tmp_path):
     shard_path.write_bytes(b"weights")
     shard = builder.import_path(shard_path, logical_kind="checkpoint-shard")
     checkpoint = AtomicCheckpointPublisher(store).publish(
-        [shard], {"sampler": "sha256:" + "1" * 64, "optimizer": "sha256:" + "2" * 64}
+        {"model-state": shard},
+        {"workload": "sha256:" + "1" * 64},
+        {"status": "not-claimed", "reason": "sampler-state-not-observed"},
     )
     assert checkpoint.logical_kind == "checkpoint"
     assert builder.verify(checkpoint)
-    assert checkpoint.provenance["shards"] == [shard.manifest_digest]
+    assert checkpoint.provenance["components"] == {"model-state": shard.manifest_digest}
+    assert checkpoint.provenance["replay"]["status"] == "not-claimed"
     digest_hex = shard.chunks[0].digest.removeprefix("sha256:")
     blob = tmp_path / "store/blobs" / digest_hex[:2] / digest_hex
     blob.write_bytes(b"corrupt")
     with pytest.raises(IntegrityError, match="verification failed"):
-        AtomicCheckpointPublisher(store).publish([shard], {})
+        AtomicCheckpointPublisher(store).publish(
+            {"model-state": shard},
+            {},
+            {"status": "not-claimed", "reason": "sampler-state-not-observed"},
+        )
+
+
+def test_atomic_checkpoint_rejects_dangling_or_implicit_component_state(tmp_path):
+    store = FilesystemStore(tmp_path / "store")
+    publisher = AtomicCheckpointPublisher(store)
+    with pytest.raises(ValidationError, match="role names"):
+        publisher.publish({}, {}, {"status": "not-claimed", "reason": "not-observed"})
+    shard_path = tmp_path / "shard"
+    shard_path.write_bytes(b"weights")
+    shard = ArtifactBuilder(store).import_path(shard_path, logical_kind="checkpoint-shard")
+    with pytest.raises(ValidationError, match="status must be explicit"):
+        publisher.publish({"model-state": shard}, {}, {})
