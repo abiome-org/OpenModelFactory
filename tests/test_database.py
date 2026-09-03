@@ -17,7 +17,7 @@ def db(tmp_path):
 def test_migration_idempotence_and_integrity(db):
     db.migrate()
     assert db.integrity_check()
-    assert db.connection.execute("select count(*) from schema_migrations").fetchone()[0] == 4
+    assert db.connection.execute("select count(*) from schema_migrations").fetchone()[0] == 5
     assert all(
         row[0] and row[1]
         for row in db.connection.execute(
@@ -46,7 +46,7 @@ def test_legacy_migration_table_is_upgraded(tmp_path):
     migrated.close()
 
 
-@pytest.mark.parametrize("versions", [(1, 3), (1, 2, 3, 4, 5)])
+@pytest.mark.parametrize("versions", [(1, 3), (1, 2, 3, 4, 5, 6)])
 def test_rejects_migration_gaps_and_future_versions(tmp_path, versions):
     path = tmp_path / "invalid.db"
     connection = sqlite3.connect(path)
@@ -167,6 +167,16 @@ def test_resource_immutable_and_idempotent(db):
         repo.put("u", "r", "K", {"x": 2}, created_at="now")
     with pytest.raises(sqlite3.IntegrityError, match="immutable"):
         db.connection.execute("update resources set kind='Z'")
+
+
+def test_latest_resource_uses_commit_order_not_authored_timestamp(db):
+    repo = ResourceRepository(db)
+    repo.put("u", "future", "K", {"revision": "future"}, created_at="9999-01-01T00:00:00Z")
+    repo.put("u", "later", "K", {"revision": "later"}, created_at="2000-01-01T00:00:00Z")
+
+    assert repo.latest(kind="K") == [{"revision": "later"}]
+    with pytest.raises(sqlite3.IntegrityError, match="immutable"):
+        db.connection.execute("UPDATE resource_order SET position=99")
 
 
 def test_status_compare_and_swap(db):

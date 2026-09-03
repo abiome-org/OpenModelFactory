@@ -188,6 +188,24 @@ Run with network namespace denial or a site sandbox and verify no external
 traffic. Offline installation alone does not prove that the full lifecycle is
 air-gapped; test the complete supported workflow with egress denied.
 
+## Distribution release
+
+`make release-candidate` builds the wheel and source archive twice, rejects
+non-reproducible bytes, and emits checksums, an SPDX SBOM, and SLSA provenance.
+Candidate provenance records the Git revision and a source-patch digest when the
+checkout is dirty; final releases require a clean checkout.
+
+The release test installs both artifacts without an index, runs `pip check`,
+upgrades legacy state, and rehearses identity-preserving backup and restore.
+
+A final release must run from the clean `v<version>` tag. Invoke
+`tools/release.py` without `--candidate`, pass a current scanner report with
+`--vulnerability-report`, and set `OMF_RELEASE_SIGN_COMMAND` to the site's
+approved signer wrapper. The wrapper receives the `SHA256SUMS` path as its final
+argument and must create the adjacent `SHA256SUMS.sig`. The tool rejects
+unwaived open high or critical findings and does not publish artifacts; upload
+the completed directory only through the repository's approved release process.
+
 ## Incident and recovery rules
 
 - Quarantine, do not mutate, suspect artifacts.

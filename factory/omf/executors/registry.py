@@ -19,11 +19,12 @@ from omf.executors.local import LocalExecutor
 from omf.executors.slurm import SlurmExecutor
 
 ENTRY_POINT_GROUP = "omf.executors"
+EXECUTOR_API_VERSION = "omf.executor/v1"
 
 
 @dataclass(frozen=True)
 class ExecutorContext:
-    """Stable project and desired-state context supplied to a trusted provider factory."""
+    """Isolated project and desired-state context supplied to a trusted provider factory."""
 
     project_root: Path
     state_root: Path
@@ -40,6 +41,7 @@ class ExecutorProvider:
     """One named provider implementation and its agent-readable configuration contract."""
 
     name: str
+    api_version: str
     factory: ExecutorFactory = field(repr=False, compare=False)
     description: str = ""
     capabilities: frozenset[str] = frozenset()
@@ -64,6 +66,14 @@ class ExecutorRegistry:
         name = provider.name.strip()
         if not name or name != provider.name:
             raise ConfigurationError("executor provider name must be non-empty and normalized")
+        if provider.api_version != EXECUTOR_API_VERSION:
+            raise ConfigurationError(
+                f"executor provider {name!r} uses unsupported API version",
+                details={
+                    "providerApiVersion": provider.api_version,
+                    "supportedApiVersions": [EXECUTOR_API_VERSION],
+                },
+            )
         if name in self._providers:
             raise ConfigurationError(
                 f"duplicate executor provider: {name}",
@@ -112,6 +122,7 @@ class ExecutorRegistry:
             providers.append(
                 {
                     "name": name,
+                    "apiVersion": provider.api_version,
                     "source": source,
                     "description": provider.description,
                     "capabilities": sorted(provider.capabilities),
@@ -119,7 +130,7 @@ class ExecutorRegistry:
                 }
             )
         return {
-            "apiVersion": "omf.executor/v1alpha1",
+            "apiVersion": EXECUTOR_API_VERSION,
             "entryPointGroup": ENTRY_POINT_GROUP,
             "providers": providers,
         }
@@ -264,6 +275,7 @@ def default_executor_registry(*, discover: bool = True) -> ExecutorRegistry:
     registry.register(
         ExecutorProvider(
             "local",
+            EXECUTOR_API_VERSION,
             _local_provider,
             "Run modules as supervised local POSIX process groups.",
             LocalExecutor().capabilities,
@@ -274,6 +286,7 @@ def default_executor_registry(*, discover: bool = True) -> ExecutorRegistry:
     registry.register(
         ExecutorProvider(
             "kubernetes",
+            EXECUTOR_API_VERSION,
             _kubernetes_provider,
             "Kubernetes Job/JobSet lifecycle adapter; module transport is not built in.",
             KubernetesExecutor().capabilities,
@@ -295,6 +308,7 @@ def default_executor_registry(*, discover: bool = True) -> ExecutorRegistry:
     registry.register(
         ExecutorProvider(
             "slurm",
+            EXECUTOR_API_VERSION,
             _slurm_provider,
             "Slurm lifecycle adapter; module transport requires an explicit shared filesystem.",
             SlurmExecutor(shared_filesystem=True).capabilities,

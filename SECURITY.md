@@ -15,6 +15,9 @@ process resource limits are defense-in-depth, not a VM-grade sandbox. Expose the
 HTTP API only behind site-managed TLS and identity controls. Never commit `.omf`,
 private keys, API tokens, cloud credentials, or data payloads.
 
-Supported releases receive security fixes. Until a stable release exists, only
-the current `main` revision is supported. Security behavior is supported only
-where the test suite and named deployment controls exercise it directly.
+The newest `1.x` minor receives correctness and security fixes. The preceding
+minor receives security fixes for six months after its successor; major version
+1 receives security fixes for twelve months after 2.0 is released. Exact end
+dates and exceptions are recorded in `CHANGELOG.md`. Security behavior is
+supported only where the test suite and named deployment controls exercise it
+directly.

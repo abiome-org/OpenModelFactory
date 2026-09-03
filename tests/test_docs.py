@@ -114,6 +114,6 @@ def test_documentation_avoids_ambiguous_internal_shorthand():
 def test_overview_does_not_duplicate_package_patch_version_or_removed_spec():
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
     assert "0.1.0" not in readme
-    assert "0.1 Alpha" in readme
+    assert "1.0 Stable" in readme
     for path in _documentation_paths():
         assert "SPEC.md" not in path.read_text(encoding="utf-8"), path.relative_to(ROOT)

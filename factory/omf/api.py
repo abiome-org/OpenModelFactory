@@ -13,6 +13,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field
 
+from omf import __version__
 from omf.config import ProjectPaths
 from omf.errors import AuthorizationError, OMFError
 from omf.executors import ExecutorRegistry
@@ -38,6 +39,11 @@ class DataRequest(BaseModel):
     rights: dict[str, Any] = Field(default_factory=dict)
     sample_schema: str = "application/octet-stream"
     cursor_policy: dict[str, Any] = Field(default_factory=dict)
+
+
+class DataRevocationRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    reason: str = Field(min_length=1, max_length=1024)
 
 
 class SyncRequest(BaseModel):
@@ -241,7 +247,7 @@ def create_app(paths: ProjectPaths, *, executors: ExecutorRegistry | None = None
 
     app = FastAPI(
         title="Open Model Factory API",
-        version="0.1.0",
+        version=__version__,
         docs_url="/docs",
         redoc_url="/redoc",
         openapi_url="/openapi.json",
@@ -497,6 +503,14 @@ def create_app(paths: ProjectPaths, *, executors: ExecutorRegistry | None = None
     @app.get("/v1/data/{name}/verify")
     def verify_data(name: str, service: Factory = Depends(authorized)) -> dict[str, Any]:
         return {"name": name, "valid": service.verify_data(name)}
+
+    @app.post("/v1/data/{name}/revoke")
+    def revoke_data(
+        name: str,
+        request: DataRevocationRequest,
+        service: Factory = Depends(authorized),
+    ) -> dict[str, Any]:
+        return service.revoke_data(name, reason=request.reason)
 
     @app.post("/v1/sync")
     def sync(request: SyncRequest, service: Factory = Depends(authorized)) -> dict[str, Any]:

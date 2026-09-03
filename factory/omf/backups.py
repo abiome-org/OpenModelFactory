@@ -351,11 +351,11 @@ def restore_backup(
             directory = temporary / relative
             directory.mkdir(mode=0o700)
         os.replace(temporary, paths.state)
-        directory = os.open(paths.root, os.O_RDONLY)
+        descriptor = os.open(paths.root, os.O_RDONLY)
         try:
-            os.fsync(directory)
+            os.fsync(descriptor)
         finally:
-            os.close(directory)
+            os.close(descriptor)
     except Exception:
         shutil.rmtree(temporary, ignore_errors=True)
         raise

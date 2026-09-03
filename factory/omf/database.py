@@ -81,6 +81,20 @@ CREATE TRIGGER IF NOT EXISTS event_order_no_delete BEFORE DELETE ON event_order
  BEGIN SELECT RAISE(ABORT,'immutable event order'); END;
 """
 
+_SCHEMA_V5 = """
+CREATE TABLE IF NOT EXISTS resource_order(position INTEGER PRIMARY KEY AUTOINCREMENT,
+ uid TEXT NOT NULL, revision TEXT NOT NULL, UNIQUE(uid,revision),
+ FOREIGN KEY(uid,revision) REFERENCES resources(uid,revision));
+INSERT OR IGNORE INTO resource_order(uid,revision)
+ SELECT uid,revision FROM resources ORDER BY rowid;
+CREATE TRIGGER IF NOT EXISTS resources_record_order AFTER INSERT ON resources
+ BEGIN INSERT INTO resource_order(uid,revision) VALUES(NEW.uid,NEW.revision); END;
+CREATE TRIGGER IF NOT EXISTS resource_order_no_update BEFORE UPDATE ON resource_order
+ BEGIN SELECT RAISE(ABORT,'immutable resource order'); END;
+CREATE TRIGGER IF NOT EXISTS resource_order_no_delete BEFORE DELETE ON resource_order
+ BEGIN SELECT RAISE(ABORT,'immutable resource order'); END;
+"""
+
 
 @dataclass(frozen=True)
 class _Migration:
@@ -114,6 +128,12 @@ _MIGRATIONS = (
         "event-order",
         "b83be71c941c1822f395d7aca4478dbd3f2b456b2b58419d49e1a4c69a2cc149",
         _SCHEMA_V4,
+    ),
+    _Migration(
+        5,
+        "resource-order",
+        "b48b2309058ad6ce0a4f34dfdba3a14352092ed61493b7efe23db85607ba1eae",
+        _SCHEMA_V5,
     ),
 )
 
@@ -365,18 +385,18 @@ class ResourceRepository:
         """Return the newest immutable revision of each logical resource."""
         if limit is not None and limit < 1:
             return []
-        where = "WHERE kind=?" if kind is not None else ""
+        where = "WHERE resources.kind=?" if kind is not None else ""
         args: builtins.list[Any] = [kind] if kind is not None else []
         query = f"""
             WITH ranked AS (
-              SELECT data,created_at,uid,revision,
+              SELECT resources.data,resource_order.position AS commit_position,resources.uid,
                 ROW_NUMBER() OVER (
-                  PARTITION BY uid ORDER BY created_at DESC,revision DESC
-                ) AS position
-              FROM resources {where}
+                  PARTITION BY resources.uid ORDER BY resource_order.position DESC
+                ) AS revision_rank
+              FROM resources JOIN resource_order USING(uid,revision) {where}
             )
-            SELECT data FROM ranked WHERE position=1
-            ORDER BY created_at DESC,uid DESC
+            SELECT data FROM ranked WHERE revision_rank=1
+            ORDER BY commit_position DESC,uid DESC
         """
         if limit is not None:
             query += " LIMIT ?"

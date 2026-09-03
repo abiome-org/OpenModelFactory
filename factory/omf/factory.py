@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import fcntl
+import hashlib
 import json
 import math
 import os
@@ -19,6 +20,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from omf import __version__
 from omf.agent import AgentControl
 from omf.artifacts import ArtifactBuilder, ArtifactManifest, AtomicCheckpointPublisher
 from omf.backups import create_backup
@@ -181,6 +183,24 @@ class Factory:
     def close(self) -> None:
         self.db.close()
 
+    @contextlib.contextmanager
+    def _dataset_rights_locks(self, datasets: list[dict[str, Any]]) -> Iterator[None]:
+        """Serialize rights changes with final use of the affected dataset identities."""
+        lock_root = self.paths.state / "operations" / "data-rights"
+        lock_root.mkdir(parents=True, exist_ok=True)
+        handles: list[Any] = []
+        try:
+            for uid in sorted({str(item["metadata"]["uid"]) for item in datasets}):
+                name = hashlib.sha256(uid.encode()).hexdigest() + ".lock"
+                handle = (lock_root / name).open("a+")
+                fcntl.flock(handle, fcntl.LOCK_EX)
+                handles.append(handle)
+            yield
+        finally:
+            for handle in reversed(handles):
+                fcntl.flock(handle, fcntl.LOCK_UN)
+                handle.close()
+
     def __enter__(self) -> Factory:
         return self
 
@@ -290,6 +310,25 @@ class Factory:
             )
 
     def apply_resource(self, value: dict[str, Any], *, _system: bool = False) -> dict[str, Any]:
+        metadata = value.get("metadata", {})
+        existing = [
+            resource
+            for resource in self.resources.latest(kind="DatasetSnapshot")
+            if value.get("kind") == "DatasetSnapshot"
+            and isinstance(metadata, dict)
+            and resource["metadata"]["name"] == metadata.get("name")
+            and resource["metadata"]["namespace"] == metadata.get("namespace")
+        ]
+        if len(existing) > 1:
+            raise IntegrityError("dataset name is bound to multiple identities")
+        if existing:
+            with self._dataset_rights_locks(existing):
+                return self._apply_resource_unlocked(value, _system=_system)
+        return self._apply_resource_unlocked(value, _system=_system)
+
+    def _apply_resource_unlocked(
+        self, value: dict[str, Any], *, _system: bool = False
+    ) -> dict[str, Any]:
         generated_kinds = {
             "Checkpoint",
             "EvaluationResult",
@@ -308,15 +347,13 @@ class Factory:
         metadata = metadata_value if isinstance(metadata_value, dict) else {}
         existing = [
             resource
-            for resource in self.resources.list(kind=str(candidate.get("kind", "")))
+            for resource in self.resources.latest(kind=str(candidate.get("kind", "")))
             if resource["metadata"]["name"] == metadata.get("name")
             and resource["metadata"]["namespace"] == metadata.get("namespace")
         ]
-        latest = (
-            sorted(existing, key=lambda item: item["metadata"]["createdAt"])[-1]
-            if existing
-            else None
-        )
+        if len(existing) > 1:
+            raise IntegrityError("resource name is bound to multiple identities")
+        latest = existing[0] if existing else None
         if latest is not None:
             supplied_uid = metadata.get("uid")
             if supplied_uid is not None and supplied_uid != latest["metadata"]["uid"]:
@@ -362,12 +399,14 @@ class Factory:
     def find_resource(self, kind: str, name: str) -> dict[str, Any]:
         matches = [
             resource
-            for resource in self.resources.list(kind=kind)
+            for resource in self.resources.latest(kind=kind)
             if resource["metadata"]["name"] == name
         ]
         if not matches:
             raise NotFoundError(f"{kind} resource not found: {name}")
-        return sorted(matches, key=lambda item: item["metadata"]["createdAt"])[-1]
+        if len(matches) > 1:
+            raise IntegrityError("resource name is bound to multiple identities")
+        return matches[0]
 
     def add_store(
         self,
@@ -539,6 +578,40 @@ class Factory:
             self._snapshot_from_resource(self.find_resource("DatasetSnapshot", name))
         )
 
+    def revoke_data(self, name: str, *, reason: str) -> dict[str, Any]:
+        if not reason.strip():
+            raise ValidationError("dataset revocation requires a reason")
+        current = self.find_resource("DatasetSnapshot", name)
+        with self._dataset_rights_locks([current]):
+            current = self.find_resource("DatasetSnapshot", name)
+            replacement = {
+                "apiVersion": current["apiVersion"],
+                "kind": current["kind"],
+                "metadata": {
+                    "name": current["metadata"]["name"],
+                    "namespace": current["metadata"]["namespace"],
+                    "uid": current["metadata"]["uid"],
+                },
+                "spec": deepcopy(current["spec"]),
+            }
+            replacement["spec"].setdefault("rights", {}).update(
+                {"trainingAllowed": False, "revoked": True, "revocationReason": reason.strip()}
+            )
+            revoked = self._apply_resource_unlocked(replacement)
+            metadata = revoked["metadata"]
+            self.events.append(
+                type="DataRightsRevoked",
+                source=f"omf://{self.namespace}",
+                subject=f"DatasetSnapshot/{name}",
+                resource_uid=metadata["uid"],
+                revision=metadata["revision"],
+                actor=self.actor,
+                data={"reason": reason.strip()},
+                dataschema="https://schemas.omf.dev/events/data-rights-revoked/v1",
+                dedupe_revision=True,
+            )
+        return revoked
+
     def sync(
         self,
         asset: str,
@@ -704,6 +777,7 @@ class Factory:
         executor_config: dict[str, Any],
         environment: dict[str, Any],
         recovering: bool = False,
+        datasets: list[dict[str, Any]] | None = None,
     ) -> ProtocolResult:
         validate_contract(manifest.schemas["input"], request.inputs, "input")
         validate_contract(manifest.schemas["config"], request.config, "config")
@@ -735,17 +809,39 @@ class Factory:
         )
         execution_record = run_dir / "controller-execution.json"
         execution_id: str | None = None
-        if recovering and execution_record.exists():
-            record = json.loads(execution_record.read_text())
-            if record.get("planDigest") != plan_digest:
-                raise IntegrityError("recovered executor plan differs from the admitted plan")
-            if record.get("state") == "submitted" and isinstance(record.get("executionId"), str):
-                execution_id = str(record["executionId"])
-                executor.attach(execution_id, run_dir)
-            elif record.get("state") == "launching":
-                execution_id = executor.recover(run_dir)
-                if execution_id is None:
-                    raise IntegrityError("executor launch outcome is indeterminate")
+        with self._dataset_rights_locks(datasets or []):
+            for dataset in datasets or []:
+                self._require_training_rights(dataset)
+            if recovering and execution_record.exists():
+                record = json.loads(execution_record.read_text())
+                if record.get("planDigest") != plan_digest:
+                    raise IntegrityError("recovered executor plan differs from the admitted plan")
+                if record.get("state") == "submitted" and isinstance(
+                    record.get("executionId"), str
+                ):
+                    execution_id = str(record["executionId"])
+                    executor.attach(execution_id, run_dir)
+                elif record.get("state") == "launching":
+                    execution_id = executor.recover(run_dir)
+                    if execution_id is None:
+                        raise IntegrityError("executor launch outcome is indeterminate")
+                    _write_execution_record(
+                        execution_record,
+                        {
+                            "version": 1,
+                            "state": "submitted",
+                            "planDigest": plan_digest,
+                            "executionId": execution_id,
+                        },
+                    )
+                else:
+                    raise IntegrityError("recovered executor record is invalid")
+            if execution_id is None:
+                _write_execution_record(
+                    execution_record,
+                    {"version": 1, "state": "launching", "planDigest": plan_digest},
+                )
+                execution_id = executor.submit(plan)
                 _write_execution_record(
                     execution_record,
                     {
@@ -755,23 +851,6 @@ class Factory:
                         "executionId": execution_id,
                     },
                 )
-            else:
-                raise IntegrityError("recovered executor record is invalid")
-        if execution_id is None:
-            _write_execution_record(
-                execution_record,
-                {"version": 1, "state": "launching", "planDigest": plan_digest},
-            )
-            execution_id = executor.submit(plan)
-            _write_execution_record(
-                execution_record,
-                {
-                    "version": 1,
-                    "state": "submitted",
-                    "planDigest": plan_digest,
-                    "executionId": execution_id,
-                },
-            )
         while True:
             status = executor.status(execution_id)
             if status.state not in {"pending", "running"}:
@@ -1309,7 +1388,6 @@ class Factory:
         if recovering:
             run_resource = self._run_resource(run_id)
             self._record_spec_validated(run_resource)
-            self._record_run_admitted(run_resource)
             workload_resource = self._resource_by_uri(
                 "WorkloadSpec", run_resource["spec"]["workloadRef"]
             )
@@ -1340,6 +1418,12 @@ class Factory:
         executor_name = str(binding_raw["spec"]["executor"])
         stages = admitted.stages
         pinned_inputs = self._pin_stage_inputs(stages, expected_resources["datasets"])
+        if recovering:
+            datasets = list(pinned_inputs.values())
+            with self._dataset_rights_locks(datasets):
+                for dataset in datasets:
+                    self._require_training_rights(dataset)
+                self._record_run_admitted(run_resource)
         model_package = self._pin_model_package(
             admitted.model_package_ref,
             stages,
@@ -1520,40 +1604,44 @@ class Factory:
         else:
             state_store.initialize(spec)
             state_store.transition(RunState.DRAFT, RunState.VALIDATED)
-            state_store.transition(RunState.VALIDATED, RunState.ADMITTED)
-            state_store.transition(RunState.ADMITTED, RunState.RUNNING)
-            run_resource = self.apply_resource(
-                {
-                    "apiVersion": "omf.dev/v1alpha1",
-                    "kind": "Run",
-                    "metadata": {
-                        "name": f"run-{run_id}",
-                        "namespace": self.namespace,
-                        "uid": run_id,
-                    },
-                    "spec": {
-                        "runId": run_id,
-                        "operationId": operation_id,
-                        "workloadRef": self._resource_uri(workload_resource),
-                        "bindingRef": self._resource_uri(binding_resource),
-                        "extensions": {
-                            "workloadDigest": spec.digest,
+            datasets = list(pinned_inputs.values())
+            with self._dataset_rights_locks(datasets):
+                for dataset in datasets:
+                    self._require_training_rights(dataset)
+                state_store.transition(RunState.VALIDATED, RunState.ADMITTED)
+                state_store.transition(RunState.ADMITTED, RunState.RUNNING)
+                run_resource = self.apply_resource(
+                    {
+                        "apiVersion": "omf.dev/v1alpha1",
+                        "kind": "Run",
+                        "metadata": {
+                            "name": f"run-{run_id}",
+                            "namespace": self.namespace,
+                            "uid": run_id,
+                        },
+                        "spec": {
+                            "runId": run_id,
                             "operationId": operation_id,
-                            "bindingDigest": spec.binding_digest,
-                            "admittedInputs": spec.input_revisions,
-                            "modelPackageRef": spec.model_package_ref,
-                            "evaluationRefs": spec.evaluation_refs,
-                            "mixRef": spec.mix_ref,
-                            "moduleDigests": spec.module_digests,
-                            "environments": spec.environments,
-                            "inferenceAdapter": inference_evidence,
-                            "reproducibility": spec.reproducibility,
+                            "workloadRef": self._resource_uri(workload_resource),
+                            "bindingRef": self._resource_uri(binding_resource),
+                            "extensions": {
+                                "workloadDigest": spec.digest,
+                                "operationId": operation_id,
+                                "bindingDigest": spec.binding_digest,
+                                "admittedInputs": spec.input_revisions,
+                                "modelPackageRef": spec.model_package_ref,
+                                "evaluationRefs": spec.evaluation_refs,
+                                "mixRef": spec.mix_ref,
+                                "moduleDigests": spec.module_digests,
+                                "environments": spec.environments,
+                                "inferenceAdapter": inference_evidence,
+                                "reproducibility": spec.reproducibility,
+                            },
                         },
                     },
-                },
-                _system=True,
-            )
-            self._record_run_admitted(run_resource)
+                    _system=True,
+                )
+                self._record_run_admitted(run_resource)
         if model_package is not None:
             self.lineage.add(
                 LineageEdge(
@@ -1613,6 +1701,11 @@ class Factory:
                 executor_config=resolved_executor.config,
                 environment=environment,
                 recovering=recovering,
+                datasets=[
+                    pinned_inputs[reference]
+                    for reference in stage.inputs.values()
+                    if reference in pinned_inputs
+                ],
             )
             stage_outputs = dict(result.outputs)
             checkpoint_artifacts = [
@@ -1832,6 +1925,7 @@ class Factory:
                             "DatasetSnapshot", reference.removeprefix("dataset/")
                         )
                     )
+                    self._require_training_rights(resource)
                     if self._snapshot_from_resource(resource).mode != "copy":
                         raise CapabilityError(
                             "only copied dataset snapshots can be executed reproducibly"
@@ -1845,6 +1939,29 @@ class Factory:
                         )
                     pinned[reference] = resource
         return pinned
+
+    @staticmethod
+    def _training_rights_valid(resource: dict[str, Any]) -> bool:
+        rights = resource["spec"].get("rights")
+        return bool(
+            isinstance(rights, dict)
+            and rights.get("trainingAllowed") is True
+            and rights.get("revoked", False) is False
+        )
+
+    def _current_training_rights_valid(self, resource: dict[str, Any]) -> bool:
+        return any(
+            item["metadata"]["uid"] == resource["metadata"]["uid"]
+            and self._training_rights_valid(item)
+            for item in self.resources.latest(kind="DatasetSnapshot")
+        )
+
+    def _require_training_rights(self, resource: dict[str, Any]) -> None:
+        name = str(resource["metadata"]["name"])
+        if not self._training_rights_valid(resource):
+            raise ValidationError(f"dataset {name!r} pinned rights do not allow training")
+        if not self._current_training_rights_valid(resource):
+            raise ValidationError(f"dataset {name!r} current rights do not allow training")
 
     def _pin_model_package(
         self,
@@ -2463,8 +2580,17 @@ class Factory:
         vulnerability_summary, vulnerability_artifact, vulnerabilities_valid = (
             self._load_vulnerability_report(vulnerability_report, required_scan_subjects)
         )
-        datasets = self.resources.list(kind="DatasetSnapshot")
-        rights_valid = all(bool(item["spec"].get("rights")) for item in datasets)
+        admitted_inputs = admission.get("admittedInputs", {})
+        if not isinstance(admitted_inputs, dict):
+            raise IntegrityError("run has invalid admitted dataset references")
+        datasets = [
+            self._resource_by_uri("DatasetSnapshot", str(reference))
+            for reference in admitted_inputs.values()
+        ]
+        rights_valid = all(
+            self._training_rights_valid(item) and self._current_training_rights_valid(item)
+            for item in datasets
+        )
         approval_list = approvals or []
         compatibility_passed = bool(evaluation["spec"]["extensions"].get("compatibilityPassed"))
         evidence = {
@@ -2576,6 +2702,32 @@ class Factory:
                 run_id=run_id,
             )
         )
+        if promote:
+            with self._dataset_rights_locks(datasets):
+                current_rights = all(
+                    self._training_rights_valid(item) and self._current_training_rights_valid(item)
+                    for item in datasets
+                )
+                final_decision = promotion_gate(
+                    {**evidence, "rights_valid": current_rights}, actor=self.actor
+                )
+                if final_decision.outcome == "deny":
+                    denied = [
+                        item["rule"]
+                        for item in final_decision.explanations
+                        if item.get("effect") == "deny"
+                    ]
+                    raise IntegrityError(f"promotion denied by gates: {', '.join(denied)}")
+                promote_alias(
+                    self.db,
+                    self.events,
+                    name=alias,
+                    uid=metadata["uid"],
+                    revision=metadata["revision"],
+                    expected_version=None,
+                    actor=self.actor,
+                    policy_decision=final_decision,
+                )
         self.events.append(
             type="ReleasePublished",
             source=f"omf://{self.namespace}",
@@ -2587,17 +2739,6 @@ class Factory:
             data={"releaseDigest": signed.digest, "promoted": promote},
             dataschema="https://schemas.omf.dev/events/release-published/v1",
         )
-        if promote:
-            promote_alias(
-                self.db,
-                self.events,
-                name=alias,
-                uid=metadata["uid"],
-                revision=metadata["revision"],
-                expected_version=None,
-                actor=self.actor,
-                policy_decision=decision,
-            )
         return resource
 
     def create_experiment(
@@ -2767,7 +2908,7 @@ class Factory:
             "documentNamespace": f"https://omf.dev/spdx/{namespace_digest}",
             "creationInfo": {
                 "created": _utc_now(),
-                "creators": ["Tool: Open Model Factory 0.1.0"],
+                "creators": [f"Tool: Open Model Factory {__version__}"],
             },
             "packages": packages,
         }

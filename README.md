@@ -27,13 +27,13 @@ schema.
 
 ## Status
 
-OMF is **0.1 Alpha**. The checked-in local example runs from data and module
-admission through training, compatibility checks, evaluation, and candidate
-comparison. Tests also cover policy-gated release and deployment paths. Stable
-upgrades, complete remote execution, recovery, stronger isolation, and
-production-scale benchmark coverage remain release work. See the
-[roadmap](ROADMAP.md) for the criteria from Alpha through 1.0 and the
-[executor guide](docs/executors.md) for current provider limits.
+OMF is **1.0 Stable** for the repository-centered local lifecycle on CPython
+3.11 and 3.12 on Linux x86-64, and for executor plugins implementing
+`omf.executor/v1`. The built-in Slurm and Kubernetes providers are preview
+lifecycle adapters, not supported remote workload paths. OMF makes no general
+claim of production scale, cluster recovery, full environment reproduction, or
+air-gap operation. See the [roadmap](ROADMAP.md) for the tested 1.0 boundary and
+the [executor guide](docs/executors.md) for provider limits.
 
 ## Start a project
 
@@ -45,7 +45,7 @@ After cloning this distribution, inspect the non-destructive installation plan:
 . /path/to/model-project/.venv/bin/activate
 ```
 
-The installer requires Python 3.11 or newer. It preserves existing files and
+The installer requires Python 3.11 or 3.12. It preserves existing files and
 creates missing project scaffolding, including `MODEL_CARD.md`, an operator
 `AGENTS.md`, a local binding, and a default policy. Start by completing the
 model card, then inspect the factory:
@@ -106,7 +106,7 @@ maps the runtime modules and lifecycle boundaries in more detail.
 - [Architecture](docs/architecture.md): lifecycle, state, and code ownership.
 - [Executor guide](docs/executors.md): provider capabilities and limitations.
 - [Agent guide](docs/agent-control.md): bounded status, goals, and actions.
-- [Roadmap](ROADMAP.md): Alpha, Beta, release-candidate, and 1.0 criteria.
+- [Roadmap](ROADMAP.md): 1.0 evidence and post-1.0 direction.
 
 ## Development
 

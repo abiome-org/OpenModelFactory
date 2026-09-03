@@ -4,17 +4,18 @@ build-backend = "hatchling.build"
 
 [project]
 name = "open-model-factory"
-version = "0.1.0"
-description = "Open, model-neutral, local-to-federated model lifecycle platform"
+dynamic = ["version"]
+description = "Repository-centered, model-neutral development and release system"
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.11,<3.13"
 license = { file = "LICENSE" }
 authors = [{ name = "Open Model Factory contributors" }]
 classifiers = [
-  "Development Status :: 3 - Alpha",
+  "Development Status :: 5 - Production/Stable",
   "Environment :: Console",
   "Framework :: FastAPI",
   "License :: OSI Approved :: Apache Software License",
+  "Operating System :: POSIX :: Linux",
   "Programming Language :: Python :: 3",
   "Programming Language :: Python :: 3.11",
   "Programming Language :: Python :: 3.12",
@@ -57,12 +58,16 @@ Documentation = "https://github.com/abiome/OpenModelFactory"
 Repository = "https://github.com/abiome/OpenModelFactory"
 Issues = "https://github.com/abiome/OpenModelFactory/issues"
 
+[tool.hatch.version]
+path = "factory/omf/_version.py"
+
 [tool.hatch.build.targets.wheel]
 packages = ["factory/omf"]
 
 [tool.hatch.build.targets.sdist]
 include = [
   "/AGENTS.md",
+  "/CHANGELOG.md",
   "/bindings",
   "/data/fixtures",
   "/deployments",

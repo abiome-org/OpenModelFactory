@@ -110,7 +110,7 @@ override.
 
 ## Development and verification
 
-Use Python 3.11 or newer. Install the locked dependencies and editable package:
+Use Python 3.11 or 3.12. Install the locked dependencies and editable package:
 
 ```sh
 python3 -m pip install --only-binary=:all: --require-hashes -r requirements.lock

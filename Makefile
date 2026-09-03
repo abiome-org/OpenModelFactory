@@ -1,4 +1,4 @@
-.PHONY: install format lint typecheck test test-all build
+.PHONY: install format lint typecheck test test-all build release-candidate
 
 install:
 	python3 -m pip install --only-binary=:all: --require-hashes -r requirements.lock
@@ -23,3 +23,8 @@ test-all: lint typecheck test
 
 build:
 	python3 -m build --no-isolation
+
+release-candidate:
+	python3 tools/release.py --candidate --output dist \
+		--source-revision "$$(git rev-parse HEAD)" \
+		--source-date-epoch "$$(git show -s --format=%ct HEAD)"

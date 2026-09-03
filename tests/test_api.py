@@ -49,6 +49,7 @@ def test_api_health_auth_schemas_resources_and_doctor(tmp_path):
         operation_id = factory.operations.create("test", {"value": 1})["id"]
     with TestClient(create_app(paths)) as client:
         assert client.get("/healthz").status_code == 200
+        assert client.get("/openapi.json").json()["info"]["version"] == "1.0.0"
         assert client.get("/v1/doctor").status_code == 403
         headers = {"Authorization": f"Bearer {token}"}
         assert client.get("/v1/doctor", headers=headers).json()["ready"]
@@ -86,6 +87,26 @@ def test_api_health_auth_schemas_resources_and_doctor(tmp_path):
         listed = client.get("/v1/resources?kind=ArtifactStore", headers=headers).json()
         assert len(listed) == 1
         assert client.get("/v1/resources?limit=1&offset=1", headers=headers).json() == []
+        data_source = paths.root / "data.jsonl"
+        data_source.write_text('{"value":1}\n')
+        added_data = client.post(
+            "/v1/data",
+            headers=headers,
+            json={
+                "source": str(data_source),
+                "name": "api-data",
+                "mode": "copy",
+                "rights": {"license": "CC0-1.0", "trainingAllowed": True},
+            },
+        )
+        assert added_data.status_code == 200
+        revoked_data = client.post(
+            "/v1/data/api-data/revoke",
+            headers=headers,
+            json={"reason": "test withdrawal"},
+        )
+        assert revoked_data.status_code == 200
+        assert revoked_data.json()["spec"]["rights"]["revoked"] is True
         operations = client.get("/v1/operations?state=pending", headers=headers).json()
         assert [item["id"] for item in operations] == [operation_id]
         assert client.get(f"/v1/operations/{operation_id}", headers=headers).json()["version"] == 1

@@ -1,8 +1,10 @@
 import fcntl
 import hashlib
+import importlib.metadata
 import json
 import shutil
 import subprocess
+import threading
 import time
 from copy import deepcopy
 from dataclasses import replace
@@ -13,8 +15,16 @@ import yaml
 from omf.artifacts import ArtifactBuilder
 from omf.config import ProjectPaths, bootstrap
 from omf.database import AliasRepository
-from omf.errors import CapabilityError, ConflictError, IntegrityError, OMFError, ValidationError
+from omf.errors import (
+    CapabilityError,
+    ConflictError,
+    IntegrityError,
+    NotFoundError,
+    OMFError,
+    ValidationError,
+)
 from omf.executors import (
+    EXECUTOR_API_VERSION,
     MODULE_PROTOCOL_CAPABILITIES,
     ExecutionPlan,
     ExecutorContext,
@@ -284,6 +294,7 @@ def test_injected_executor_runs_unchanged_workload(tmp_path):
     registry.register(
         ExecutorProvider(
             "test-remote",
+            EXECUTOR_API_VERSION,
             create,
             capabilities=MODULE_PROTOCOL_CAPABILITIES | frozenset({"isolation:network-deny"}),
         )
@@ -300,6 +311,221 @@ def test_injected_executor_runs_unchanged_workload(tmp_path):
     assert len(created) == 2
     assert not created[0].planned
     assert created[1].planned
+
+
+def test_stable_executor_plugin_acceptance(tmp_path, monkeypatch):
+    plugin_root = Path("tests/fixtures/executor_plugin/src").resolve()
+    monkeypatch.syspath_prepend(str(plugin_root))
+    entry_point = importlib.metadata.EntryPoint(
+        name="stable-test",
+        value="omf_stable_executor:provider",
+        group="omf.executors",
+    )
+    entry_points = importlib.metadata.EntryPoints([entry_point])
+    monkeypatch.setattr("omf.executors.registry.metadata.entry_points", lambda: entry_points)
+    registry = ExecutorRegistry()
+    registry.discover()
+    assert registry.catalog() == {
+        "apiVersion": EXECUTOR_API_VERSION,
+        "entryPointGroup": "omf.executors",
+        "providers": [
+            {
+                "name": "stable-test",
+                "apiVersion": EXECUTOR_API_VERSION,
+                "source": "entry-point:unknown:omf_stable_executor:provider",
+                "description": "Independent acceptance-test executor.",
+                "capabilities": sorted(
+                    MODULE_PROTOCOL_CAPABILITIES
+                    | frozenset({"isolation:network-deny", "recovery:attach"})
+                ),
+                "configContract": {
+                    "type": "object",
+                    "properties": {
+                        "interruptStatusOnce": {"type": "boolean"},
+                        "interruptSubmitOnce": {"type": "boolean"},
+                    },
+                    "additionalProperties": False,
+                },
+            }
+        ],
+    }
+    with pytest.raises(CapabilityError, match="unknown executor provider") as missing:
+        registry.resolve(
+            "local",
+            project_root=tmp_path,
+            state_root=tmp_path / ".omf",
+            actor="tester",
+            declaration={},
+        )
+    assert missing.value.details["available"] == ["stable-test"]
+
+    paths = _project(tmp_path)
+    stable_binding = yaml.safe_load((paths.root / "bindings/local.yaml").read_text())
+    stable_binding["metadata"]["name"] = "stable-test"
+    stable_binding["spec"]["executor"] = "stable-test"
+    stable_binding["spec"]["config"]["executor"] = {"interruptStatusOnce": True}
+    stable_binding_path = paths.root / "bindings/stable-test.yaml"
+    stable_binding_path.write_text(yaml.safe_dump(stable_binding))
+    bootstrap(paths)
+
+    with Factory(paths) as local:
+        local.add_data(
+            paths.root / "data/numbers.jsonl",
+            name="example-numbers",
+            mode="copy",
+            rights={"license": "CC0-1.0", "trainingAllowed": True},
+        )
+        local_run = local.run(
+            paths.root / "workloads/example-statistical.yaml",
+            paths.root / "bindings/local.yaml",
+        )
+    with Factory(paths, executors=registry) as external:
+        assert external.executor_preflight(
+            stable_binding_path,
+            workload_path=paths.root / "workloads/example-statistical.yaml",
+        )["ready"]
+        operation = external.create_run_operation(
+            paths.root / "workloads/example-statistical.yaml", stable_binding_path
+        )
+        with pytest.raises(KeyboardInterrupt, match="after durable submit"):
+            external.execute_run_operation(operation["id"])
+    interrupted_record = next(paths.runs.rglob("stable-execution.json"))
+    interrupted_id = str(json.loads(interrupted_record.read_text())["id"])
+    assert (
+        interrupted_record.parent / "stable-submit-attempts.jsonl"
+    ).read_text().splitlines() == [interrupted_id]
+
+    restarted_registry = ExecutorRegistry()
+    restarted_registry.discover()
+    with Factory(paths, executors=restarted_registry) as restarted:
+        completed = restarted.execute_run_operation(operation["id"])
+    plugin_run = completed["result"]
+    assert json.loads(interrupted_record.read_text())["id"] == interrupted_id
+    assert (
+        interrupted_record.parent / "stable-submit-attempts.jsonl"
+    ).read_text().splitlines() == [interrupted_id]
+
+    assert plugin_run["state"] == "Succeeded"
+    assert plugin_run["outputs"]["train.mean"] == local_run["outputs"]["train.mean"] == 3.0
+    assert plugin_run["outputs"]["evaluate.passed"]
+    assert plugin_run["outputs"]["train.model"].startswith("sha256:")
+    execution_records = sorted(paths.runs.rglob("stable-execution.json"))
+    assert len(execution_records) == 2
+    for record_path in execution_records:
+        run_dir = record_path.parent
+        plan = json.loads((run_dir / "stable-plan.json").read_text())
+        assert plan["environmentDigest"].startswith("sha256:")
+        assert Path(plan["cwd"]).is_relative_to(paths.runs)
+        assert (run_dir / "request.json").is_file()
+        assert (run_dir / "result.json").is_file()
+        assert (run_dir / "stable-submit-attempts.jsonl").read_text().splitlines() == [
+            str(json.loads(record_path.read_text())["id"])
+        ]
+
+    recover_binding = deepcopy(stable_binding)
+    recover_binding["metadata"]["name"] = "stable-test-recover"
+    recover_binding["spec"]["config"]["executor"] = {"interruptSubmitOnce": True}
+    recover_binding_path = paths.root / "bindings/stable-test-recover.yaml"
+    recover_binding_path.write_text(yaml.safe_dump(recover_binding))
+    with Factory(paths, executors=restarted_registry) as external:
+        recover_operation = external.create_run_operation(
+            paths.root / "workloads/example-statistical.yaml", recover_binding_path
+        )
+        with pytest.raises(KeyboardInterrupt, match="during provider submit"):
+            external.execute_run_operation(recover_operation["id"])
+    recover_records = set(paths.runs.rglob("stable-execution.json")) - set(execution_records)
+    assert len(recover_records) == 1
+    recover_record = recover_records.pop()
+    recover_id = str(json.loads(recover_record.read_text())["id"])
+    assert (recover_record.parent / "stable-submit-attempts.jsonl").read_text().splitlines() == [
+        recover_id
+    ]
+
+    recovered_registry = ExecutorRegistry()
+    recovered_registry.discover()
+    with Factory(paths, executors=recovered_registry) as recovered:
+        recovered_run = recovered.execute_run_operation(recover_operation["id"])["result"]
+    assert recovered_run["outputs"]["train.mean"] == plugin_run["outputs"]["train.mean"]
+    assert len(list(paths.runs.rglob("stable-execution.json"))) == 4
+    assert json.loads(recover_record.read_text())["id"] == recover_id
+    assert (recover_record.parent / "stable-submit-attempts.jsonl").read_text().splitlines() == [
+        recover_id
+    ]
+
+    resolved = registry.resolve(
+        "stable-test",
+        project_root=paths.root,
+        state_root=paths.state,
+        actor="tester",
+        declaration=stable_binding,
+    )
+    assert resolved.executor.recover(tmp_path / "never-submitted") is None
+    completed_dir = execution_records[0].parent
+    completed_id = str(json.loads(execution_records[0].read_text())["id"])
+    assert resolved.executor.recover(completed_dir) == completed_id
+
+    log_dir = paths.runs / "plugin-logs"
+    logging_executor = resolved.executor
+    log_id = logging_executor.submit(
+        logging_executor.plan(
+            argv=[
+                "python3",
+                "-c",
+                "import sys; print('A' * 64); print('B' * 64, file=sys.stderr)",
+            ],
+            run_dir=log_dir,
+            cwd=paths.root,
+            requires_result=False,
+        )
+    )
+    while logging_executor.status(log_id).state in {"pending", "running"}:
+        time.sleep(0.01)
+    log_reader = registry.resolve(
+        "stable-test",
+        project_root=paths.root,
+        state_root=paths.state,
+        actor="tester",
+        declaration=stable_binding,
+    ).executor
+    log_reader.attach(log_id, log_dir)
+    stdout, stderr = log_reader.read_logs(log_id, tail_bytes=16)
+    assert stdout == "A" * 15 + "\n"
+    assert stderr == "B" * 15 + "\n"
+
+    indeterminate = paths.runs / "plugin-indeterminate"
+    indeterminate.mkdir()
+    (indeterminate / "stable-execution.json").write_text(
+        json.dumps({"id": "unknown", "state": "launching"})
+    )
+    with pytest.raises(RuntimeError, match="indeterminate"):
+        resolved.executor.recover(indeterminate)
+
+    cancel_dir = paths.runs / "plugin-cancel"
+    original = resolved.executor
+    execution_id = original.submit(
+        original.plan(
+            argv=["python3", "-c", "import time; time.sleep(30)"],
+            run_dir=cancel_dir,
+            cwd=paths.root,
+            requires_result=False,
+        )
+    )
+    attached = registry.resolve(
+        "stable-test",
+        project_root=paths.root,
+        state_root=paths.state,
+        actor="tester",
+        declaration=stable_binding,
+    ).executor
+    attached.attach(execution_id, cancel_dir)
+    assert attached.status(execution_id).state == "running"
+    attached.cancel(execution_id)
+    assert attached.status(execution_id).state == "canceled"
+    assert attached.recover(cancel_dir) == execution_id
+    deadline = time.monotonic() + 5
+    while original.status(execution_id).state == "running" and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert original.status(execution_id).state == "canceled"
 
 
 def test_opaque_dependency_lock_reaches_provider_without_core_interpretation(tmp_path):
@@ -331,6 +557,7 @@ def test_opaque_dependency_lock_reaches_provider_without_core_interpretation(tmp
     registry.register(
         ExecutorProvider(
             "opaque-lock",
+            EXECUTOR_API_VERSION,
             lambda _context: OpaqueLockExecutor(),
             capabilities=MODULE_PROTOCOL_CAPABILITIES | frozenset({"isolation:network-deny"}),
         )
@@ -534,7 +761,297 @@ def test_workload_preflight_checks_environment_and_binding_semantics(tmp_path):
     assert any("placement" in issue for issue in report["issues"])
 
 
-def test_model_neutral_from_scratch_golden_path(tmp_path):
+@pytest.mark.parametrize(
+    "rights",
+    [
+        {},
+        {"trainingAllowed": False},
+        {"trainingAllowed": "true"},
+        {"trainingAllowed": True, "revoked": True},
+        {"trainingAllowed": True, "revoked": "false"},
+    ],
+)
+def test_run_admission_rejects_data_without_current_training_rights(tmp_path, rights):
+    paths = _project(tmp_path)
+    bootstrap(paths)
+    with Factory(paths) as factory:
+        factory.add_data(
+            paths.root / "data/numbers.jsonl",
+            name="example-numbers",
+            mode="copy",
+            rights=rights,
+        )
+        with pytest.raises(ValidationError, match="rights do not allow training"):
+            factory.create_run_operation(
+                paths.root / "workloads/example-statistical.yaml",
+                paths.root / "bindings/local.yaml",
+            )
+        assert factory.operations.list() == []
+        assert factory.list_resources(kind="Run") == []
+
+
+def test_revocation_is_current_despite_future_authored_timestamp(tmp_path):
+    paths = _project(tmp_path)
+    bootstrap(paths)
+    with Factory(paths) as factory:
+        initial = factory.add_data(
+            paths.root / "data/numbers.jsonl",
+            name="example-numbers",
+            mode="copy",
+            rights={"license": "CC0-1.0", "trainingAllowed": True},
+        )
+        future = {
+            "apiVersion": initial["apiVersion"],
+            "kind": initial["kind"],
+            "metadata": {
+                "name": initial["metadata"]["name"],
+                "namespace": initial["metadata"]["namespace"],
+                "uid": initial["metadata"]["uid"],
+                "createdAt": "9999-01-01T00:00:00Z",
+            },
+            "spec": deepcopy(initial["spec"]),
+        }
+        future["spec"]["rights"]["rightsRevision"] = "future-authored"
+        authorized = factory.apply_resource(future)
+        queued = factory.create_run_operation(
+            paths.root / "workloads/example-statistical.yaml",
+            paths.root / "bindings/local.yaml",
+        )
+        revoked = factory.revoke_data("example-numbers", reason="consent withdrawn")
+
+        assert factory.find_resource("DatasetSnapshot", "example-numbers") == revoked
+        assert revoked["metadata"]["revision"] != authorized["metadata"]["revision"]
+        with pytest.raises(ValidationError, match="current rights"):
+            factory.execute_run_operation(queued["id"])
+
+
+def test_revocation_before_final_admission_prevents_run_admission(tmp_path, monkeypatch):
+    paths = _project(tmp_path)
+    bootstrap(paths)
+    with Factory(paths) as factory:
+        factory.add_data(
+            paths.root / "data/numbers.jsonl",
+            name="example-numbers",
+            mode="copy",
+            rights={"license": "CC0-1.0", "trainingAllowed": True},
+        )
+        operation = factory.create_run_operation(
+            paths.root / "workloads/example-statistical.yaml",
+            paths.root / "bindings/local.yaml",
+        )
+        inputs_pinned = threading.Event()
+        continue_admission = threading.Event()
+        original_pin = factory._pin_stage_inputs
+
+        def pause_after_pin(stages, expected_revisions=None):
+            pinned = original_pin(stages, expected_revisions)
+            if expected_revisions is not None:
+                inputs_pinned.set()
+                if not continue_admission.wait(timeout=5):
+                    raise RuntimeError("admission test barrier timed out")
+            return pinned
+
+        monkeypatch.setattr(factory, "_pin_stage_inputs", pause_after_pin)
+        errors = []
+
+        def execute() -> None:
+            try:
+                factory.execute_run_operation(operation["id"])
+            except Exception as error:
+                errors.append(error)
+
+        execution = threading.Thread(target=execute)
+        execution.start()
+        assert inputs_pinned.wait(timeout=5)
+        with Factory(paths, actor="rights-operator") as rights_operator:
+            rights_operator.revoke_data("example-numbers", reason="consent withdrawn")
+        continue_admission.set()
+        execution.join(timeout=5)
+
+        assert not execution.is_alive()
+        assert len(errors) == 1
+        assert isinstance(errors[0], ValidationError)
+        assert "current rights" in str(errors[0])
+        assert factory.events.query(run_id=operation["id"], type="RunAdmitted") == []
+        assert factory.list_resources(kind="Run") == []
+
+
+def test_revocation_stops_queued_and_recovering_training_without_replay(tmp_path):
+    paths = _project(tmp_path)
+    binding_path = paths.root / "bindings/local.yaml"
+    binding = yaml.safe_load(binding_path.read_text())
+    binding["spec"]["executor"] = "rights-test"
+    binding_path.write_text(yaml.safe_dump(binding))
+    bootstrap(paths)
+    observed = {"interrupted": False, "submissions": 0, "attachments": 0}
+    recovery_planned = threading.Event()
+    continue_recovery = threading.Event()
+
+    class RightsTestExecutor(LocalExecutor):
+        def plan(self, **kwargs):
+            plan = super().plan(**kwargs)
+            if observed["interrupted"] and not recovery_planned.is_set():
+                recovery_planned.set()
+                if not continue_recovery.wait(timeout=5):
+                    raise RuntimeError("recovery test barrier timed out")
+            return plan
+
+        def submit(self, plan):
+            observed["submissions"] += 1
+            return super().submit(plan)
+
+        def status(self, execution_id):
+            if not observed["interrupted"]:
+                observed["interrupted"] = True
+                raise KeyboardInterrupt("interrupt before rights recheck")
+            return super().status(execution_id)
+
+        def attach(self, execution_id, run_dir):
+            observed["attachments"] += 1
+            return super().attach(execution_id, run_dir)
+
+    registry = ExecutorRegistry()
+    registry.register(
+        ExecutorProvider(
+            "rights-test",
+            EXECUTOR_API_VERSION,
+            lambda _context: RightsTestExecutor(),
+            capabilities=LocalExecutor().capabilities,
+            config_contract={"type": "object", "additionalProperties": False},
+        )
+    )
+    with Factory(paths, executors=registry) as factory:
+        factory.add_data(
+            paths.root / "data/numbers.jsonl",
+            name="example-numbers",
+            mode="copy",
+            rights={"license": "CC0-1.0", "trainingAllowed": True},
+        )
+        queued = factory.create_run_operation(
+            paths.root / "workloads/example-statistical.yaml", binding_path
+        )
+        factory.revoke_data("example-numbers", reason="source permission withdrawn")
+        with pytest.raises(ValidationError, match="current rights"):
+            factory.execute_run_operation(queued["id"])
+        assert observed["submissions"] == 0
+        assert factory.operations.get(queued["id"])["state"] == "failed"
+        assert factory.list_resources(kind="Run") == []
+
+        allowed = factory.add_data(
+            paths.root / "data/numbers.jsonl",
+            name="second-numbers",
+            mode="copy",
+            rights={"license": "CC0-1.0", "trainingAllowed": True},
+        )
+        workload_path = paths.root / "workloads/recovery-rights.yaml"
+        workload = yaml.safe_load((paths.root / "workloads/example-statistical.yaml").read_text())
+        workload["metadata"]["name"] = "recovery-rights"
+        workload["spec"]["graph"]["stages"][0]["inputs"]["dataset"] = "dataset/second-numbers"
+        workload_path.write_text(yaml.safe_dump(workload))
+        operation = factory.create_run_operation(workload_path, binding_path)
+        with pytest.raises(KeyboardInterrupt, match="rights recheck"):
+            factory.execute_run_operation(operation["id"])
+        assert observed["submissions"] == 1
+        assert factory.operations.get(operation["id"])["state"] == "running"
+
+    errors = []
+
+    def recover() -> None:
+        try:
+            with Factory(paths, executors=registry) as restarted:
+                restarted.execute_run_operation(operation["id"])
+        except Exception as error:
+            errors.append(error)
+
+    recovery = threading.Thread(target=recover)
+    recovery.start()
+    assert recovery_planned.wait(timeout=5)
+    with Factory(paths, executors=registry) as rights_operator:
+        revoked = rights_operator.revoke_data("second-numbers", reason="consent withdrawn")
+    continue_recovery.set()
+    recovery.join(timeout=5)
+    assert not recovery.is_alive()
+    assert len(errors) == 1
+    assert isinstance(errors[0], ValidationError)
+    assert "current rights" in str(errors[0])
+    assert revoked["metadata"]["uid"] == allowed["metadata"]["uid"]
+
+    with Factory(paths, executors=registry) as restarted:
+        assert restarted.operations.get(operation["id"])["state"] == "failed"
+        assert restarted.run_status(operation["id"])["status"]["state"] == "Failed"
+        assert restarted.list_resources(kind="RunResult") == []
+    assert observed == {"interrupted": True, "submissions": 1, "attachments": 0}
+
+
+def test_revocation_winning_submit_race_prevents_allocation(tmp_path):
+    paths = _project(tmp_path)
+    binding_path = paths.root / "bindings/local.yaml"
+    binding = yaml.safe_load(binding_path.read_text())
+    binding["spec"]["executor"] = "submit-race"
+    binding_path.write_text(yaml.safe_dump(binding))
+    bootstrap(paths)
+    planned = threading.Event()
+    continue_submit = threading.Event()
+    submissions = []
+
+    class SubmitRaceExecutor(LocalExecutor):
+        def plan(self, **kwargs):
+            plan = super().plan(**kwargs)
+            planned.set()
+            if not continue_submit.wait(timeout=5):
+                raise RuntimeError("submit test barrier timed out")
+            return plan
+
+        def submit(self, plan):
+            submissions.append(plan)
+            return super().submit(plan)
+
+    registry = ExecutorRegistry()
+    registry.register(
+        ExecutorProvider(
+            "submit-race",
+            EXECUTOR_API_VERSION,
+            lambda _context: SubmitRaceExecutor(),
+            capabilities=LocalExecutor().capabilities,
+            config_contract={"type": "object", "additionalProperties": False},
+        )
+    )
+    with Factory(paths, executors=registry) as factory:
+        factory.add_data(
+            paths.root / "data/numbers.jsonl",
+            name="example-numbers",
+            mode="copy",
+            rights={"license": "CC0-1.0", "trainingAllowed": True},
+        )
+        operation = factory.create_run_operation(
+            paths.root / "workloads/example-statistical.yaml", binding_path
+        )
+
+    errors = []
+
+    def execute() -> None:
+        try:
+            with Factory(paths, executors=registry) as factory:
+                factory.execute_run_operation(operation["id"])
+        except Exception as error:
+            errors.append(error)
+
+    execution = threading.Thread(target=execute)
+    execution.start()
+    assert planned.wait(timeout=5)
+    with Factory(paths, executors=registry) as rights_operator:
+        rights_operator.revoke_data("example-numbers", reason="consent withdrawn")
+    continue_submit.set()
+    execution.join(timeout=5)
+
+    assert not execution.is_alive()
+    assert len(errors) == 1
+    assert isinstance(errors[0], ValidationError)
+    assert "current rights" in str(errors[0])
+    assert submissions == []
+
+
+def test_model_neutral_from_scratch_golden_path(tmp_path, monkeypatch):
     paths = _project(tmp_path)
     workload_path = paths.root / "workloads/example-from-scratch.yaml"
     workload = yaml.safe_load(workload_path.read_text())
@@ -550,7 +1067,7 @@ def test_model_neutral_from_scratch_golden_path(tmp_path):
     with Factory(paths) as factory:
         package_resource = factory.apply_resource(model_package)
         suite_resource = factory.apply_resource(evaluation_spec)
-        factory.add_data(
+        dataset = factory.add_data(
             Path("data/fixtures/affine.jsonl").resolve(),
             name="example-affine",
             mode="copy",
@@ -593,12 +1110,82 @@ def test_model_neutral_from_scratch_golden_path(tmp_path):
             )
         scan["subjects"].append(admission["inferenceAdapter"]["sourceDigest"])
         scan_path.write_text(yaml.safe_dump(scan))
+        revised_data = tmp_path / "revised-affine.jsonl"
+        revised_data.write_text(Path("data/fixtures/affine.jsonl").read_text() + "\n")
+        current_dataset = factory.add_data(
+            revised_data,
+            name="example-affine",
+            mode="copy",
+            rights={"license": "CC0-1.0", "trainingAllowed": True},
+        )
+        assert current_dataset["metadata"]["uid"] == dataset["metadata"]["uid"]
+        unrelated = factory.add_data(
+            revised_data,
+            name="unrelated",
+            mode="copy",
+            rights={"license": "CC0-1.0", "trainingAllowed": True},
+        )
+        factory.revoke_data("unrelated", reason="not part of this run")
         release = factory.create_release(
             result["runId"],
             name="affine-release",
             intended_use="test",
             vulnerability_report=scan_path,
         )
+        assert release["spec"]["extensions"]["manifest"]["dataSummary"] == [
+            {
+                "name": "example-affine",
+                "revision": dataset["metadata"]["revision"],
+                "rights": dataset["spec"]["rights"],
+            }
+        ]
+        assert unrelated["metadata"]["uid"] != dataset["metadata"]["uid"]
+        release_applied = threading.Event()
+        continue_promotion = threading.Event()
+        original_apply_resource = factory.apply_resource
+
+        def pause_before_final_promotion(value, *, _system=False):
+            applied = original_apply_resource(value, _system=_system)
+            if value.get("kind") == "Release" and value["metadata"]["name"] == "rights-race":
+                release_applied.set()
+                if not continue_promotion.wait(timeout=5):
+                    raise RuntimeError("promotion test barrier timed out")
+            return applied
+
+        monkeypatch.setattr(factory, "apply_resource", pause_before_final_promotion)
+        promotion_errors = []
+
+        def promote() -> None:
+            try:
+                factory.create_release(
+                    result["runId"],
+                    name="rights-race",
+                    intended_use="test",
+                    promote=True,
+                    approvals=["independent-reviewer"],
+                    vulnerability_report=scan_path,
+                )
+            except Exception as error:
+                promotion_errors.append(error)
+
+        promotion = threading.Thread(target=promote)
+        promotion.start()
+        assert release_applied.wait(timeout=5)
+        with Factory(paths, actor="rights-operator") as rights_operator:
+            rights_operator.revoke_data("example-affine", reason="training consent withdrawn")
+        continue_promotion.set()
+        promotion.join(timeout=5)
+        assert not promotion.is_alive()
+        assert len(promotion_errors) == 1
+        assert isinstance(promotion_errors[0], IntegrityError)
+        assert "rights" in str(promotion_errors[0])
+        with pytest.raises(NotFoundError):
+            AliasRepository(factory.db).get("candidate")
+        assert not [
+            event
+            for event in factory.events.query(type="ReleasePublished")
+            if event.subject == "Release/rights-race"
+        ]
         experiment = factory.create_experiment(
             name="affine-self-check",
             baseline_ref=factory._resource_uri(evaluation),
@@ -1060,6 +1647,40 @@ def test_recovery_repairs_run_admission_event_crash_gaps(tmp_path, monkeypatch, 
     assert len(admission_events) == 1
 
 
+def test_recovery_does_not_backfill_admission_after_rights_revocation(tmp_path, monkeypatch):
+    paths = _project(tmp_path)
+    bootstrap(paths)
+    with Factory(paths) as factory:
+        factory.add_data(
+            paths.root / "data/numbers.jsonl",
+            name="example-numbers",
+            mode="copy",
+            rights={"license": "CC0-1.0", "trainingAllowed": True},
+        )
+        operation = factory.create_run_operation(
+            paths.root / "workloads/example-statistical.yaml",
+            paths.root / "bindings/local.yaml",
+        )
+        append = factory.events.append
+
+        def interrupt_admission(**kwargs):
+            if kwargs["type"] == "RunAdmitted":
+                raise KeyboardInterrupt("controller stopped after run persistence")
+            return append(**kwargs)
+
+        with monkeypatch.context() as patch:
+            patch.setattr(factory.events, "append", interrupt_admission)
+            with pytest.raises(KeyboardInterrupt, match="controller stopped"):
+                factory.execute_run_operation(operation["id"])
+
+        factory.revoke_data("example-numbers", reason="consent withdrawn")
+        with pytest.raises(ValidationError, match="current rights"):
+            factory.execute_run_operation(operation["id"])
+
+        assert factory.events.query(run_id=operation["id"], type="RunAdmitted") == []
+        assert factory.operations.get(operation["id"])["state"] == "failed"
+
+
 def test_recovery_integrity_failure_finalizes_the_durable_run(tmp_path, monkeypatch):
     paths = _project(tmp_path)
     bootstrap(paths)
@@ -1132,6 +1753,7 @@ def test_running_local_operation_reattaches_without_duplicate_stage_work(tmp_pat
     registry.register(
         ExecutorProvider(
             "recoverable-local",
+            EXECUTOR_API_VERSION,
             lambda _context: RecoverableLocal(),
             capabilities=LocalExecutor().capabilities,
             config_contract={"type": "object", "additionalProperties": False},

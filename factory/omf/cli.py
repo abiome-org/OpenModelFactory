@@ -97,7 +97,7 @@ def main(
     actor: str = typer.Option("local-user", "--actor", help="Attributable local actor"),
     version: bool = typer.Option(False, "--version", callback=_version, is_eager=True),
 ) -> None:
-    """Open, model-neutral, local-to-federated model lifecycle platform."""
+    """Repository-centered, model-neutral development and release system."""
     del version
     if output not in {"table", "json", "yaml"}:
         raise typer.BadParameter("output must be table, json, or yaml")
@@ -455,6 +455,18 @@ def data_verify(name: str) -> None:
     def run() -> dict[str, Any]:
         with _factory() as factory:
             return {"name": name, "valid": factory.verify_data(name)}
+
+    _handle(run)
+
+
+@data_app.command("revoke")
+def data_revoke(
+    name: str,
+    reason: str = typer.Option(..., "--reason", help="Non-sensitive revocation reason"),
+) -> None:
+    def run() -> dict[str, Any]:
+        with _factory() as factory:
+            return factory.revoke_data(name, reason=reason)
 
     _handle(run)
 

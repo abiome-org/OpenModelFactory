@@ -10,7 +10,7 @@ from typer.testing import CliRunner
 
 def test_cli_help_version_and_bootstrap_plan(tmp_path):
     runner = CliRunner()
-    assert runner.invoke(app, ["--version"]).stdout.strip() == "0.1.0"
+    assert runner.invoke(app, ["--version"]).stdout.strip() == "1.0.0"
     assert runner.invoke(app, ["--help"]).exit_code == 0
     root = tmp_path / "project"
     root.mkdir()
@@ -242,6 +242,9 @@ def test_cli_complete_local_lifecycle(tmp_path):
     deployment_path.write_text(yaml.safe_dump(deployment))
     assert invoke("deploy", deployment_path)["state"] == "packaged"
     assert invoke("deployment", "status", "edge-one")["status"]["state"] == "packaged"
+    revoked = invoke("data", "revoke", "example-numbers", "--reason", "test withdrawal")
+    assert revoked["spec"]["rights"]["trainingAllowed"] is False
+    assert revoked["spec"]["rights"]["revoked"] is True
 
     assert "keyId" in invoke("federation", "identity")
     content = root / "federated-content.yaml"

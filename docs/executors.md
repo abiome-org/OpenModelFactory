@@ -71,10 +71,10 @@ spec:
     moduleProtocol: shared-filesystem
 ```
 
-The provider factory receives the complete immutable declaration as
-`ExecutorContext.declaration`, repository and state roots, the named actor, and
-only the nested executor options as `ExecutorContext.config`. A provider may
-interpret binding resources, placement, transport, and policy, but must not
+The provider factory receives the complete declaration as an isolated deep copy
+in `ExecutorContext.declaration`, repository and state roots, the named actor,
+and only the nested executor options as `ExecutorContext.config`. A provider
+may interpret binding resources, placement, transport, and policy, but must not
 reinterpret stage semantics.
 
 Versioned configuration must not contain plaintext credentials. Refer to
@@ -147,6 +147,16 @@ keeping deployment-form semantics separate from scheduler details.
 
 ## Add a provider
 
+`omf.executor/v1` is the stable provider boundary. The controller passes an
+isolated copy of project and desired-state context to the provider factory,
+validates provider configuration before calling it, and then uses only the
+exported `Executor` methods. Plans must be deterministic. `submit` returns a
+durable provider ID. Providers that keep state in `run_dir` make `attach`
+idempotent and verify that ID against the directory; scheduler-identity-only
+providers can use the no-op default. `recover` returns `None` only when no
+allocation occurred and raises when launch outcome is ambiguous. Status and
+logs remain available after controller restart.
+
 The smallest in-repository change is to construct and inject an
 `ExecutorRegistry`; this is useful for a site service or tests. A reusable
 provider is an installed Python package exporting one `ExecutorProvider` entry
@@ -155,6 +165,7 @@ point:
 ```python
 # omf_modal/provider.py
 from omf.executors import (
+    EXECUTOR_API_VERSION,
     MODULE_PROTOCOL_CAPABILITIES,
     ExecutorContext,
     ExecutorProvider,
@@ -173,6 +184,7 @@ def create(context: ExecutorContext) -> ModalExecutor:
 
 provider = ExecutorProvider(
     name="modal",
+    api_version=EXECUTOR_API_VERSION,
     factory=create,
     description="Modal function runner with object-store protocol transport.",
     capabilities=MODULE_PROTOCOL_CAPABILITIES,
@@ -194,7 +206,9 @@ provider = ExecutorProvider(
 modal = "omf_modal.provider:provider"
 ```
 
-`ModalExecutor` implements the `Executor` abstract methods in
+The entry point must export the current `EXECUTOR_API_VERSION`; missing or
+unsupported versions fail during discovery rather than running against an
+ambiguous interface. `ModalExecutor` implements the `Executor` abstract methods in
 `omf.executors.base`: `capabilities`, `preflight`, `plan`, `submit`, `status`,
 `cancel`, and `logs`; override `attach` when controller-local bookkeeping must
 be reconstructed after restart. `plan` must be deterministic for identical

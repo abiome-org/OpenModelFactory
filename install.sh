@@ -19,7 +19,7 @@ Usage:
 
 Options:
   --plan                Show the complete installation plan without changing anything.
-  --python EXECUTABLE   Python 3.11+ used to create DIRECTORY/.venv (default: python3).
+  --python EXECUTABLE   Python 3.11 or 3.12 used for DIRECTORY/.venv (default: python3).
   --name PROJECT_NAME   Name for a newly created project (default: directory basename).
   -h, --help            Show this help.
 
@@ -101,9 +101,9 @@ fi
 PYTHON="${PYTHON_PATH}"
 "${PYTHON}" -c '
 import sys
-if sys.version_info < (3, 11):
-    raise SystemExit("Open Model Factory requires Python 3.11 or newer")
-' || fail "a working Python 3.11+ interpreter is required"
+if not (3, 11) <= sys.version_info[:2] < (3, 13):
+    raise SystemExit("Open Model Factory 1.0 requires Python 3.11 or 3.12")
+' || fail "a working Python 3.11 or 3.12 interpreter is required"
 
 TARGET="$("${PYTHON}" - "${TARGET_ARGUMENT}" <<'PY'
 import sys
@@ -412,8 +412,8 @@ from pathlib import Path
 expected = Path(sys.argv[1]).resolve()
 if Path(sys.prefix).resolve() != expected or sys.prefix == sys.base_prefix:
     raise SystemExit("interpreter is not isolated in the requested virtual environment")
-if sys.version_info < (3, 11):
-    raise SystemExit("the fresh virtual environment uses Python older than 3.11")
+if not (3, 11) <= sys.version_info[:2] < (3, 13):
+    raise SystemExit("the fresh virtual environment must use Python 3.11 or 3.12")
 PY
 run_new_venv_python -m pip --version >/dev/null \
   || fail "fresh environment does not provide pip"

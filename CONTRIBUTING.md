@@ -1,7 +1,7 @@
 # Contributing
 
 Open Model Factory changes must preserve model neutrality, immutable identity,
-and the local-to-federated lifecycle boundaries in
+and the repository-centered lifecycle boundaries in
 [`docs/architecture.md`](docs/architecture.md). Resource contracts live in
 `factory/omf/schemas/`; executable guarantees live in `tests/`.
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from copy import deepcopy
 from dataclasses import dataclass
 from typing import Any
 
@@ -28,14 +29,25 @@ class FeedbackDataset:
     revision: str
     records: tuple[dict[str, Any], ...]
     lineage: dict[str, str]
+    collected_by: str
     approved_for_training: bool = False
 
 
+@dataclass(frozen=True)
+class FeedbackTrainingExport:
+    source_revision: str
+    records: tuple[dict[str, Any], ...]
+    approved_by: str
+
+
 class FeedbackCollector:
-    def __init__(self, spec: FeedbackSpec) -> None:
+    def __init__(self, spec: FeedbackSpec, *, collected_by: str) -> None:
         if not spec.purpose or not spec.rights_basis or spec.retention_days <= 0:
             raise ValidationError("feedback requires purpose, rights basis, and positive retention")
+        if not collected_by.strip():
+            raise ValidationError("feedback collector identity is required")
         self.spec = spec
+        self.collected_by = collected_by
         self._accepted: list[dict[str, Any]] = []
         self.rejections: list[dict[str, str]] = []
 
@@ -57,17 +69,45 @@ class FeedbackCollector:
             return False
         self._accepted.append(
             {
-                key: "[REDACTED]" if key in self.spec.redacted_fields else value
+                key: "[REDACTED]" if key in self.spec.redacted_fields else deepcopy(value)
                 for key, value in record.items()
             }
         )
         return True
 
     def materialize(self) -> FeedbackDataset:
-        records = tuple(dict(record) for record in self._accepted)
-        revision = sha256_digest({"spec": self.spec.deployment_revision, "records": records})
+        records = tuple(deepcopy(record) for record in self._accepted)
+        lineage = {
+            "deployment": self.spec.deployment_revision,
+            "release": self.spec.release_revision,
+        }
+        revision = sha256_digest(
+            {"lineage": lineage, "records": records, "collectedBy": self.collected_by}
+        )
         return FeedbackDataset(
             revision,
             records,
-            {"deployment": self.spec.deployment_revision, "release": self.spec.release_revision},
+            lineage,
+            self.collected_by,
         )
+
+
+def approve_and_export_for_training(
+    dataset: FeedbackDataset, *, approver: str
+) -> FeedbackTrainingExport:
+    if not approver.strip() or approver == dataset.collected_by:
+        raise ValidationError("feedback training export requires a different named approver")
+    expected = sha256_digest(
+        {
+            "lineage": dataset.lineage,
+            "records": dataset.records,
+            "collectedBy": dataset.collected_by,
+        }
+    )
+    if expected != dataset.revision:
+        raise ValidationError("staged feedback revision failed integrity verification")
+    return FeedbackTrainingExport(
+        source_revision=dataset.revision,
+        records=tuple(deepcopy(record) for record in dataset.records),
+        approved_by=approver,
+    )

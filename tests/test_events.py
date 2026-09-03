@@ -100,7 +100,7 @@ def test_event_order_migration_backfills_existing_events(tmp_path):
         DROP TRIGGER event_order_no_update;
         DROP TRIGGER event_order_no_delete;
         DROP TABLE event_order;
-        DELETE FROM schema_migrations WHERE version=4;
+        DELETE FROM schema_migrations WHERE version>=4;
         """
     )
     connection.close()

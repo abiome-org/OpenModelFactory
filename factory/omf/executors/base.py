@@ -89,15 +89,20 @@ class Executor(ABC):
     def attach(self, execution_id: str, run_dir: Path) -> None:
         """Restore controller-local bookkeeping after a process restart.
 
-        Executors whose scheduler identity is sufficient may keep the default no-op. Adapters
-        that use the local run directory for status or logs should override this method.
+        The operation must be idempotent and must reject a run directory that does not belong to
+        ``execution_id``. Executors whose scheduler identity is sufficient may keep the default
+        no-op. Adapters that use the local run directory for status or logs should override it.
         """
         del execution_id, run_dir
 
     def recover(self, run_dir: Path) -> str | None:
-        """Recover an execution ID after submit returned but before the controller persisted it."""
+        """Recover an ID after allocation but before the controller persisted it.
+
+        Return ``None`` only when the provider can establish that no execution was allocated.
+        Raise when allocation may have happened but cannot be identified safely.
+        """
         del run_dir
-        return None
+        raise RuntimeError("executor cannot identify an interrupted submission")
 
     def prepare_environment(
         self,

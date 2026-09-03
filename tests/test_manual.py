@@ -8,7 +8,8 @@ import tarfile
 from pathlib import Path
 
 import pytest
-from omf.config import ProjectPaths
+import yaml
+from omf.config import ProjectPaths, bootstrap
 from omf.errors import IntegrityError
 from omf.factory import Factory
 
@@ -55,6 +56,12 @@ def _manual_project(tmp_path: Path) -> Path:
     root.mkdir()
     shutil.copy2("omf.yaml", root / "omf.yaml")
     shutil.copy2(".gitignore", root / ".gitignore")
+    model_card = Path("templates/project/MODEL_CARD.md").read_text()
+    (root / "MODEL_CARD.md").write_text(
+        model_card.replace("__OMF_PROJECT_NAME__", "open-model-factory").replace(
+            "__OMF_PROJECT_NAMESPACE__", "local/open-model-factory"
+        )
+    )
     (root / "bindings").mkdir()
     shutil.copy2("bindings/local.yaml", root / "bindings/local.yaml")
     (root / "workloads").mkdir()
@@ -65,6 +72,7 @@ def _manual_project(tmp_path: Path) -> Path:
     shutil.copytree(
         "modules/examples/affine-regression", root / "modules/examples/affine-regression"
     )
+    shutil.copytree("modules/examples/affine-serving", root / "modules/examples/affine-serving")
     (root / "data/fixtures").mkdir(parents=True)
     shutil.copy2("data/fixtures/affine.jsonl", root / "data/fixtures/affine.jsonl")
     shutil.copy2("data/fixtures/rights.yaml", root / "data/fixtures/rights.yaml")
@@ -78,6 +86,85 @@ def _manual_project(tmp_path: Path) -> Path:
     subprocess.run(["git", "add", "."], cwd=root, check=True)
     subprocess.run(["git", "commit", "-qm", "Create manual fixture"], cwd=root, check=True)
     return root
+
+
+def test_greenfield_model_card_to_compared_candidate(tmp_path):
+    root = _manual_project(tmp_path)
+    model_card_path = root / "MODEL_CARD.md"
+    model_card_path.write_text(
+        model_card_path.read_text()
+        .replace("**Status:** Draft", "**Status:** Active")
+        .replace("TBD", "Defined for the affine acceptance benchmark")
+    )
+    workload_path = root / "workloads/example-from-scratch.yaml"
+    workload = yaml.safe_load(workload_path.read_text())
+    workload["spec"]["graph"]["stages"][0]["config"]["steps"] = 200
+    workload_path.write_text(yaml.safe_dump(workload))
+    subprocess.run(["git", "add", "."], cwd=root, check=True)
+    subprocess.run(["git", "commit", "-qm", "Define baseline"], cwd=root, check=True)
+
+    paths = ProjectPaths(root)
+    bootstrap(paths)
+    with Factory(paths) as factory:
+        for resource in (
+            root / "model-packages/example-affine.yaml",
+            root / "evaluations/example-affine.yaml",
+            root / "mixes/example-affine.yaml",
+        ):
+            factory.apply_resource_file(resource)
+        factory.add_data(
+            root / "data/fixtures/affine.jsonl",
+            name="example-affine",
+            mode="copy",
+            rights=yaml.safe_load((root / "data/fixtures/rights.yaml").read_text()),
+        )
+        baseline = factory.run(workload_path, root / "bindings/local.yaml")
+        baseline_evaluation = factory.evaluate(f"run/{baseline['runId']}")
+
+        workload["spec"]["graph"]["stages"][0]["config"]["steps"] = 500
+        workload_path.write_text(yaml.safe_dump(workload))
+        subprocess.run(["git", "add", str(workload_path)], cwd=root, check=True)
+        subprocess.run(["git", "commit", "-qm", "Train candidate longer"], cwd=root, check=True)
+        candidate = factory.run(workload_path, root / "bindings/local.yaml")
+        candidate_evaluation = factory.evaluate(f"run/{candidate['runId']}")
+        experiment = factory.create_experiment(
+            name="longer-training",
+            baseline_ref=factory._resource_uri(baseline_evaluation),
+            candidate_ref=factory._resource_uri(candidate_evaluation),
+            metric="training-loss",
+            direction="minimize",
+        )
+        baseline_evaluation_ref = factory._resource_uri(baseline_evaluation)
+        candidate_evaluation_ref = factory._resource_uri(candidate_evaluation)
+        baseline_lineage = factory.lineage.by_run(baseline["runId"])
+        candidate_lineage = factory.lineage.by_run(candidate["runId"])
+
+    initial_decision = (
+        "| Defined for the affine acceptance benchmark | Initial direction | "
+        "Defined for the affine acceptance benchmark |"
+    )
+    model_card_path.write_text(
+        model_card_path.read_text().replace(
+            initial_decision,
+            f"| 2026-09-03 | Selected longer training | {experiment['metadata']['revision']} |",
+        )
+    )
+    assert "TBD" not in model_card_path.read_text()
+    assert baseline["workloadDigest"] != candidate["workloadDigest"]
+    assert (
+        baseline_evaluation["spec"]["extensions"]["evaluationRefs"]
+        == (candidate_evaluation["spec"]["extensions"]["evaluationRefs"])
+    )
+    assert (
+        candidate_evaluation["spec"]["scores"]["training-loss"]
+        < baseline_evaluation["spec"]["scores"]["training-loss"]
+    )
+    assert experiment["spec"]["decision"] == "candidate"
+    assert experiment["spec"]["baselineRef"] == baseline_evaluation_ref
+    assert experiment["spec"]["candidateRef"] == candidate_evaluation_ref
+    assert baseline_lineage
+    assert candidate_lineage
+    assert experiment["metadata"]["revision"] in model_card_path.read_text()
 
 
 def test_canonical_manual_lifecycle_executes_end_to_end(tmp_path):

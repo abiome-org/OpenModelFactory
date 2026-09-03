@@ -1,12 +1,17 @@
 import hashlib
+import json
+import os
 import shutil
+import subprocess
 import sys
 import time
+import venv
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 from omf.errors import CapabilityError, ConfigurationError, IntegrityError, ValidationError
-from omf.executors import ExecutorContext, ExecutorProvider, ExecutorRegistry
+from omf.executors import EXECUTOR_API_VERSION, ExecutorContext, ExecutorProvider, ExecutorRegistry
 from omf.executors.base import DependencyLock
 from omf.executors.kubernetes import KubernetesExecutor
 from omf.executors.local import LocalExecutor
@@ -40,7 +45,8 @@ def test_executor_registry_catalog_duplicates_unknown_and_discovery(tmp_path, mo
     ]
     with pytest.raises(ConfigurationError, match="duplicate"):
         registry.register(
-            ExecutorProvider("local", lambda _context: LocalExecutor()), source="test"
+            ExecutorProvider("local", EXECUTOR_API_VERSION, lambda _context: LocalExecutor()),
+            source="test",
         )
     with pytest.raises(CapabilityError, match="unknown"):
         registry.resolve(
@@ -54,6 +60,7 @@ def test_executor_registry_catalog_duplicates_unknown_and_discovery(tmp_path, mo
     custom = ExecutorRegistry()
     provider = ExecutorProvider(
         "custom",
+        EXECUTOR_API_VERSION,
         lambda context: LocalExecutor() if isinstance(context, ExecutorContext) else None,
         config_contract={"type": "object", "additionalProperties": False},
     )
@@ -87,17 +94,22 @@ def test_executor_registry_catalog_duplicates_unknown_and_discovery(tmp_path, mo
 def test_executor_registry_rejects_invalid_plugins_and_controller_fields(tmp_path, monkeypatch):
     registry = ExecutorRegistry()
     with pytest.raises(ConfigurationError, match="normalized"):
-        registry.register(ExecutorProvider(" invalid ", lambda _context: LocalExecutor()))
+        registry.register(
+            ExecutorProvider(" invalid ", EXECUTOR_API_VERSION, lambda _context: LocalExecutor())
+        )
+    with pytest.raises(ConfigurationError, match="unsupported API version"):
+        registry.register(ExecutorProvider("old", "omf.executor/v1alpha1", LocalExecutor))
     with pytest.raises(ConfigurationError, match="invalid config contract"):
         registry.register(
             ExecutorProvider(
                 "invalid-schema",
+                EXECUTOR_API_VERSION,
                 lambda _context: LocalExecutor(),
                 config_contract={"type": "not-a-json-schema-type"},
             )
         )
 
-    provider = ExecutorProvider("valid", lambda _context: LocalExecutor())
+    provider = ExecutorProvider("valid", EXECUTOR_API_VERSION, lambda _context: LocalExecutor())
     registry.register(provider)
     resolve = {
         "project_root": tmp_path,
@@ -113,7 +125,9 @@ def test_executor_registry_rejects_invalid_plugins_and_controller_fields(tmp_pat
         builtins.resolve("kubernetes", config={"typo": True}, **resolve)
 
     invalid_executor = ExecutorRegistry()
-    invalid_executor.register(ExecutorProvider("invalid", lambda _context: object()))
+    invalid_executor.register(
+        ExecutorProvider("invalid", EXECUTOR_API_VERSION, lambda _context: object())
+    )
     with pytest.raises(ConfigurationError, match="invalid adapter"):
         invalid_executor.resolve("invalid", **resolve)
 
@@ -130,11 +144,140 @@ def test_executor_registry_rejects_invalid_plugins_and_controller_fields(tmp_pat
     wrong_entry_point = SimpleNamespace(
         name="declared-name",
         value="wrong:provider",
-        load=lambda: ExecutorProvider("different-name", lambda _context: LocalExecutor()),
+        load=lambda: ExecutorProvider(
+            "different-name", EXECUTOR_API_VERSION, lambda _context: LocalExecutor()
+        ),
     )
     entry_points = SimpleNamespace(select=lambda **_kwargs: [wrong_entry_point])
     with pytest.raises(ConfigurationError, match="does not match"):
         ExecutorRegistry().discover()
+
+
+def test_executor_plugin_wheel_is_discovered_in_an_isolated_environment(tmp_path):
+    distributions = tmp_path / "dist"
+    distributions.mkdir()
+    for source in (Path.cwd(), Path("tests/fixtures/executor_plugin").resolve()):
+        built = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "build",
+                "--wheel",
+                "--no-isolation",
+                "--outdir",
+                str(distributions),
+            ],
+            cwd=source,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=60,
+        )
+        assert built.returncode == 0, built.stdout + built.stderr
+
+    environment = tmp_path / "venv"
+    venv.EnvBuilder(with_pip=True, system_site_packages=True).create(environment)
+    python = environment / "bin/python"
+    wheels = sorted(distributions.glob("*.whl"))
+    installed = subprocess.run(
+        [
+            str(python),
+            "-m",
+            "pip",
+            "install",
+            "--no-index",
+            "--no-deps",
+            *[str(wheel) for wheel in wheels],
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=60,
+        env=os.environ | {"PIP_NO_INDEX": "1"},
+    )
+    assert installed.returncode == 0, installed.stdout + installed.stderr
+    checked = subprocess.run(
+        [str(python), "-m", "pip", "check"],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=60,
+        env=os.environ | {"PIP_NO_INDEX": "1"},
+    )
+    assert checked.returncode == 0, checked.stdout + checked.stderr
+
+    isolated = tmp_path / "isolated"
+    isolated.mkdir()
+    acceptance = subprocess.run(
+        [
+            str(python),
+            "-I",
+            "-c",
+            """
+import importlib.metadata
+import json
+import sys
+import time
+from pathlib import Path
+
+import omf
+import omf_stable_executor
+from omf.executors import EXECUTOR_API_VERSION, ExecutorContext, default_executor_registry
+
+prefix = Path(sys.prefix).resolve()
+assert Path(omf.__file__).resolve().is_relative_to(prefix)
+assert Path(omf_stable_executor.__file__).resolve().is_relative_to(prefix)
+requires = importlib.metadata.metadata("omf-stable-executor-test-plugin").get_all("Requires-Dist")
+assert requires == ["open-model-factory<2,>=1"]
+registry = default_executor_registry()
+catalog = registry.catalog()
+stable = next(item for item in catalog["providers"] if item["name"] == "stable-test")
+assert catalog["apiVersion"] == EXECUTOR_API_VERSION
+assert stable["apiVersion"] == EXECUTOR_API_VERSION
+assert stable["source"].startswith("entry-point:omf-stable-executor-test-plugin:")
+
+root = Path("project").resolve()
+state = root / ".omf"
+state.mkdir(parents=True)
+context = ExecutorContext(root, state, "acceptance", {}, {})
+executor = omf_stable_executor.create(context)
+run_dir = state / "run"
+command = (
+    "import os\\n"
+    "import pathlib\\n"
+    "import sys\\n"
+    "pathlib.Path(os.environ['OMF_RESULT_FILE']).write_text(os.environ['OMF_RUN_ID'])\\n"
+    "print('out-tail')\\n"
+    "print('err-tail', file=sys.stderr)"
+)
+execution_id = executor.submit(
+    executor.plan(
+        argv=[sys.executable, "-c", command],
+        run_dir=run_dir,
+        cwd=root,
+        requires_result=False,
+    )
+)
+while executor.status(execution_id).state in {"pending", "running"}:
+    time.sleep(0.01)
+attached = omf_stable_executor.create(context)
+attached.attach(execution_id, run_dir)
+assert attached.status(execution_id).state == "succeeded"
+assert attached.recover(run_dir) == execution_id
+assert (run_dir / "result.json").read_text() == execution_id
+assert attached.read_logs(execution_id, tail_bytes=9) == ("out-tail\\n", "err-tail\\n")
+print(json.dumps({"provider": stable["name"], "state": "succeeded"}))
+""",
+        ],
+        cwd=isolated,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=60,
+        env={key: value for key, value in os.environ.items() if key != "PYTHONPATH"},
+    )
+    assert acceptance.returncode == 0, acceptance.stdout + acceptance.stderr
+    assert json.loads(acceptance.stdout) == {"provider": "stable-test", "state": "succeeded"}
 
 
 def test_local_executor_success_failure_logs_and_reconcile(tmp_path):

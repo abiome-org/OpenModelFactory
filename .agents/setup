@@ -12,8 +12,8 @@ printf '[setup] checking Python version\n'
 python3 - <<'PY'
 import sys
 
-if sys.version_info < (3, 11):
-    raise SystemExit("Open Model Factory requires Python 3.11 or newer")
+if not (3, 11) <= sys.version_info[:2] < (3, 13):
+    raise SystemExit("Open Model Factory 1.0 requires Python 3.11 or 3.12")
 PY
 
 printf '[setup] installing locked runtime dependencies\n'

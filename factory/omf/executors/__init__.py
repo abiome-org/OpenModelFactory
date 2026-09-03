@@ -3,12 +3,14 @@ from omf.executors.base import (
     MODULE_PROTOCOL_CAPABILITIES,
     DependencyLock,
     ExecutionPlan,
+    ExecutionState,
     ExecutionStatus,
     Executor,
 )
 from omf.executors.kubernetes import KubernetesExecutor
 from omf.executors.local import LocalExecutor
 from omf.executors.registry import (
+    EXECUTOR_API_VERSION,
     ExecutorContext,
     ExecutorProvider,
     ExecutorRegistry,
@@ -19,9 +21,11 @@ from omf.executors.slurm import SlurmExecutor
 
 __all__ = [
     "DEPLOYMENT_PROTOCOL_CAPABILITIES",
+    "EXECUTOR_API_VERSION",
     "MODULE_PROTOCOL_CAPABILITIES",
     "DependencyLock",
     "ExecutionPlan",
+    "ExecutionState",
     "ExecutionStatus",
     "Executor",
     "ExecutorContext",
