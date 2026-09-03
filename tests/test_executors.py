@@ -417,8 +417,8 @@ def test_local_environment_resolves_relative_path_entries(tmp_path, monkeypatch)
     assert environment["executables"][0]["path"] == str(executable.resolve())
 
 
-def test_local_environment_rejects_nonempty_opaque_dependency_lock(tmp_path):
-    with pytest.raises(CapabilityError, match="cannot realize a non-empty dependency lock"):
+def test_local_environment_rejects_nonempty_lock_without_environment_root(tmp_path):
+    with pytest.raises(CapabilityError, match="no environment cache root"):
         LocalExecutor().prepare_environment(
             argv=["python3", "-c", "pass"],
             cwd=tmp_path,
@@ -426,6 +426,120 @@ def test_local_environment_rejects_nonempty_opaque_dependency_lock(tmp_path):
                 "environment.lock", "sha256:" + "1" * 64, b"\x00provider-specific\xff"
             ),
         )
+
+
+def test_local_environment_rejects_nonempty_lock_for_non_python_entry_point(tmp_path):
+    binary = tmp_path / "tool"
+    binary.write_bytes(b"binary")
+    binary.chmod(0o755)
+    with pytest.raises(CapabilityError, match="requires a Python interpreter entry point"):
+        LocalExecutor(environment_root=tmp_path / "environments").prepare_environment(
+            argv=["./tool"],
+            cwd=tmp_path,
+            dependency=DependencyLock("environment.lock", "sha256:" + "1" * 64, b"opaque\n"),
+        )
+
+
+def _wait(executor: LocalExecutor, execution_id: str, timeout: float = 60.0) -> None:
+    deadline = time.monotonic() + timeout
+    while executor.status(execution_id).state in {"pending", "running"}:
+        assert time.monotonic() < deadline, "execution did not finish"
+        time.sleep(0.05)
+
+
+def test_local_environment_keeps_virtual_environment_symlink_interpreter(tmp_path, monkeypatch):
+    environment_path = tmp_path / "venv"
+    venv.EnvBuilder(symlinks=True, with_pip=False, system_site_packages=True).create(
+        environment_path
+    )
+    python = environment_path / "bin" / "python3"
+    if not python.is_symlink():
+        pytest.skip("this platform does not create symlink interpreters")
+    monkeypatch.setenv("PATH", f"{environment_path / 'bin'}{os.pathsep}{os.environ['PATH']}")
+    executor = LocalExecutor()
+
+    environment = executor.prepare_environment(
+        argv=["python3", "-c", "import sys; print(sys.prefix)"],
+        cwd=tmp_path,
+        dependency=DependencyLock("requirements.lock", "sha256:test", b""),
+    )
+
+    assert environment["command"][0] == str(python)
+    assert environment["executables"][0]["path"] == str(python)
+    assert environment["executables"][0]["target"] == str(python.resolve())
+    assert environment["runtime"]["python"]["version"]
+    run_dir = tmp_path / "run"
+    execution_id = executor.submit(
+        executor.plan(
+            argv=environment["command"],
+            run_dir=run_dir,
+            cwd=tmp_path,
+            requires_result=False,
+            environment=environment,
+        )
+    )
+    _wait(executor, execution_id)
+    assert executor.status(execution_id).state == "succeeded"
+    assert (run_dir / "stdout.log").read_text().strip() == str(environment_path)
+
+
+def test_local_executor_realizes_dependency_lock_from_wheelhouse(tmp_path):
+    from _wheels import build_wheel, lock_for
+
+    wheelhouse = tmp_path / "wheels"
+    _wheel, wheel_digest = build_wheel(wheelhouse)
+    lock = lock_for("omftiny", "1.0", wheel_digest)
+    dependency = DependencyLock(
+        "requirements.lock", "sha256:" + hashlib.sha256(lock).hexdigest(), lock
+    )
+    executor = LocalExecutor(
+        environment_root=tmp_path / "environments",
+        dependency_wheelhouse=wheelhouse,
+        dependency_index=False,
+    )
+    argv = ["python3", "-c", "import omf.sdk, omftiny; print(omftiny.VERSION)"]
+
+    environment = executor.prepare_environment(argv=argv, cwd=tmp_path, dependency=dependency)
+
+    realization = environment["realization"]
+    assert realization["strategy"] == "venv"
+    assert realization["lockDigest"] == dependency.digest
+    assert environment["command"][0].startswith(str(tmp_path / "environments"))
+    assert Path(environment["command"][0]).is_symlink()
+    names = {item["name"] for item in environment["runtime"]["python"]["distributions"]}
+    assert {"omftiny", "open-model-factory"} <= names
+    again = executor.prepare_environment(argv=argv, cwd=tmp_path, dependency=dependency)
+    assert again["digest"] == environment["digest"]
+    assert len(list((tmp_path / "environments").glob("*/omf-environment.json"))) == 1
+
+    run_dir = tmp_path / "run"
+    execution_id = executor.submit(
+        executor.plan(
+            argv=environment["command"],
+            run_dir=run_dir,
+            cwd=tmp_path,
+            requires_result=False,
+            environment=environment,
+        )
+    )
+    _wait(executor, execution_id)
+    assert executor.status(execution_id).state == "succeeded", (run_dir / "stderr.log").read_text()
+    assert (run_dir / "stdout.log").read_text().strip() == "1.0"
+
+
+def test_local_executor_reports_unsatisfiable_lock_without_index(tmp_path):
+    lock = b"omfmissing==9.9 --hash=sha256:" + b"0" * 64 + b"\n"
+    executor = LocalExecutor(environment_root=tmp_path / "environments", dependency_index=False)
+    with pytest.raises(CapabilityError, match="dependency installation failed") as excinfo:
+        executor.prepare_environment(
+            argv=["python3", "-c", "pass"],
+            cwd=tmp_path,
+            dependency=DependencyLock(
+                "requirements.lock", "sha256:" + hashlib.sha256(lock).hexdigest(), lock
+            ),
+        )
+    assert "output" in excinfo.value.details
+    assert not list((tmp_path / "environments").glob("*/omf-environment.json"))
 
 
 def test_local_environment_captures_python_runtime_and_distribution_inventory(tmp_path):

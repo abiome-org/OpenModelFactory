@@ -4,11 +4,15 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any, Literal
 
-from omf.canonical import sha256_digest
-from omf.errors import IntegrityError
+from omf.canonical import load_document, sha256_digest
+from omf.errors import IntegrityError, ValidationError
 from omf.security import verify
+
+WORKTREE_MODES = ("deny", "allow", "archive")
+_POLICY_SUFFIXES = (".yaml", ".yml", ".json")
 
 
 @dataclass(frozen=True)
@@ -71,6 +75,125 @@ class PolicyEngine:
                 isinstance(actual, (list, set, tuple)) and bool(set(actual) & set(expected))
             )
         return bool(actual == expected)
+
+
+def _validate_policy_config(config: dict[str, Any]) -> dict[str, Any]:
+    """Accept only configuration keys the factory enforces; an unenforced key is an error.
+
+    ``dirtyWorktree`` is enforced at workload admission. ``unsignedModules: deny`` and
+    ``sync.allowDelete: false`` describe behavior the factory always has (modules are admitted
+    only from digest-verified captured packages, and synchronization never deletes), so any
+    other value is rejected rather than silently ignored. The promotion keys must stay true
+    because the release gates they name are mandatory.
+    """
+    validated: dict[str, Any] = {}
+    for key, value in config.items():
+        if key == "dirtyWorktree":
+            if value not in WORKTREE_MODES:
+                raise ValidationError(
+                    f"policy dirtyWorktree must be one of {', '.join(WORKTREE_MODES)}"
+                )
+            validated[key] = value
+        elif key == "unsignedModules":
+            if value != "deny":
+                raise ValidationError("policy unsignedModules supports only 'deny'")
+            validated[key] = value
+        elif key == "sync":
+            if not isinstance(value, dict) or set(value) - {"requirePlan", "allowDelete"}:
+                raise ValidationError("policy sync accepts only requirePlan and allowDelete")
+            if not isinstance(value.get("requirePlan", True), bool):
+                raise ValidationError("policy sync.requirePlan must be a boolean")
+            if value.get("allowDelete", False) is not False:
+                raise ValidationError("policy sync.allowDelete must be false; sync never deletes")
+            validated[key] = dict(value)
+        elif key == "promotion":
+            allowed = {"requireEvaluationPass", "requireCompleteLineage"}
+            if not isinstance(value, dict) or set(value) - allowed:
+                raise ValidationError(f"policy promotion accepts only {', '.join(sorted(allowed))}")
+            if any(value.get(name, True) is not True for name in allowed):
+                raise ValidationError("policy promotion gates are mandatory and must remain true")
+            validated[key] = dict(value)
+        else:
+            raise ValidationError(f"policy config key is not enforced by this factory: {key}")
+    return validated
+
+
+@dataclass(frozen=True)
+class ProjectPolicy:
+    """Every policy document in the project's policy directory, loaded as one decision source."""
+
+    engine: PolicyEngine
+    config: dict[str, Any]
+    documents: tuple[dict[str, Any], ...]
+    digest: str
+    directory: str
+
+    @property
+    def enforced(self) -> bool:
+        return bool(self.documents)
+
+    @property
+    def dirty_worktree(self) -> str:
+        return str(self.config.get("dirtyWorktree", "allow"))
+
+    def authorize(self, context: dict[str, Any]) -> PolicyDecision:
+        if not self.documents:
+            return PolicyDecision(
+                "allow",
+                self.digest,
+                ({"rule": "no-policy-documents", "effect": "allow", "reason": ""},),
+            )
+        return self.engine.evaluate(context)
+
+    @classmethod
+    def load(cls, root: str | Path, project: dict[str, Any]) -> ProjectPolicy:
+        from omf.schema_registry import default_registry
+
+        extensions = project.get("spec", {}).get("extensions", {})
+        directory = str(extensions.get("policyDirectory", "policies"))
+        if not directory or Path(directory).is_absolute() or ".." in Path(directory).parts:
+            raise ValidationError("policyDirectory must be a relative path inside the project")
+        location = Path(root) / directory
+        rules: list[PolicyRule] = []
+        config: dict[str, Any] = {}
+        documents: list[dict[str, Any]] = []
+        namespace = project.get("metadata", {}).get("namespace")
+        if location.is_dir():
+            for path in sorted(item for item in location.iterdir() if item.is_file()):
+                if path.suffix not in _POLICY_SUFFIXES:
+                    continue
+                value = load_document(path.read_bytes())
+                if not isinstance(value, dict):
+                    raise ValidationError(f"policy document must be one object: {path.name}")
+                document = default_registry.validate_as(value, "Policy")
+                if document["metadata"].get("namespace") != namespace:
+                    raise ValidationError(
+                        f"policy namespace does not match the project: {path.name}"
+                    )
+                for index, rule in enumerate(document["spec"]["rules"]):
+                    if (
+                        not isinstance(rule, dict)
+                        or not isinstance(rule.get("name"), str)
+                        or rule.get("effect") not in {"allow", "deny", "warn"}
+                        or not isinstance(rule.get("match", {}), dict)
+                    ):
+                        raise ValidationError(f"policy rule {index} is invalid in {path.name}")
+                    rules.append(
+                        PolicyRule(
+                            str(rule["name"]),
+                            rule["effect"],
+                            dict(rule.get("match", {})),
+                            str(rule.get("reason", "")),
+                        )
+                    )
+                document_config = document["spec"].get("config", {})
+                for key, item in _validate_policy_config(dict(document_config)).items():
+                    if key in config and config[key] != item:
+                        raise ValidationError(f"policy documents disagree on config key: {key}")
+                    config[key] = item
+                documents.append({"path": path.name, "document": document})
+        digest = sha256_digest({"directory": directory, "documents": documents})
+        return cls(PolicyEngine(rules), config, tuple(documents), digest, directory)
 
 
 @dataclass(frozen=True)

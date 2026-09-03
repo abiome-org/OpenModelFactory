@@ -236,7 +236,24 @@ def _local_provider(context: ExecutorContext) -> Executor:
     resources = binding_spec.get("resources", {})
     if not isinstance(resources, dict):
         raise ValidationError("local binding resources must be an object")
-    return LocalExecutor(binding_resources=resources, binding_spec=binding_spec)
+    wheelhouse = context.config.get("dependencyWheelhouse")
+    wheelhouse_path: Path | None = None
+    if wheelhouse is not None:
+        if not isinstance(wheelhouse, str) or not wheelhouse:
+            raise ValidationError("local dependencyWheelhouse must be a non-empty string")
+        wheelhouse_path = Path(wheelhouse)
+        if not wheelhouse_path.is_absolute():
+            wheelhouse_path = context.project_root / wheelhouse_path
+    index = context.config.get("dependencyIndex", True)
+    if not isinstance(index, bool):
+        raise ValidationError("local dependencyIndex must be a boolean")
+    return LocalExecutor(
+        binding_resources=resources,
+        binding_spec=binding_spec,
+        environment_root=context.state_root / "environments",
+        dependency_wheelhouse=wheelhouse_path,
+        dependency_index=index,
+    )
 
 
 def _kubernetes_provider(context: ExecutorContext) -> Executor:
@@ -279,7 +296,27 @@ def default_executor_registry(*, discover: bool = True) -> ExecutorRegistry:
             _local_provider,
             "Run modules as supervised local POSIX process groups.",
             LocalExecutor().capabilities,
-            {"type": "object", "additionalProperties": False},
+            {
+                "type": "object",
+                "properties": {
+                    "dependencyWheelhouse": {
+                        "type": "string",
+                        "minLength": 1,
+                        "description": (
+                            "Directory of wheels used with pip --find-links when a module "
+                            "declares a non-empty dependency lock."
+                        ),
+                    },
+                    "dependencyIndex": {
+                        "type": "boolean",
+                        "description": (
+                            "Whether dependency realization may use pip's configured package "
+                            "index. False installs only from the wheelhouse."
+                        ),
+                    },
+                },
+                "additionalProperties": False,
+            },
         ),
         source="builtin",
     )

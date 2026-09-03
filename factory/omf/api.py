@@ -59,6 +59,7 @@ class SyncRequest(BaseModel):
 class ModuleRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     manifest: str
+    binding: str | None = None
 
 
 class RunRequest(BaseModel):
@@ -533,7 +534,10 @@ def create_app(paths: ProjectPaths, *, executors: ExecutorRegistry | None = None
     def test_module(
         request: ModuleRequest, service: Factory = Depends(authorized)
     ) -> dict[str, Any]:
-        return service.test_module(paths.root / request.manifest)
+        return service.test_module(
+            paths.root / request.manifest,
+            binding_path=paths.root / request.binding if request.binding else None,
+        )
 
     def execute_run_operation(operation_id: str) -> None:
         with Factory(paths, executors=factory.executors) as reader:

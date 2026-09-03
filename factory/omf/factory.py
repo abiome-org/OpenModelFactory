@@ -11,6 +11,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
 from collections.abc import Iterator
@@ -27,8 +28,9 @@ from omf.backups import create_backup
 from omf.canonical import canonical_json, load_document, portable_relative_path, sha256_digest
 from omf.config import ProjectPaths, load_project
 from omf.data import DataService, DatasetSnapshot
-from omf.database import Database, ResourceRepository
+from omf.database import AliasRepository, Database, ResourceRepository
 from omf.errors import (
+    AuthorizationError,
     CapabilityError,
     ConfigurationError,
     ConflictError,
@@ -59,9 +61,10 @@ from omf.modules import (
     validate_contract,
     validate_contract_schema,
     validate_fixtures,
+    worktree_state,
 )
 from omf.operations import OperationStore
-from omf.policy import promotion_gate
+from omf.policy import PolicyDecision, ProjectPolicy, promotion_gate
 from omf.releases import Release, ReleaseBuilder, promote_alias, verify_release
 from omf.schema_registry import default_registry
 from omf.sdk import ProtocolRequest, ProtocolResult
@@ -178,10 +181,124 @@ class Factory:
         self.local_store = FilesystemStore(paths.store)
         self.telemetry = TelemetrySink(paths.telemetry)
         self.executors = executors or default_executor_registry()
+        self._policy_cache: tuple[tuple[tuple[str, int, int], ...], ProjectPolicy] | None = None
         self.agent = AgentControl(self)
 
     def close(self) -> None:
         self.db.close()
+
+    @property
+    def policy(self) -> ProjectPolicy:
+        """The project's policy documents, reloaded whenever a document changes on disk."""
+        extensions = self.project["spec"].get("extensions", {})
+        directory = self.paths.root / str(extensions.get("policyDirectory", "policies"))
+        signature: tuple[tuple[str, int, int], ...] = ()
+        if directory.is_dir():
+            signature = tuple(
+                (item.name, item.stat().st_mtime_ns, item.stat().st_size)
+                for item in sorted(directory.iterdir())
+                if item.is_file()
+            )
+        cached = self._policy_cache
+        if cached is not None and cached[0] == signature:
+            return cached[1]
+        try:
+            policy = ProjectPolicy.load(self.paths.root, self.project)
+        except OMFError as exc:
+            raise ConfigurationError(
+                f"project policy is invalid: {exc.message}",
+                details=exc.details,
+                remediation=[
+                    {
+                        "action": "project.doctor",
+                        "command": "omf doctor",
+                        "description": "Fix the policy documents in the project policy directory.",
+                    }
+                ],
+            ) from exc
+        self._policy_cache = (signature, policy)
+        return policy
+
+    def _authorize(
+        self, action: str, *, purpose: str | None = None, resource: str | None = None
+    ) -> PolicyDecision:
+        """Evaluate the project policy for one named action or raise a recorded denial."""
+        policy = self.policy
+        context: dict[str, Any] = {
+            "actor": self.actor,
+            "action": action,
+            "resource": resource or self.namespace,
+        }
+        if purpose is not None:
+            context["purpose"] = purpose
+        decision = policy.authorize(context)
+        if decision.outcome != "deny":
+            return decision
+        rules = [item["rule"] for item in decision.explanations]
+        self.events.append(
+            type="PolicyDecisionRecorded",
+            source=f"omf://{self.namespace}",
+            subject=action,
+            resource_uid=str(uuid7()),
+            revision=policy.digest,
+            actor=self.actor,
+            data={"outcome": "deny", "action": action, "rules": rules},
+            dataschema="https://schemas.omf.dev/events/policy-decision/v1",
+            policy_digest=policy.digest,
+        )
+        raise AuthorizationError(
+            f"policy denies actor {self.actor!r} action {action!r} on {context['resource']}",
+            details={"policyDigest": policy.digest, "rules": rules},
+            remediation=[
+                {
+                    "action": "project.doctor",
+                    "command": "omf doctor",
+                    "description": (
+                        f"Add an allow rule for this actor to a policy document under "
+                        f"{policy.directory!r}, or act as an authorized actor."
+                    ),
+                }
+            ],
+        )
+
+    def _admission_worktree(self) -> dict[str, Any]:
+        """Apply the dirty-worktree policy and describe the source state a run admits."""
+        state = worktree_state(self.paths.root)
+        mode = self.policy.dirty_worktree
+        record: dict[str, Any] = {
+            "commit": state["commit"],
+            "dirty": state["dirty"],
+            "patchDigest": state["patchDigest"],
+            "untracked": state["untracked"][:64],
+            "untrackedCount": len(state["untracked"]),
+            "policy": mode,
+        }
+        if state["dirty"] and mode == "deny":
+            raise ValidationError(
+                "policy denies workload admission from a dirty worktree; commit the project "
+                "configuration and code first",
+                details={
+                    "commit": state["commit"],
+                    "untrackedCount": len(state["untracked"]),
+                    "patchDigest": state["patchDigest"],
+                },
+            )
+        if state["dirty"] and mode == "archive" and state["patch"]:
+            with tempfile.NamedTemporaryFile(
+                dir=self.paths.packages, suffix=".patch", delete=False
+            ) as temporary:
+                temporary.write(state["patch"])
+                patch_path = Path(temporary.name)
+            try:
+                artifact = ArtifactBuilder(self.local_store).import_path(
+                    patch_path,
+                    logical_kind="worktree-patch",
+                    provenance={"commit": state["commit"]},
+                )
+            finally:
+                patch_path.unlink(missing_ok=True)
+            record["patchArtifact"] = artifact.manifest_digest
+        return record
 
     @contextlib.contextmanager
     def _dataset_rights_locks(self, datasets: list[dict[str, Any]]) -> Iterator[None]:
@@ -282,6 +399,14 @@ class Factory:
             lambda: _utc_now(),
             "configure a trusted UTC time source",
         )
+        check(
+            "policy",
+            lambda: (
+                f"{len(self.policy.documents)} document(s) in {self.policy.directory!r} "
+                f"{self.policy.digest}"
+            ),
+            "fix the policy documents in the project policy directory",
+        )
         failures = sum(item["status"] == "fail" for item in checks)
         return {
             "ready": failures == 0,
@@ -310,6 +435,8 @@ class Factory:
             )
 
     def apply_resource(self, value: dict[str, Any], *, _system: bool = False) -> dict[str, Any]:
+        if not _system:
+            self._authorize("resource.apply")
         metadata = value.get("metadata", {})
         existing = [
             resource
@@ -579,6 +706,7 @@ class Factory:
         )
 
     def revoke_data(self, name: str, *, reason: str) -> dict[str, Any]:
+        self._authorize("data.revoke")
         if not reason.strip():
             raise ValidationError("dataset revocation requires a reason")
         current = self.find_resource("DatasetSnapshot", name)
@@ -651,6 +779,7 @@ class Factory:
         }
         if plan:
             return {"plan": result, "mutates": False}
+        self._authorize("sync.execute", purpose=direction)
         manifest = engine.execute(sync_plan, source_store, destination_store)
         self.events.append(
             type="ArtifactCommitted",
@@ -729,14 +858,27 @@ class Factory:
             package_path.unlink(missing_ok=True)
         return manifest, code_root, package_digest, artifact.manifest_digest
 
-    def test_module(self, manifest_path: str | Path) -> dict[str, Any]:
+    def test_module(
+        self, manifest_path: str | Path, *, binding_path: str | Path | None = None
+    ) -> dict[str, Any]:
         manifest, code_root = load_manifest(manifest_path, self.paths.root)
         validate_fixtures(manifest)
-        resolved = self._resolve_executor(
-            "local",
-            {"kind": "ModuleTest", "manifest": str(Path(manifest_path).resolve())},
-            {},
-        )
+        if binding_path is None:
+            resolved = self._resolve_executor(
+                "local",
+                {"kind": "ModuleTest", "manifest": str(Path(manifest_path).resolve())},
+                {},
+            )
+        else:
+            binding_file = self._project_file(binding_path, kind="binding")
+            binding = load_document(binding_file.read_bytes())
+            if not isinstance(binding, dict):
+                raise ValidationError("binding must be an object")
+            default_registry.validate_as(binding, "Binding")
+            self._validate_namespace(binding)
+            resolved = self._resolve_executor(
+                str(binding["spec"]["executor"]), binding, self._executor_config(binding)
+            )
         self._require_executor(
             resolved,
             MODULE_PROTOCOL_CAPABILITIES
@@ -1035,6 +1177,7 @@ class Factory:
     def create_run_operation(
         self, workload_path: str | Path, binding_path: str | Path
     ) -> dict[str, Any]:
+        self._authorize("workload.run")
         workload = self._project_file(workload_path, kind="workload")
         binding = self._project_file(binding_path, kind="binding")
         workload_raw = load_document(workload.read_bytes())
@@ -1058,6 +1201,7 @@ class Factory:
         self._require_executor(resolved, self._module_requirements(execution_stages))
         self._admit_module_environments(execution_stages, resolved)
         pinned_inputs = self._pin_stage_inputs(stages)
+        pinned_references = self._pin_reference_inputs(stages)
         evaluation_specs = self._pin_named_resources(
             admitted.evaluation_refs, "evaluationspec/", "EvaluationSpec"
         )
@@ -1075,6 +1219,7 @@ class Factory:
             module_path = self._project_file(adapter.module, kind="inference adapter")
             with tempfile.NamedTemporaryFile(dir=self.paths.packages, suffix=".tar") as package:
                 adapter_packages["inference"] = package_module(module_path.parent, package.name)
+        worktree = self._admission_worktree()
         operation_id = str(uuid7())
         return self.operations.create(
             "run",
@@ -1082,6 +1227,8 @@ class Factory:
                 "workload": workload.relative_to(self.paths.root).as_posix(),
                 "binding": binding.relative_to(self.paths.root).as_posix(),
                 "actor": self.actor,
+                "policyDigest": self.policy.digest,
+                "worktree": worktree,
                 "workloadDigest": sha256_digest(workload_raw),
                 "bindingDigest": sha256_digest(binding_raw),
                 "modulePackages": module_packages,
@@ -1091,6 +1238,7 @@ class Factory:
                         reference: self._resource_uri(resource)
                         for reference, resource in pinned_inputs.items()
                     },
+                    "references": pinned_references,
                     "modelPackage": (
                         self._resource_uri(model_package) if model_package is not None else None
                     ),
@@ -1418,6 +1566,9 @@ class Factory:
         executor_name = str(binding_raw["spec"]["executor"])
         stages = admitted.stages
         pinned_inputs = self._pin_stage_inputs(stages, expected_resources["datasets"])
+        pinned_references = self._pin_reference_inputs(
+            stages, expected_resources.get("references", {})
+        )
         if recovering:
             datasets = list(pinned_inputs.values())
             with self._dataset_rights_locks(datasets):
@@ -1575,6 +1726,9 @@ class Factory:
                     reference: self._resource_uri(resource)
                     for reference, resource in pinned_inputs.items()
                 },
+                "reference_revisions": {
+                    reference: str(pinned["uri"]) for reference, pinned in pinned_references.items()
+                },
                 "model_package_ref": (
                     self._resource_uri(model_package) if model_package is not None else None
                 ),
@@ -1602,6 +1756,7 @@ class Factory:
             else:
                 raise IntegrityError(f"run state {state!r} cannot be recovered")
         else:
+            worktree = self._admission_worktree()
             state_store.initialize(spec)
             state_store.transition(RunState.DRAFT, RunState.VALIDATED)
             datasets = list(pinned_inputs.values())
@@ -1629,6 +1784,9 @@ class Factory:
                                 "operationId": operation_id,
                                 "bindingDigest": spec.binding_digest,
                                 "admittedInputs": spec.input_revisions,
+                                "admittedReferences": spec.reference_revisions,
+                                "policyDigest": self.policy.digest,
+                                "worktree": worktree,
                                 "modelPackageRef": spec.model_package_ref,
                                 "evaluationRefs": spec.evaluation_refs,
                                 "mixRef": spec.mix_ref,
@@ -1678,6 +1836,9 @@ class Factory:
                     self._resolve_output_reference(reference, outputs, stages),
                     run_dir / "stages" / stage.name / "inputs" / name,
                     pinned_inputs,
+                    run_id=run_id,
+                    stage_name=stage.name,
+                    pinned_references=pinned_references,
                     allow_existing=recovering,
                 )
                 for name, reference in stage.inputs.items()
@@ -2113,22 +2274,177 @@ class Factory:
         except KeyError as exc:
             raise IntegrityError(f"stage output reference is unavailable: {reference}") from exc
 
+    @staticmethod
+    def _is_reference_input(reference: str) -> bool:
+        return (
+            reference.startswith(("release/", "checkpoint/", "artifact:sha256:"))
+            or re.fullmatch(r"sha256:[0-9a-f]{64}", reference) is not None
+        )
+
+    def _pin_reference_inputs(
+        self,
+        stages: list[Stage],
+        expected: dict[str, dict[str, Any]] | None = None,
+    ) -> dict[str, dict[str, Any]]:
+        """Pin prior releases, checkpoints, and artifacts named as stage inputs.
+
+        Refinement consumes earlier evidence by exact identity: every referenced artifact must
+        exist and verify in the local store before a run identity is allocated, and a queued
+        run must see the same pinned identities at admission.
+        """
+        pinned: dict[str, dict[str, Any]] = {}
+        for stage in stages:
+            for reference in stage.inputs.values():
+                if reference in pinned or not self._is_reference_input(reference):
+                    continue
+                if expected is not None and reference not in expected:
+                    raise IntegrityError("queued reference input was not pinned")
+                pinned[reference] = self._pin_reference(
+                    reference, None if expected is None else expected[reference]
+                )
+        return pinned
+
+    def _pin_reference(self, reference: str, expected: dict[str, Any] | None) -> dict[str, Any]:
+        artifacts: dict[str, str]
+        pinned: dict[str, Any]
+        if reference.startswith(("release/", "checkpoint/")):
+            kind = "Release" if reference.startswith("release/") else "Checkpoint"
+            name = reference.split("/", 1)[1]
+            if not name or "@" in name:
+                raise ValidationError(f"reference input must use {kind.lower()}/<name>")
+            resource = (
+                self._resource_by_uri(kind, str(expected["uri"]))
+                if expected is not None
+                else self.find_resource(kind, name)
+            )
+            if kind == "Release":
+                manifest = resource["spec"].get("extensions", {}).get("manifest", {})
+                model_digest = manifest.get("model", {}).get("digest")
+                state_digest = manifest.get("state", {}).get("digest")
+                if not isinstance(model_digest, str) or not isinstance(state_digest, str):
+                    raise IntegrityError(f"release has no model artifact to consume: {name}")
+                artifacts = {"model": model_digest, "state": state_digest}
+                try:
+                    state_manifest = self.local_store.read_manifest(state_digest)
+                except OMFError as exc:
+                    raise IntegrityError(f"release state artifact is unavailable: {name}") from exc
+                if state_manifest.logical_kind == "checkpoint":
+                    components = state_manifest.provenance.get("components", {})
+                    for role in ("module-state", "protocol-state"):
+                        if isinstance(components.get(role), str):
+                            artifacts[role] = str(components[role])
+                pinned = {
+                    "kind": "release",
+                    "uri": self._resource_uri(resource),
+                    "artifacts": artifacts,
+                    "modelPackageRef": manifest.get("modelPackage", {}).get("ref"),
+                }
+            else:
+                components = resource["spec"].get("components", {})
+                if not isinstance(components, dict) or "module-state" not in components:
+                    raise IntegrityError(f"checkpoint has no module-state component: {name}")
+                artifacts = {"checkpoint": str(resource["spec"]["artifactRef"])}
+                artifacts.update({role: str(digest) for role, digest in components.items()})
+                pinned = {
+                    "kind": "checkpoint",
+                    "uri": self._resource_uri(resource),
+                    "artifacts": artifacts,
+                    "runRef": resource["spec"]["runRef"],
+                }
+        else:
+            digest = reference.removeprefix("artifact:")
+            pinned = {
+                "kind": "artifact",
+                "uri": f"artifact:{digest}",
+                "artifacts": {"payload": digest},
+            }
+        builder = ArtifactBuilder(self.local_store)
+        for digest in pinned["artifacts"].values():
+            try:
+                manifest = self.local_store.read_manifest(str(digest))
+            except OMFError as exc:
+                raise IntegrityError(
+                    f"reference input artifact is unavailable: {reference}"
+                ) from exc
+            if not builder.verify(manifest):
+                raise IntegrityError(f"reference input artifact failed verification: {reference}")
+        if expected is not None and expected != pinned:
+            raise IntegrityError("queued reference input changed before admission")
+        return pinned
+
+    def _materialize_reference(
+        self,
+        pinned: dict[str, Any],
+        target_root: Path,
+        *,
+        allow_existing: bool,
+    ) -> dict[str, Any]:
+        builder = ArtifactBuilder(self.local_store)
+        paths: dict[str, str] = {}
+        for role, digest in sorted(pinned["artifacts"].items()):
+            manifest = self.local_store.read_manifest(str(digest))
+            target = target_root / role
+            target.parent.mkdir(parents=True, exist_ok=True)
+            if target.exists() or target.is_symlink():
+                if not allow_existing:
+                    raise IntegrityError("reference materialization target already exists")
+                if not ArtifactBuilder.verify_restored(manifest, target):
+                    raise IntegrityError("materialized reference differs from admitted artifact")
+            else:
+                builder.restore(manifest, target)
+            payload = target / "payload"
+            paths[role] = str(payload if payload.exists() else target)
+        primary = {"release": "model", "checkpoint": "module-state", "artifact": "payload"}
+        value: dict[str, Any] = {
+            "resource": pinned["uri"],
+            "kind": pinned["kind"],
+            "artifacts": dict(pinned["artifacts"]),
+            "paths": paths,
+            "path": paths[primary[str(pinned["kind"])]],
+        }
+        if "protocol-state" in paths:
+            value["state"] = json.loads(Path(paths["protocol-state"]).read_bytes())
+        for key in ("modelPackageRef", "runRef"):
+            if key in pinned:
+                value[key] = pinned[key]
+        return value
+
     def _resolve_stage_input(
         self,
         value: Any,
         target_root: Path,
         pinned_inputs: dict[str, dict[str, Any]],
         *,
+        run_id: str,
+        stage_name: str,
+        pinned_references: dict[str, dict[str, Any]] | None = None,
         allow_existing: bool = False,
     ) -> Any:
-        if not isinstance(value, str) or not value.startswith("dataset/"):
+        if not isinstance(value, str):
+            return value
+        stage_activity = f"run:{run_id}/stage:{stage_name}"
+        if self._is_reference_input(value):
+            pinned = (pinned_references or {}).get(value)
+            if pinned is None:
+                raise IntegrityError("reference input was not pinned at admission")
+            self.lineage.add(
+                LineageEdge(
+                    str(pinned["uri"]),
+                    stage_activity,
+                    "used",
+                    "entity",
+                    "activity",
+                    run_id=run_id,
+                )
+            )
+            return self._materialize_reference(pinned, target_root, allow_existing=allow_existing)
+        if not value.startswith("dataset/"):
             return value
         try:
             dataset = pinned_inputs[value]
         except KeyError as exc:
             raise IntegrityError("dataset input was not pinned at admission") from exc
         snapshot = self._snapshot_from_resource(dataset)
-        stage_activity = f"run:{target_root.parents[2].name}/stage:{target_root.parent.name}"
         self.lineage.add(
             LineageEdge(
                 self._resource_uri(dataset),
@@ -2136,7 +2452,7 @@ class Factory:
                 "used",
                 "entity",
                 "activity",
-                run_id=target_root.parents[2].name,
+                run_id=run_id,
             )
         )
         if snapshot.mode == "copy" and snapshot.artifact is not None:
@@ -2191,6 +2507,7 @@ class Factory:
             dataschema="https://schemas.omf.dev/events/run-admitted/v1",
             workload_digest=admission["workloadDigest"],
             binding_digest=admission["bindingDigest"],
+            policy_digest=admission.get("policyDigest"),
             dedupe_revision=True,
         )
 
@@ -2494,6 +2811,9 @@ class Factory:
         evaluation_ref: str | None = None,
     ) -> dict[str, Any]:
         """Build a signed complete release and optionally move a policy-gated alias."""
+        self._authorize("release.create")
+        if promote:
+            self._authorize("release.promote")
         run_id = run_id.removeprefix("run/")
         run = self.run_status(run_id)
         status = run["status"]
@@ -2718,13 +3038,21 @@ class Factory:
                         if item.get("effect") == "deny"
                     ]
                     raise IntegrityError(f"promotion denied by gates: {', '.join(denied)}")
+                # Guard the move with the alias version observed inside the rights lock so a
+                # concurrent promotion conflicts instead of being silently overwritten, while a
+                # later release can still take the alias over from an earlier one.
+                try:
+                    _uid, _revision, alias_version = AliasRepository(self.db).get(alias)
+                    current_alias_version: int | None = alias_version
+                except NotFoundError:
+                    current_alias_version = None
                 promote_alias(
                     self.db,
                     self.events,
                     name=alias,
                     uid=metadata["uid"],
                     revision=metadata["revision"],
-                    expected_version=None,
+                    expected_version=current_alias_version,
                     actor=self.actor,
                     policy_decision=final_decision,
                 )
@@ -2923,6 +3251,7 @@ class Factory:
 
     def deploy(self, deployment_path: str | Path) -> dict[str, Any]:
         """Apply a deployment resource through its explicitly selected executor provider."""
+        self._authorize("deployment.apply")
         raw = load_document(Path(deployment_path).read_bytes())
         if not isinstance(raw, dict):
             raise ValidationError("deployment file must contain one resource")
@@ -2947,8 +3276,8 @@ class Factory:
         extension = raw["spec"].get("extensions", {})
         form = extension.get("form", "service")
         command = extension.get("command")
-        if form != "edge" and not command:
-            raise ValidationError("non-edge deployment requires extensions.command argv")
+        if form not in {"edge", "service"} and not command:
+            raise ValidationError(f"{form} deployments require extensions.command argv")
         if command:
             resolved = self._deployment_executor(raw)
             required = DEPLOYMENT_PROTOCOL_CAPABILITIES
@@ -2978,7 +3307,7 @@ class Factory:
         except NotFoundError:
             pass
         resource = self.apply_resource(raw)
-        state, execution_id, run_dir, executor_name = self._launch_deployment(resource)
+        state, execution_id, run_dir, executor_name, endpoint = self._launch_deployment(resource)
         self.resources.set_status(
             resource["metadata"]["uid"],
             {
@@ -2991,6 +3320,7 @@ class Factory:
                 "executionId": execution_id,
                 "executor": executor_name,
                 "runDirectory": str(run_dir) if run_dir else None,
+                "endpoint": endpoint,
             },
             expected_version=expected_version,
         )
@@ -3023,15 +3353,97 @@ class Factory:
             raise ValidationError("deployment extensions.executorConfig must be an object")
         return self._resolve_executor(name, resource, config)
 
+    def _prepare_serving(self, resource: dict[str, Any], run_dir: Path) -> tuple[list[str], str]:
+        """Stage the release's admitted inference adapter and model state for local serving.
+
+        The adapter source is the exact package admitted with the run, its environment must
+        match the admitted environment digest, and the model state is the run result output
+        the model package declared. The worker then answers each request through one
+        ``omf.module/v1`` exchange with that adapter.
+        """
+        extension = resource["spec"].get("extensions", {})
+        release_name = str(resource["spec"]["releaseRef"]).removeprefix("release/")
+        release = self.find_resource("Release", release_name)
+        manifest = release["spec"].get("extensions", {}).get("manifest", {})
+        package_ref = manifest.get("modelPackage", {}).get("ref")
+        adapter_digest = manifest.get("runtime", {}).get("sources", {}).get("inference")
+        run_id = manifest.get("workload", {}).get("runId")
+        if not isinstance(package_ref, str) or not isinstance(adapter_digest, str):
+            raise ValidationError(
+                "a service deployment without a command requires a release built from a model "
+                "package with an admitted inference adapter"
+            )
+        model_package = self._resource_by_uri("ModelPackage", package_ref)
+        adapter = model_package["spec"]["adapters"]["inferenceReference"]
+        signatures = model_package["spec"]["signatures"]
+        run_resource = self._run_resource(str(run_id))
+        run_result = self._run_result(str(run_id), self.run_status(str(run_id))["status"])
+        try:
+            state = run_result["spec"]["outputs"][adapter["stateOutput"]]
+            admission = run_resource["spec"]["extensions"]["inferenceAdapter"]
+            admitted_environment = str(admission["environment"]["digest"])
+        except (KeyError, TypeError) as exc:
+            raise IntegrityError("release run has no admitted inference adapter state") from exc
+        validate_contract(signatures["state"], state, "model package state")
+        source_manifest = self.local_store.read_manifest(adapter_digest)
+        builder = ArtifactBuilder(self.local_store)
+        if not builder.verify(source_manifest):
+            raise IntegrityError("admitted serving adapter source failed verification")
+        run_dir.mkdir(parents=True, exist_ok=True)
+        archive = run_dir / "adapter-archive"
+        builder.restore(source_manifest, archive)
+        code_root = extract_module_package(archive / "payload", run_dir / "adapter")
+        adapter_manifest, code_root = load_manifest(code_root / "module.yaml", code_root)
+        resolved = self._deployment_executor(resource)
+        self._require_executor(
+            resolved,
+            MODULE_PROTOCOL_CAPABILITIES
+            | (
+                frozenset({"isolation:network-deny"})
+                if not adapter_manifest.network
+                else frozenset()
+            ),
+        )
+        environment = self._prepare_module_environment(
+            resolved.executor, adapter_manifest, code_root
+        )
+        if environment["digest"] != admitted_environment:
+            raise IntegrityError("serving adapter environment differs from run admission")
+        host = str(extension.get("host", "127.0.0.1"))
+        port = extension.get("port", 8090)
+        if not isinstance(port, int) or isinstance(port, bool) or not 1 <= port <= 65535:
+            raise ValidationError("deployment extensions.port must be an integer port number")
+        timeout = extension.get("requestTimeoutSeconds", 60)
+        if not isinstance(timeout, (int, float)) or isinstance(timeout, bool) or timeout <= 0:
+            raise ValidationError("deployment extensions.requestTimeoutSeconds must be positive")
+        serving = {
+            "deployment": resource["metadata"]["name"],
+            "release": release["metadata"]["revision"],
+            "modelPackageRef": package_ref,
+            "operation": adapter["operation"],
+            "method": "predict",
+            "config": adapter.get("config", {}),
+            "state": state,
+            "signatures": {"input": signatures["input"], "output": signatures["output"]},
+            "command": [str(item) for item in environment["command"]],
+            "wrapper": [str(item) for item in environment.get("wrapper", [])],
+            "cwd": str(code_root),
+            "host": host,
+            "port": port,
+            "timeoutSeconds": float(timeout),
+        }
+        config_path = run_dir / "serving.json"
+        config_path.write_bytes(canonical_json(serving))
+        return (
+            [sys.executable, "-m", "omf.serve_worker", "--config", str(config_path)],
+            f"http://{host}:{port}",
+        )
+
     def _launch_deployment(
         self, resource: dict[str, Any], *, instance: str | None = None
-    ) -> tuple[str, str | None, Path | None, str | None]:
+    ) -> tuple[str, str | None, Path | None, str | None, str | None]:
         extension = resource["spec"].get("extensions", {})
         command = extension.get("command")
-        if not command:
-            return "packaged", None, None, None
-        if not isinstance(command, list) or not all(isinstance(item, str) for item in command):
-            raise ValidationError("deployment command must be an argv string array")
         run_dir = (
             self.paths.runs
             / "deployments"
@@ -3040,6 +3452,13 @@ class Factory:
         )
         if instance:
             run_dir /= instance
+        endpoint: str | None = None
+        if not command and extension.get("form", "service") == "service":
+            command, endpoint = self._prepare_serving(resource, run_dir)
+        if not command:
+            return "packaged", None, None, None, None
+        if not isinstance(command, list) or not all(isinstance(item, str) for item in command):
+            raise ValidationError("deployment command must be an argv string array")
         resolved = self._deployment_executor(resource)
         required = DEPLOYMENT_PROTOCOL_CAPABILITIES
         if bool(extension.get("denyNetwork", False)):
@@ -3055,7 +3474,7 @@ class Factory:
             requires_result=False,
             **resolved.config,
         )
-        return "running", resolved.executor.submit(plan), run_dir, resolved.provider.name
+        return "running", resolved.executor.submit(plan), run_dir, resolved.provider.name, endpoint
 
     def deployment_status(self, name: str) -> dict[str, Any]:
         resource = self.find_resource("DeploymentSpec", name)
@@ -3089,6 +3508,7 @@ class Factory:
         return {"deployment": resource, "status": status, "statusVersion": version}
 
     def cancel_deployment(self, name: str) -> dict[str, Any]:
+        self._authorize("deployment.cancel")
         current = self.deployment_status(name)
         resource = current["deployment"]
         status = current["status"]
@@ -3124,6 +3544,7 @@ class Factory:
         return {"deployment": resource, "status": updated, "statusVersion": new_version}
 
     def rollback_deployment(self, name: str, *, expected_version: int) -> dict[str, Any]:
+        self._authorize("deployment.rollback")
         current = self.deployment_status(name)
         if int(current["statusVersion"]) != expected_version:
             raise ConflictError("deployment status version mismatch")
@@ -3138,7 +3559,7 @@ class Factory:
         target = self.resources.get(resource["metadata"]["uid"], str(previous))
         release_name = str(target["spec"]["releaseRef"]).removeprefix("release/")
         release = self.find_resource("Release", release_name)
-        state, execution_id, run_dir, executor_name = self._launch_deployment(
+        state, execution_id, run_dir, executor_name, endpoint = self._launch_deployment(
             target, instance=f"rollback-{expected_version + 1}"
         )
         updated = {
@@ -3149,6 +3570,7 @@ class Factory:
             "executionId": execution_id,
             "executor": executor_name,
             "runDirectory": str(run_dir) if run_dir else None,
+            "endpoint": endpoint,
             "reason": "rollback",
         }
         new_version = self.resources.set_status(

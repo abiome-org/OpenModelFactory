@@ -96,14 +96,30 @@ capabilities:
 | `transport:artifacts` | Retrieve declared artifacts into the stage run directory |
 
 Execution-environment claims are separate capabilities. The local provider
-accepts only a zero-byte dependency lock and records the selected executable digest. Its
-worker rechecks that pathname immediately before process creation and advertises
-this honestly as `environment:executable-drift-detection`, not byte-sealed
-attestation: trusted host administration could still replace the executable in
-the final check/exec interval. Non-empty dependency locks fail admission until a
-provider with a compatible resolver is installed. Slurm and Kubernetes advertise
-no environment realization in their built-in forms. None of these built-ins claim
-a content-addressed runtime closure or bitwise environment reproducibility.
+launches the interpreter through the path the module named, keeping a virtual
+environment's symlink intact so its site-packages remain visible, and records
+the digest of the resolved executable. Its worker rechecks that pathname
+immediately before process creation and advertises this honestly as
+`environment:executable-drift-detection`, not byte-sealed attestation: trusted
+host administration could still replace the executable in the final check/exec
+interval.
+
+A module with a non-empty dependency lock is realized by the local provider
+(`environment:dependency-lock-realization`) into a cached virtual environment
+under `.omf/environments/`, keyed by the lock digest, the interpreter digest,
+and the realization options. The lock must name a Python interpreter entry
+point and must pin every distribution with a hash; pip installs it with
+`--require-hashes --only-binary=:all:`. After installation the environment
+inherits the site directories of the interpreter the module named, so
+`omf.sdk` and the project's toolchain stay importable while the lock always
+shadows them. The recorded environment descriptor lists every distribution the
+module can import, inherited layers included. Set
+`spec.config.executor.dependencyWheelhouse` to install from a local wheel
+directory and `dependencyIndex: false` to forbid index access; otherwise pip's
+own configuration, including `PIP_*` variables, applies. Slurm and Kubernetes
+advertise no environment realization in their built-in forms. None of these
+built-ins claim a content-addressed runtime closure or bitwise environment
+reproducibility.
 
 The controller writes `request.json` and passes local `run_dir`, admitted-source
 `cwd`, argv, limits, timeout, and network policy to `Executor.plan`. A remote
@@ -128,7 +144,7 @@ adapter must actually provide the isolation boundary.
 
 | Provider | What is implemented | Complete workload status |
 | --- | --- | --- |
-| `local` | POSIX process groups, limits, timeout, durable status/logs, local protocol/artifact transport, and executable drift detection | Ready only for zero-byte dependency locks when host preflight and requested network isolation pass |
+| `local` | POSIX process groups, limits, timeout, durable status/logs, local protocol/artifact transport, executable drift detection, and hash-pinned dependency lock realization into cached virtual environments | Ready when host preflight, requested network isolation, and any lock installation pass |
 | `slurm` | `sbatch`/`sacct`/`scancel`, deterministic scripts, request/result environment, shared-filesystem transport | Scheduler-lifecycle-only for modules because the built-in adapter cannot attest environments or enforce network denial |
 | `kubernetes` | Immutable-image Job/JobSet plans and scheduler lifecycle | Not workload-ready: source, request/result, and artifact transport are intentionally absent |
 

@@ -27,7 +27,7 @@ _MANIFEST = "manifest.json"
 _REQUIRED = {"metadata.db", "identity/signing.key", "identity/secrets.key"}
 _STORE_PREFIXES = ("store/blobs/", "store/manifests/")
 _MAX_MANIFEST_BYTES = 16 * 1024 * 1024
-_RUNTIME_DIRECTORIES = ("runs", "packages", "operations", "telemetry")
+_RUNTIME_DIRECTORIES = ("runs", "packages", "operations", "telemetry", "environments")
 
 
 def _digest_file(path: Path) -> tuple[str, int]:

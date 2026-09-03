@@ -404,10 +404,17 @@ def module_validate(path: Path | None = typer.Argument(None)) -> None:
 
 
 @module_app.command("test")
-def module_test(path: Path | None = typer.Argument(None)) -> None:
+def module_test(
+    path: Path | None = typer.Argument(None),
+    binding: Path | None = typer.Option(
+        None,
+        "--binding",
+        help="Binding whose executor and dependency options run the fixtures (default: local).",
+    ),
+) -> None:
     def run() -> list[dict[str, Any]]:
         with _factory() as factory:
-            return [factory.test_module(item) for item in _module_paths(path)]
+            return [factory.test_module(item, binding_path=binding) for item in _module_paths(path)]
 
     _handle(run)
 

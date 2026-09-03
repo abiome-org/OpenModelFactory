@@ -49,6 +49,25 @@ omf --actor research-agent --output json goal create improve-quality \
 Replace the scaffold's `local-user` owner and policy actor before shared use.
 Do not invent a human identity or reuse one actor for independent approval.
 
+## Policy documents are enforced
+
+Every `Policy` document in the project's policy directory (`policies/` by
+default) is loaded, validated, and applied. Its rules authorize the named
+actor for mutating actions such as `workload.run`, `sync.execute`,
+`release.create`, `release.promote`, `deployment.apply`, and `data.revoke`; a
+project with policy documents denies any actor no rule allows and records the
+denial as a signed `PolicyDecisionRecorded` event. A project without policy
+documents allows every actor, and `omf doctor` reports which case applies.
+
+The `dirtyWorktree` setting governs admission. With `deny`, a workload is
+admitted only from a committed tree with no uncommitted or untracked files
+under the project. With `archive`, a dirty tree is admitted and the patch is
+stored as a `worktree-patch` artifact referenced by the run. With `allow`, the
+state is recorded without archiving. The run records the commit, whether the
+tree was dirty, and the policy digest that governed admission. A configuration
+key the factory cannot enforce is rejected when the policy loads rather than
+silently ignored.
+
 ## Repository boundaries
 
 | Content | Owner |

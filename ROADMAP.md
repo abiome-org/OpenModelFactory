@@ -44,9 +44,10 @@ Federation, additional stores, modalities, frameworks, and measured scale follow
 the same rule.
 
 Sampler replay remains explicitly unclaimed until sampler state is observed and
-bound into atomic checkpoints. The local executor continues to reject non-empty
-dependency locks; its runtime inventory detects drift but does not recreate an
-environment. Offline candidate installation is tested, but full air-gap and
+bound into atomic checkpoints. The local executor realizes hash-pinned binary
+dependency locks into cached virtual environments layered over the module's
+interpreter; it does not build source distributions or claim a closed runtime.
+Offline candidate installation is tested, but full air-gap and
 production-scale claims require direct deployment-specific evidence.
 
 Change this roadmap when product evidence changes. Prefer deleting completed or

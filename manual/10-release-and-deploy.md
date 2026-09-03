@@ -52,6 +52,40 @@ For rollback, first read the exact current `statusVersion`, then use it as the
 compare-and-set guard. Refresh status after a stale-version response rather than
 retrying blindly.
 
+## Serve a release locally
+
+A `service` deployment that names no `command` serves the release through the
+model package's inference adapter. OMF restores the adapter source admitted
+with the release's run, checks that its environment digest matches the
+admitted one, loads the model state the package declared, and starts a local
+HTTP worker on `extensions.host` and `extensions.port` (default
+`127.0.0.1:8090`). The deployment status reports the `endpoint`.
+
+```yaml
+apiVersion: omf.dev/v1alpha1
+kind: DeploymentSpec
+metadata:
+  name: affine-service
+  namespace: local/my-factory
+spec:
+  releaseRef: release/affine-v1
+  runtime: omf.module/v1
+  routing: {}
+  extensions:
+    form: service
+    port: 8090
+    requestTimeoutSeconds: 60
+```
+
+`GET /healthz` reports the release revision, model package, and request
+counters. `POST /v1/infer` with `{"inputs": {...}}` validates the inputs
+against the package input signature, runs one `omf.module/v1` exchange with the
+adapter and the release state, validates the outputs against the output
+signature, and returns them with the release revision. The adapter runs with
+network denial when the executor can enforce it; the worker owns the endpoint.
+Error responses carry codes and request identifiers, never request values. A
+`batch`, `actor`, or `control` deployment still requires an explicit command.
+
 Deployment success does not establish security, availability, latency, or
 scale. Test those properties under the applicable site controls before treating
 them as supported.

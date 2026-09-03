@@ -1,11 +1,57 @@
 import io
 import shutil
+import subprocess
 import tarfile
 
 import pytest
 import yaml
-from omf.errors import ValidationError
-from omf.modules import extract_module_package, load_manifest, package_module
+from omf.errors import ConfigurationError, ValidationError
+from omf.modules import (
+    extract_module_package,
+    git_source,
+    load_manifest,
+    package_module,
+    worktree_state,
+)
+
+
+def test_worktree_state_tracks_commits_patches_and_untracked_files(tmp_path):
+    root = tmp_path / "repo"
+    root.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+    subprocess.run(["git", "config", "user.name", "t"], cwd=root, check=True)
+    subprocess.run(["git", "config", "user.email", "t@t"], cwd=root, check=True)
+    (root / "a.txt").write_text("a\n")
+
+    uncommitted = worktree_state(root)
+    assert uncommitted["commit"] is None
+    assert uncommitted["dirty"]
+    assert uncommitted["untracked"] == ["a.txt"]
+
+    subprocess.run(["git", "add", "."], cwd=root, check=True)
+    subprocess.run(["git", "commit", "-qm", "initial"], cwd=root, check=True)
+    clean = worktree_state(root)
+    assert clean["commit"]
+    assert not clean["dirty"]
+    assert clean["patch"] == b""
+    assert git_source(root)["commit"] == clean["commit"]
+
+    (root / "a.txt").write_text("b\n")
+    patched = worktree_state(root)
+    assert patched["dirty"]
+    assert patched["patch"]
+    assert patched["patchDigest"] != clean["patchDigest"]
+    with pytest.raises(ValidationError, match="allow_dirty"):
+        git_source(root)
+
+    subprocess.run(["git", "checkout", "--", "a.txt"], cwd=root, check=True)
+    (root / "new.txt").write_text("n\n")
+    assert git_source(root, allow_dirty=True)["untracked"] == ["new.txt"]
+
+    outside = tmp_path / "not-a-repo"
+    outside.mkdir()
+    with pytest.raises(ConfigurationError, match="Git working tree"):
+        worktree_state(outside)
 
 
 def test_reproducible_package_and_links_rejected(tmp_path):

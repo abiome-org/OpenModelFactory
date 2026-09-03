@@ -1,5 +1,38 @@
 # Changelog
 
+## Unreleased
+
+- Both GitHub Actions workflows were invalid YAML: the unquoted
+  `--only-binary=:all: --require-hashes` argument was parsed as a mapping, so
+  every run failed before any job started. The lines are quoted and both
+  workflows accept manual dispatch.
+- The local executor launches a module interpreter through the path it named
+  instead of the resolved symlink target, so modules run inside the project's
+  virtual environment again. Projects created by `install.sh` were affected.
+- The local executor realizes non-empty, hash-pinned dependency locks into
+  cached virtual environments under `.omf/environments/`, with optional
+  `dependencyWheelhouse` and `dependencyIndex` binding options.
+- `omf module test` accepts `--binding` so fixtures run with the same executor
+  and dependency options as the workload.
+- Promoting a later release to an alias that already points at an earlier
+  release now moves the alias under the current alias version instead of
+  conflicting unconditionally.
+- Policy documents in the project policy directory are loaded and enforced:
+  rules authorize the acting identity for mutating actions, `dirtyWorktree`
+  governs whether an uncommitted tree can admit a workload, and admission
+  records the commit, worktree state, and policy digest. Unenforceable policy
+  configuration is rejected at load time. Previously the scaffold policy was
+  never read.
+- A `service` deployment without a command now serves the release: the
+  admitted inference adapter and model state are staged into the deployment
+  directory and a local HTTP worker answers `POST /v1/infer` through the module
+  protocol, with `GET /healthz` and an `endpoint` in the deployment status.
+- Workload stage inputs may name `release/<name>`, `checkpoint/<name>`, or an
+  artifact digest. The referenced artifacts are pinned and verified before a
+  run is allocated, restored into the stage input directory with their
+  protocol state, and linked to the consuming stage in lineage, so a
+  refinement run derives from the release it started from.
+
 ## 1.0.0 — 2026-09-03
 
 Open Model Factory 1.0 establishes the repository-centered model-development

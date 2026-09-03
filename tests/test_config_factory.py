@@ -2,21 +2,28 @@ import fcntl
 import hashlib
 import importlib.metadata
 import json
+import os
 import shutil
+import socket
 import subprocess
 import threading
 import time
+import venv
 from copy import deepcopy
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 
+import httpx
 import pytest
 import yaml
 from omf.artifacts import ArtifactBuilder
 from omf.config import ProjectPaths, bootstrap
 from omf.database import AliasRepository
 from omf.errors import (
+    AuthorizationError,
     CapabilityError,
+    ConfigurationError,
     ConflictError,
     IntegrityError,
     NotFoundError,
@@ -34,6 +41,7 @@ from omf.executors import (
 )
 from omf.factory import Factory, _execution_plan_digest
 from omf.modules import load_manifest
+from omf.releases import promote_alias
 from omf.sdk import ProtocolRequest
 from omf.workloads import project_workload
 
@@ -691,6 +699,504 @@ def test_module_manifest_revision_changes_admitted_source_identity(tmp_path):
         second = factory.validate_module(manifest_path)
 
     assert first["artifactManifest"] != second["artifactManifest"]
+
+
+def test_module_test_executes_inside_symlink_virtual_environment(tmp_path, monkeypatch):
+    paths = _project(tmp_path)
+    bootstrap(paths)
+    environment_path = tmp_path / "venv"
+    venv.EnvBuilder(symlinks=True, with_pip=False, system_site_packages=True).create(
+        environment_path
+    )
+    python = environment_path / "bin" / "python3"
+    if not python.is_symlink():
+        pytest.skip("this platform does not create symlink interpreters")
+    module_dir = paths.root / "modules/examples/statistical"
+    # The protocol is language neutral, so the fixture needs no omf import to prove which
+    # interpreter environment actually ran it.
+    (module_dir / "main.py").write_text(
+        "import json, os, sys\n"
+        f"EXPECTED = {str(environment_path)!r}\n"
+        "if sys.prefix != EXPECTED:\n"
+        "    raise SystemExit(f'wrong interpreter environment: {sys.prefix}')\n"
+        "with open(os.environ['OMF_RESULT_FILE'], 'w') as stream:\n"
+        "    json.dump({'protocol': 'omf.module/v1', 'status': 'ok'}, stream)\n"
+    )
+    monkeypatch.setenv("PATH", f"{environment_path / 'bin'}{os.pathsep}{os.environ['PATH']}")
+
+    with Factory(paths) as factory:
+        report = factory.test_module(module_dir / "module.yaml")
+
+    assert report["passed"] == 1
+
+
+def test_run_realizes_module_dependency_lock_from_binding_wheelhouse(tmp_path):
+    from _wheels import build_wheel, lock_for
+
+    paths = _project(tmp_path)
+    bootstrap(paths)
+    wheelhouse = paths.root / "wheels"
+    _wheel, wheel_digest = build_wheel(wheelhouse)
+    lock = lock_for("omftiny", "1.0", wheel_digest)
+    module_dir = paths.root / "modules/locked"
+    shutil.copytree(paths.root / "modules/examples/statistical", module_dir)
+    (module_dir / "requirements.lock").write_bytes(lock)
+    manifest = yaml.safe_load((module_dir / "module.yaml").read_text())
+    manifest["metadata"]["name"] = "locked"
+    manifest["spec"]["environment"]["dependencyDigest"] = (
+        "sha256:" + hashlib.sha256(lock).hexdigest()
+    )
+    manifest["spec"]["provenance"]["sourceRef"] = "repository:modules/locked"
+    (module_dir / "module.yaml").write_text(yaml.safe_dump(manifest))
+    (module_dir / "main.py").write_text(
+        "import omftiny\n"
+        "from omf.sdk import ProtocolResult, main\n"
+        "def validate(_request):\n"
+        "    return ProtocolResult(status='ok')\n"
+        "def run(_request):\n"
+        "    return ProtocolResult(status='ok', outputs={'omftiny': omftiny.VERSION})\n"
+        "if __name__ == '__main__':\n"
+        "    raise SystemExit(main({'validate': validate, 'run': run}))\n"
+    )
+    binding = yaml.safe_load((paths.root / "bindings/local.yaml").read_text())
+    binding["spec"]["config"]["executor"] = {
+        "dependencyWheelhouse": "wheels",
+        "dependencyIndex": False,
+    }
+    binding_path = paths.root / "bindings/wheelhouse.yaml"
+    binding_path.write_text(yaml.safe_dump(binding))
+    workload_path = paths.root / "workloads/locked.yaml"
+    workload_path.write_text(
+        yaml.safe_dump(
+            {
+                "apiVersion": "omf.dev/v1alpha1",
+                "kind": "WorkloadSpec",
+                "metadata": {"name": "locked", "namespace": "local/test-project"},
+                "spec": {
+                    "parameters": {},
+                    "reproducibility": "lineage",
+                    "graph": {
+                        "stages": [
+                            {
+                                "name": "train",
+                                "module": "modules/locked/module.yaml",
+                                "operation": "run",
+                                "outputs": ["omftiny"],
+                            }
+                        ]
+                    },
+                },
+            }
+        )
+    )
+
+    with Factory(paths) as factory:
+        tested = factory.test_module(module_dir / "module.yaml", binding_path=binding_path)
+        result = factory.run(workload_path, binding_path)
+        admission = factory._run_resource(result["runId"])["spec"]["extensions"]
+
+    assert tested["passed"] == 1
+    assert result["state"] == "Succeeded"
+    assert result["outputs"]["train.omftiny"] == "1.0"
+    realization = admission["environments"]["train"]["realization"]
+    assert realization["strategy"] == "venv"
+    assert realization["options"] == {"index": False, "wheelhouse": str(wheelhouse)}
+    assert len(list(paths.environments.glob("*/omf-environment.json"))) == 1
+
+
+def _scan_for(paths: ProjectPaths, factory: Factory, run: dict) -> Path:
+    admission = factory._run_resource(run["runId"])["spec"]["extensions"]
+    subjects = [run["outputs"]["train.model"], *admission["moduleDigests"].values()]
+    if admission.get("inferenceAdapter"):
+        subjects.append(admission["inferenceAdapter"]["sourceDigest"])
+    scan_path = paths.root / f"scan-{run['runId']}.yaml"
+    scan_path.write_text(
+        yaml.safe_dump(
+            {
+                "scanner": {"name": "test-scanner", "version": "1"},
+                "databaseRevision": "test-db-1",
+                "generatedAt": "2026-09-01T00:00:00Z",
+                "subjects": subjects,
+                "findings": [],
+                "waivers": [],
+            }
+        )
+    )
+    return scan_path
+
+
+def test_alias_promotion_moves_between_releases(tmp_path):
+    paths = _project(tmp_path)
+    bootstrap(paths)
+    with Factory(paths) as factory:
+        factory.add_data(
+            paths.root / "data/numbers.jsonl",
+            name="example-numbers",
+            mode="copy",
+            rights={"license": "CC0-1.0", "trainingAllowed": True},
+        )
+        run = factory.run(
+            paths.root / "workloads/example-statistical.yaml", paths.root / "bindings/local.yaml"
+        )
+        factory.evaluate(f"run/{run['runId']}")
+        scan_path = _scan_for(paths, factory, run)
+        first = factory.create_release(
+            run["runId"],
+            name="release-one",
+            intended_use="test",
+            promote=True,
+            approvals=["independent-reviewer"],
+            vulnerability_report=scan_path,
+        )
+        aliases = AliasRepository(factory.db)
+        assert aliases.get("candidate") == (
+            first["metadata"]["uid"],
+            first["metadata"]["revision"],
+            1,
+        )
+        second = factory.create_release(
+            run["runId"],
+            name="release-two",
+            intended_use="test",
+            promote=True,
+            approvals=["independent-reviewer"],
+            vulnerability_report=scan_path,
+        )
+        assert aliases.get("candidate") == (
+            second["metadata"]["uid"],
+            second["metadata"]["revision"],
+            2,
+        )
+        with pytest.raises(ConflictError, match="alias version mismatch"):
+            promote_alias(
+                factory.db,
+                factory.events,
+                name="candidate",
+                uid=first["metadata"]["uid"],
+                revision=first["metadata"]["revision"],
+                expected_version=1,
+                actor="tester",
+                policy_decision=SimpleNamespace(outcome="allow", policy_digest="sha256:policy"),
+            )
+        assert aliases.get("candidate")[2] == 2
+        moved = list(factory.events.query(type="AliasMoved"))
+        assert [event.data["version"] for event in moved] == [1, 2]
+
+
+def _committed_policy_project(tmp_path: Path, *, dirty_worktree: str = "deny") -> ProjectPaths:
+    paths = _project(tmp_path)
+    (paths.root / ".gitignore").write_text(".omf/\n")
+    (paths.root / "policies").mkdir()
+    policy = yaml.safe_load(Path("policies/default.yaml").read_text())
+    policy["metadata"]["namespace"] = "local/test-project"
+    policy["spec"]["rules"][0]["match"]["resource"] = "local/test-project"
+    policy["spec"]["config"]["dirtyWorktree"] = dirty_worktree
+    (paths.root / "policies/default.yaml").write_text(yaml.safe_dump(policy))
+    for command in (
+        ["git", "config", "user.name", "t"],
+        ["git", "config", "user.email", "t@t"],
+        ["git", "add", "."],
+        ["git", "commit", "-qm", "Commit the project"],
+    ):
+        subprocess.run(command, cwd=paths.root, check=True)
+    bootstrap(paths)
+    return paths
+
+
+def test_policy_directory_governs_admission_actors_and_worktree(tmp_path):
+    paths = _committed_policy_project(tmp_path)
+    workload = paths.root / "workloads/example-statistical.yaml"
+    binding = paths.root / "bindings/local.yaml"
+    rights = {"license": "CC0-1.0", "trainingAllowed": True}
+    with Factory(paths) as factory:
+        checks = {item["name"]: item for item in factory.doctor()["checks"]}
+        assert checks["policy"]["status"] == "pass"
+        assert factory.policy.enforced
+        factory.add_data(
+            paths.root / "data/numbers.jsonl", name="example-numbers", mode="copy", rights=rights
+        )
+        run = factory.run(workload, binding)
+        admission = factory._run_resource(run["runId"])["spec"]["extensions"]
+        assert admission["policyDigest"] == factory.policy.digest
+        assert admission["worktree"]["dirty"] is False
+        assert admission["worktree"]["commit"]
+        assert admission["worktree"]["policy"] == "deny"
+        admitted = next(iter(factory.events.query(run_id=run["runId"], type="RunAdmitted")))
+        assert admitted.policy_digest == factory.policy.digest
+        assert factory.operations.get(run["operationId"])["request"]["worktree"]["dirty"] is False
+
+        (paths.root / "scratch.txt").write_text("uncommitted\n")
+        with pytest.raises(ValidationError, match="dirty worktree"):
+            factory.run(workload, binding)
+        assert len(factory.operations.list()) == 1
+
+        policy_path = paths.root / "policies/default.yaml"
+        policy = yaml.safe_load(policy_path.read_text())
+        policy["spec"]["config"]["dirtyWorktree"] = "archive"
+        policy_path.write_text(yaml.safe_dump(policy))
+        assert factory.policy.dirty_worktree == "archive"
+        archived = factory.run(workload, binding)
+        worktree = factory._run_resource(archived["runId"])["spec"]["extensions"]["worktree"]
+        assert worktree["dirty"] is True
+        assert worktree["policy"] == "archive"
+        assert "scratch.txt" in worktree["untracked"]
+        assert worktree["untrackedCount"] == 1
+        patch = factory.local_store.read_manifest(worktree["patchArtifact"])
+        assert patch.logical_kind == "worktree-patch"
+        assert patch.provenance["commit"] == worktree["commit"]
+
+        policy["spec"]["config"]["retention"] = {"days": 1}
+        policy_path.write_text(yaml.safe_dump(policy))
+        with pytest.raises(ConfigurationError, match="not enforced"):
+            factory.run(workload, binding)
+        checks = {item["name"]: item for item in factory.doctor()["checks"]}
+        assert checks["policy"]["status"] == "fail"
+        del policy["spec"]["config"]["retention"]
+        policy_path.write_text(yaml.safe_dump(policy))
+
+    with Factory(paths, actor="stranger") as stranger:
+        with pytest.raises(AuthorizationError, match="policy denies actor 'stranger'"):
+            stranger.run(workload, binding)
+        with pytest.raises(AuthorizationError):
+            stranger.add_data(
+                paths.root / "data/numbers.jsonl", name="more", mode="copy", rights=rights
+            )
+        with pytest.raises(AuthorizationError):
+            stranger.revoke_data("example-numbers", reason="not allowed")
+        denials = list(stranger.events.query(type="PolicyDecisionRecorded"))
+        assert denials
+        assert denials[-1].data["outcome"] == "deny"
+        assert denials[-1].actor == "stranger"
+        assert stranger.find_resource("DatasetSnapshot", "example-numbers")["spec"]["rights"][
+            "trainingAllowed"
+        ]
+
+
+def _affine_project(tmp_path: Path) -> tuple[ProjectPaths, Path]:
+    paths = _project(tmp_path)
+    workload_path = paths.root / "workloads/example-from-scratch.yaml"
+    workload = yaml.safe_load(workload_path.read_text())
+    workload["metadata"]["namespace"] = "local/test-project"
+    workload_path.write_text(yaml.safe_dump(workload))
+    bootstrap(paths)
+    with Factory(paths) as factory:
+        for source in (
+            "model-packages/example-affine.yaml",
+            "evaluations/example-affine.yaml",
+            "mixes/example-affine.yaml",
+        ):
+            resource = yaml.safe_load(Path(source).read_text())
+            resource["metadata"]["namespace"] = "local/test-project"
+            factory.apply_resource(resource)
+        factory.add_data(
+            Path("data/fixtures/affine.jsonl").resolve(),
+            name="example-affine",
+            mode="copy",
+            rights={"license": "CC0-1.0", "trainingAllowed": True},
+        )
+    return paths, workload_path
+
+
+def _free_port() -> int:
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        return int(sock.getsockname()[1])
+
+
+def test_service_deployment_serves_release_through_admitted_adapter(tmp_path):
+    paths, workload_path = _affine_project(tmp_path)
+    port = _free_port()
+    with Factory(paths) as factory:
+        run = factory.run(workload_path, paths.root / "bindings/local.yaml")
+        factory.evaluate(f"run/{run['runId']}")
+        release = factory.create_release(
+            run["runId"],
+            name="affine-v1",
+            intended_use="test",
+            promote=True,
+            approvals=["independent-reviewer"],
+            vulnerability_report=_scan_for(paths, factory, run),
+        )
+        # Serving must come from the admitted adapter source, never the live checkout.
+        (paths.root / "modules/examples/affine-serving/main.py").write_text(
+            "raise RuntimeError('live serving source must not execute')\n"
+        )
+        deployment_path = paths.root / "service.yaml"
+        deployment_path.write_text(
+            yaml.safe_dump(
+                {
+                    "apiVersion": "omf.dev/v1alpha1",
+                    "kind": "DeploymentSpec",
+                    "metadata": {"name": "affine-service", "namespace": "local/test-project"},
+                    "spec": {
+                        "releaseRef": "release/affine-v1",
+                        "runtime": "omf.module/v1",
+                        "routing": {},
+                        "extensions": {"form": "service", "port": port},
+                    },
+                }
+            )
+        )
+        applied = factory.deploy(deployment_path)
+        assert applied["state"] == "running"
+        status = factory.deployment_status("affine-service")["status"]
+        assert status["endpoint"] == f"http://127.0.0.1:{port}"
+        serving = json.loads((Path(status["runDirectory"]) / "serving.json").read_text())
+        assert serving["state"]["format"] == "json-affine/v1"
+        assert (
+            serving["modelPackageRef"]
+            == (release["spec"]["extensions"]["manifest"]["modelPackage"]["ref"])
+        )
+        assert serving["cwd"].startswith(status["runDirectory"])
+
+        with httpx.Client(base_url=status["endpoint"], timeout=5.0) as client:
+            health = None
+            for _ in range(300):
+                try:
+                    health = client.get("/healthz")
+                    if health.status_code == 200:
+                        break
+                except httpx.HTTPError:
+                    pass
+                assert factory.deployment_status("affine-service")["status"]["state"] == "running"
+                time.sleep(0.1)
+            assert health is not None, "endpoint never became healthy"
+            assert health.status_code == 200, "endpoint never became healthy"
+            assert health.json()["release"] == release["metadata"]["revision"]
+            inference = client.post("/v1/infer", json={"inputs": {"input": 3.0}})
+            assert inference.status_code == 200, inference.text
+            body = inference.json()
+            assert body["outputs"]["prediction"] == pytest.approx(7.0, abs=0.01)
+            assert body["release"] == release["metadata"]["revision"]
+            invalid = client.post("/v1/infer", json={"inputs": {"input": "three"}})
+            assert invalid.status_code == 400
+            assert "three" not in invalid.text
+            unknown = client.post("/v1/infer", json={"inputs": {"input": 1.0, "extra": 2}})
+            assert unknown.status_code == 400
+            assert client.get("/healthz").json()["requests"] == 1
+
+        canceled = factory.cancel_deployment("affine-service")
+        assert canceled["status"]["state"] == "canceled"
+
+        deployment_path.write_text(
+            deployment_path.read_text().replace("form: service", "form: batch")
+        )
+        with pytest.raises(ValidationError, match=r"require extensions\.command"):
+            factory.deploy(deployment_path)
+
+
+def test_reference_inputs_pin_prior_release_checkpoint_and_artifact(tmp_path):
+    paths, workload_path = _affine_project(tmp_path)
+    probe = paths.root / "modules/probe"
+    shutil.copytree(paths.root / "modules/examples/statistical", probe)
+    manifest = yaml.safe_load((probe / "module.yaml").read_text())
+    manifest["metadata"]["name"] = "probe"
+    manifest["spec"]["provenance"]["sourceRef"] = "repository:modules/probe"
+    (probe / "module.yaml").write_text(yaml.safe_dump(manifest))
+    (probe / "main.py").write_text(
+        "import os\n"
+        "from omf.sdk import ProtocolResult, main\n"
+        "def validate(_request):\n"
+        "    return ProtocolResult(status='ok')\n"
+        "def run(request):\n"
+        "    seen = {}\n"
+        "    for key, value in request.inputs.items():\n"
+        "        seen[key] = {\n"
+        "            'kind': value['kind'],\n"
+        "            'exists': os.path.isfile(value['path']),\n"
+        "            'state': value.get('state'),\n"
+        "            'resource': value['resource'],\n"
+        "        }\n"
+        "    return ProtocolResult(status='ok', outputs={'seen': seen})\n"
+        "if __name__ == '__main__':\n"
+        "    raise SystemExit(main({'validate': validate, 'run': run}))\n"
+    )
+
+    def refine_workload(base: str, checkpoint: str, raw: str) -> Path:
+        path = paths.root / "workloads/refine.yaml"
+        path.write_text(
+            yaml.safe_dump(
+                {
+                    "apiVersion": "omf.dev/v1alpha1",
+                    "kind": "WorkloadSpec",
+                    "metadata": {"name": "refine", "namespace": "local/test-project"},
+                    "spec": {
+                        "parameters": {},
+                        "reproducibility": "lineage",
+                        "graph": {
+                            "stages": [
+                                {
+                                    "name": "refine",
+                                    "module": "modules/probe/module.yaml",
+                                    "operation": "run",
+                                    "inputs": {"base": base, "ckpt": checkpoint, "raw": raw},
+                                    "outputs": ["seen"],
+                                }
+                            ]
+                        },
+                    },
+                }
+            )
+        )
+        return path
+
+    with Factory(paths) as factory:
+        baseline = factory.run(workload_path, paths.root / "bindings/local.yaml")
+        factory.evaluate(f"run/{baseline['runId']}")
+        release = factory.create_release(
+            baseline["runId"],
+            name="affine-v1",
+            intended_use="test",
+            promote=True,
+            approvals=["independent-reviewer"],
+            vulnerability_report=_scan_for(paths, factory, baseline),
+        )
+        release_uri = factory._resource_uri(release)
+        checkpoint = factory.list_resources(kind="Checkpoint")[0]
+        checkpoint_name = checkpoint["metadata"]["name"]
+        model_digest = baseline["outputs"]["train.model"]
+        operations_before = len(factory.operations.list())
+
+        with pytest.raises(NotFoundError):
+            factory.run(
+                refine_workload("release/missing", f"checkpoint/{checkpoint_name}", model_digest),
+                paths.root / "bindings/local.yaml",
+            )
+        assert len(factory.operations.list()) == operations_before
+        assert len(factory.list_resources(kind="Run")) == 1
+
+        refined = factory.run(
+            refine_workload("release/affine-v1", f"checkpoint/{checkpoint_name}", model_digest),
+            paths.root / "bindings/local.yaml",
+        )
+        seen = refined["outputs"]["refine.seen"]
+        admission = factory._run_resource(refined["runId"])["spec"]["extensions"]
+        stage_lineage = factory.lineage_query(f"run:{refined['runId']}/stage:refine")
+        impact = factory.lineage_query(release_uri, direction="downstream")
+        materialized = sorted(
+            item.name for item in (paths.runs / refined["runId"] / "stages/refine/inputs").iterdir()
+        )
+
+    assert refined["state"] == "Succeeded"
+    assert seen["base"]["kind"] == "release"
+    assert seen["base"]["exists"]
+    assert seen["base"]["resource"] == release_uri
+    assert seen["base"]["state"]["format"] == "json-affine/v1"
+    assert seen["ckpt"]["kind"] == "checkpoint"
+    assert seen["ckpt"]["exists"]
+    assert seen["ckpt"]["state"]["slope"] == pytest.approx(2.0, abs=0.01)
+    assert seen["raw"]["kind"] == "artifact"
+    assert seen["raw"]["exists"]
+    assert seen["raw"]["state"] is None
+    assert materialized == ["base", "ckpt", "raw"]
+    assert admission["admittedReferences"] == {
+        "release/affine-v1": release_uri,
+        f"checkpoint/{checkpoint_name}": factory._resource_uri(checkpoint),
+        model_digest: f"artifact:{model_digest}",
+    }
+    used = {edge["source"] for edge in stage_lineage if edge["relation"] == "used"}
+    assert {release_uri, factory._resource_uri(checkpoint), f"artifact:{model_digest}"} <= used
+    assert any(edge["target"] == f"run:{refined['runId']}/stage:refine" for edge in impact)
 
 
 def test_copied_dataset_revision_is_relocatable(tmp_path):
@@ -1438,18 +1944,28 @@ def test_resource_pinning_and_resolution_fail_closed(tmp_path):
         assert factory._resolve_output_reference("literal", {}, stages) == "literal"
         with pytest.raises(IntegrityError, match="stage output reference is unavailable"):
             factory._resolve_output_reference("train.model", {}, stages)
-        assert factory._resolve_stage_input(7, paths.runs / "x", {}) == 7
+        resolve = {"run_id": "run", "stage_name": "train"}
+        assert factory._resolve_stage_input(7, paths.runs / "x", {}, **resolve) == 7
         with pytest.raises(IntegrityError, match="not pinned at admission"):
-            factory._resolve_stage_input("dataset/missing", paths.runs / "x/y/z", {})
+            factory._resolve_stage_input("dataset/missing", paths.runs / "x/y/z", {}, **resolve)
+        with pytest.raises(IntegrityError, match="reference input was not pinned"):
+            factory._resolve_stage_input("release/missing", paths.runs / "x/y/z", {}, **resolve)
 
         target_root = paths.runs / "run" / "stages" / "train" / "inputs" / "dataset"
         materialized = factory._resolve_stage_input(
-            "dataset/example-affine", target_root, {"dataset/example-affine": dataset}
+            "dataset/example-affine", target_root, {"dataset/example-affine": dataset}, **resolve
         )
         assert materialized["manifestDigest"].startswith("sha256:")
+        assert any(
+            edge["source"] == factory._resource_uri(dataset)
+            for edge in factory.lineage_query("run:run/stage:train")
+        )
         with pytest.raises(IntegrityError, match="target already exists"):
             factory._resolve_stage_input(
-                "dataset/example-affine", target_root, {"dataset/example-affine": dataset}
+                "dataset/example-affine",
+                target_root,
+                {"dataset/example-affine": dataset},
+                **resolve,
             )
 
         assert factory._verify_stage_outputs({"value": 1})

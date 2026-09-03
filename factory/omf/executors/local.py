@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import importlib.metadata
 import json
 import os
 import platform
+import re
 import resource
 import shutil
 import signal
@@ -14,6 +16,7 @@ import subprocess
 import sys
 import time
 import uuid
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -29,6 +32,83 @@ from omf.executors.base import (
 )
 
 _DEFAULT_LOG_BYTES = 1024 * 1024
+_PYTHON_NAME = re.compile(r"^python(?:3(?:\.\d+)?)?$")
+_ENVIRONMENT_RECORD = "omf-environment.json"
+_INHERITED_LAYERS = "omf-inherited-layers.pth"
+_TOOL_ENVIRONMENT = {"HOME", "LANG", "PATH", "TZ"}
+_TOOL_PASSTHROUGH = {
+    "CURL_CA_BUNDLE",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "NO_PROXY",
+    "REQUESTS_CA_BUNDLE",
+    "SSL_CERT_FILE",
+    "http_proxy",
+    "https_proxy",
+    "no_proxy",
+}
+_CREDENTIAL_URL = re.compile(r"://[^/@\s]+@")
+_INVENTORY_SCRIPT = """
+import hashlib, importlib.metadata, json, platform, sys
+items = []
+for distribution in importlib.metadata.distributions():
+    name = distribution.metadata["Name"]
+    if not name:
+        continue
+    record = distribution.read_text("RECORD")
+    items.append(
+        {
+            "name": name.lower().replace("_", "-"),
+            "version": distribution.version,
+            "recordDigest": (
+                "sha256:" + hashlib.sha256(record.encode()).hexdigest()
+                if record is not None
+                else None
+            ),
+        }
+    )
+print(
+    json.dumps(
+        {
+            "implementation": sys.implementation.name,
+            "version": platform.python_version(),
+            "cacheTag": sys.implementation.cache_tag,
+            "distributions": sorted(
+                items,
+                key=lambda item: (
+                    str(item["name"]),
+                    str(item["version"]),
+                    str(item["recordDigest"]),
+                ),
+            ),
+        }
+    )
+)
+"""
+_SITE_SCRIPT = """
+import json, sys
+print(
+    json.dumps(
+        [
+            entry
+            for entry in sys.path
+            if entry.endswith(("site-packages", "dist-packages"))
+        ]
+    )
+)
+"""
+
+
+def _tool_environment() -> dict[str, str]:
+    return {
+        key: value
+        for key, value in os.environ.items()
+        if key in _TOOL_ENVIRONMENT or key in _TOOL_PASSTHROUGH or key.startswith("PIP_")
+    }
+
+
+def _redact(text: str) -> str:
+    return _CREDENTIAL_URL.sub("://***@", text)
 
 
 class LocalExecutor(Executor):
@@ -37,15 +117,22 @@ class LocalExecutor(Executor):
         *,
         binding_resources: dict[str, Any] | None = None,
         binding_spec: dict[str, Any] | None = None,
+        environment_root: Path | None = None,
+        dependency_wheelhouse: Path | None = None,
+        dependency_index: bool = True,
     ) -> None:
         self._processes: dict[str, subprocess.Popen[bytes]] = {}
         self._dirs: dict[str, Path] = {}
         self.binding_resources = binding_resources or {}
         self.binding_spec = binding_spec or {}
+        self.environment_root = environment_root
+        self.dependency_wheelhouse = dependency_wheelhouse
+        self.dependency_index = dependency_index
 
     @property
     def capabilities(self) -> frozenset[str]:
         caps = {
+            "environment:dependency-lock-realization",
             "environment:executable-drift-detection",
             "environment:python-distribution-inventory",
             "bounded-logs",
@@ -68,6 +155,257 @@ class LocalExecutor(Executor):
             return Path(value).resolve(strict=True)
         except OSError:
             return None
+
+    @staticmethod
+    def _locate_executable(name: str, cwd: Path) -> tuple[Path, Path] | None:
+        """Return the invocation path with its final symlink retained, plus the real file.
+
+        A virtual environment interpreter is a symlink to its base interpreter. Executing the
+        resolved target would silently drop the environment's site-packages, so the module is
+        launched through the path it named while the digest attests the resolved bytes.
+        """
+        if "/" in name:
+            candidate = Path(cwd) / name
+        else:
+            found = shutil.which(name)
+            if found is None:
+                return None
+            candidate = Path(found)
+        candidate = Path(os.path.abspath(candidate))
+        try:
+            invocation = candidate.parent.resolve(strict=True) / candidate.name
+            resolved = invocation.resolve(strict=True)
+        except OSError:
+            return None
+        if not resolved.is_file():
+            return None
+        return invocation, resolved
+
+    @staticmethod
+    def _inprocess_python_inventory() -> dict[str, Any]:
+        distributions = []
+        for distribution in importlib.metadata.distributions():
+            name = distribution.metadata["Name"]
+            if not name:
+                continue
+            record = distribution.read_text("RECORD")
+            distributions.append(
+                {
+                    "name": name.lower().replace("_", "-"),
+                    "version": distribution.version,
+                    "recordDigest": (
+                        "sha256:" + hashlib.sha256(record.encode()).hexdigest()
+                        if record is not None
+                        else None
+                    ),
+                }
+            )
+        return {
+            "implementation": sys.implementation.name,
+            "version": platform.python_version(),
+            "cacheTag": sys.implementation.cache_tag,
+            "distributions": sorted(
+                distributions,
+                key=lambda item: (
+                    str(item["name"]),
+                    str(item["version"]),
+                    str(item["recordDigest"]),
+                ),
+            ),
+        }
+
+    @staticmethod
+    def _interpreter_json(python: Path, script: str, purpose: str) -> Any:
+        completed = subprocess.run(
+            [str(python), "-I", "-c", script],
+            capture_output=True,
+            text=True,
+            check=False,
+            env=_tool_environment(),
+            timeout=120,
+        )
+        if completed.returncode != 0:
+            raise RuntimeError(f"module interpreter {purpose} failed: {completed.stderr[-500:]}")
+        return json.loads(completed.stdout)
+
+    def _python_runtime(self, invocation: Path, resolved: Path) -> dict[str, Any] | None:
+        controller = Path(sys.executable)
+        try:
+            same_controller = invocation.parent == controller.parent.resolve(
+                strict=True
+            ) and resolved == controller.resolve(strict=True)
+        except OSError:
+            same_controller = False
+        if same_controller:
+            return self._inprocess_python_inventory()
+        if _PYTHON_NAME.fullmatch(invocation.name):
+            value = self._interpreter_json(invocation, _INVENTORY_SCRIPT, "inventory")
+            return value if isinstance(value, dict) else None
+        return None
+
+    def _realize_dependency_lock(
+        self, invocation: Path, resolved: Path, dependency: DependencyLock
+    ) -> tuple[Path, Path, dict[str, Any]]:
+        """Materialize a lock into a cached environment keyed by lock and interpreter identity.
+
+        The realized environment contains exactly the lock's hash-pinned binary distributions,
+        installed with pip's hash checking, plus the site directories of the interpreter the
+        module named so that ``omf.sdk`` and the module's toolchain remain importable. The
+        inherited layers are appended after installation, so the lock always shadows them.
+        """
+        if self.environment_root is None:
+            raise CapabilityError(
+                "local executor has no environment cache root for dependency lock realization",
+                details={"dependencyDigest": dependency.digest},
+            )
+        if not _PYTHON_NAME.fullmatch(invocation.name):
+            raise CapabilityError(
+                "dependency lock realization requires a Python interpreter entry point",
+                details={"dependencyDigest": dependency.digest, "executable": invocation.name},
+            )
+        interpreter_digest = "sha256:" + hashlib.sha256(resolved.read_bytes()).hexdigest()
+        options = {
+            "index": self.dependency_index,
+            "wheelhouse": (
+                str(self.dependency_wheelhouse) if self.dependency_wheelhouse is not None else None
+            ),
+        }
+        key = sha256_digest(
+            {
+                "format": _ENVIRONMENT_RECORD,
+                "lockDigest": dependency.digest,
+                "interpreter": interpreter_digest,
+                "options": options,
+            }
+        ).removeprefix("sha256:")
+        root = self.environment_root
+        root.mkdir(parents=True, exist_ok=True)
+        final = root / key
+        record_path = final / _ENVIRONMENT_RECORD
+        with (root / f"{key}.lock").open("a+") as handle:
+            fcntl.flock(handle, fcntl.LOCK_EX)
+            if not record_path.is_file():
+                self._build_environment(invocation, resolved, dependency, final, options)
+            record = json.loads(record_path.read_text())
+        if record.get("lockDigest") != dependency.digest:
+            raise IntegrityError("realized environment does not match the dependency lock")
+        located = self._locate_executable(str(final / "bin" / "python3"), final)
+        if located is None:
+            raise IntegrityError("realized environment has no interpreter")
+        realized_invocation, realized_resolved = located
+        realization = {
+            "strategy": "venv",
+            "layering": "interpreter-site-packages",
+            "lockDigest": dependency.digest,
+            "interpreterDigest": interpreter_digest,
+            "options": options,
+            "environment": str(final),
+            "createdAt": record.get("createdAt"),
+        }
+        return realized_invocation, realized_resolved, realization
+
+    def _build_environment(
+        self,
+        invocation: Path,
+        resolved: Path,
+        dependency: DependencyLock,
+        final: Path,
+        options: dict[str, Any],
+    ) -> None:
+        if final.exists():
+            shutil.rmtree(final)
+        staging = final.parent / f".{final.name}.staging-{uuid.uuid4().hex}"
+        try:
+            self._run_tool(
+                [str(invocation), "-m", "venv", str(staging)],
+                purpose="environment creation",
+                log=None,
+            )
+            python = staging / "bin" / "python3"
+            if not python.exists():
+                python = staging / "bin" / "python"
+            lock_file = staging / "requirements.lock"
+            lock_file.write_bytes(dependency.contents)
+            command = [
+                str(python),
+                "-m",
+                "pip",
+                "install",
+                "--disable-pip-version-check",
+                "--no-input",
+                "--require-hashes",
+                "--only-binary=:all:",
+                "--no-warn-script-location",
+            ]
+            if not self.dependency_index:
+                command.append("--no-index")
+            if self.dependency_wheelhouse is not None:
+                command.extend(["--find-links", str(self.dependency_wheelhouse)])
+            command.extend(["-r", str(lock_file)])
+            self._run_tool(command, purpose="dependency installation", log=staging / "pip.log")
+            layers = self._interpreter_json(invocation, _SITE_SCRIPT, "site inspection")
+            if not isinstance(layers, list) or not all(isinstance(item, str) for item in layers):
+                raise CapabilityError("module interpreter site inspection returned no layers")
+            site_directories = self._interpreter_json(python, _SITE_SCRIPT, "site inspection")
+            if not isinstance(site_directories, list) or not site_directories:
+                raise CapabilityError("realized environment has no site directory")
+            realized_site = [
+                entry for entry in site_directories if entry.startswith(str(staging) + os.sep)
+            ]
+            if not realized_site:
+                raise CapabilityError("realized environment site directory is not local")
+            # ``site.addsitedir`` lines make the interpreter's own layers visible, including
+            # the editable-install finders in their ``.pth`` files, after the lock's packages.
+            (Path(realized_site[0]) / _INHERITED_LAYERS).write_text(
+                "".join(
+                    f"import site; site.addsitedir({entry!r})\n"
+                    for entry in layers
+                    if not entry.startswith(str(staging))
+                )
+            )
+            (staging / _ENVIRONMENT_RECORD).write_text(
+                json.dumps(
+                    {
+                        "format": "omf.local-environment/v1",
+                        "lockDigest": dependency.digest,
+                        "interpreter": {
+                            "path": str(resolved),
+                            "digest": (
+                                "sha256:" + hashlib.sha256(resolved.read_bytes()).hexdigest()
+                            ),
+                        },
+                        "layering": "interpreter-site-packages",
+                        "inheritedLayers": layers,
+                        "options": options,
+                        "createdAt": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+                    },
+                    sort_keys=True,
+                    indent=2,
+                )
+            )
+            os.replace(staging, final)
+        except Exception:
+            shutil.rmtree(staging, ignore_errors=True)
+            raise
+
+    @staticmethod
+    def _run_tool(command: list[str], *, purpose: str, log: Path | None) -> None:
+        completed = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            check=False,
+            env=_tool_environment(),
+            timeout=1800,
+        )
+        output = _redact(completed.stdout + completed.stderr)
+        if log is not None:
+            log.write_text(output)
+        if completed.returncode != 0:
+            raise CapabilityError(
+                f"dependency lock {purpose} failed",
+                details={"exitCode": completed.returncode, "output": output[-2000:]},
+            )
 
     @classmethod
     def _network_namespace_available(cls, unshare: Path | None = None) -> bool:
@@ -123,63 +461,32 @@ class LocalExecutor(Executor):
         dependency: DependencyLock,
         deny_network: bool = False,
     ) -> dict[str, Any]:
-        if dependency.contents:
-            raise CapabilityError(
-                "local executor cannot realize a non-empty dependency lock",
-                details={"dependencyDigest": dependency.digest},
-            )
         executable = argv[0]
-        resolved = (
-            (cwd / executable).resolve() if "/" in executable else self._find_executable(executable)
-        )
-        if resolved is None or not resolved.is_file():
+        located = self._locate_executable(executable, cwd)
+        if located is None:
             raise RuntimeError(f"module executable is unavailable: {executable}")
-        executable_bytes = resolved.read_bytes()
-        if executable_bytes.startswith(b"#!"):
+        invocation, resolved = located
+        if resolved.read_bytes().startswith(b"#!"):
             raise RuntimeError("script entry points must declare their interpreter explicitly")
+        realization: dict[str, Any] | None = None
+        if dependency.contents:
+            invocation, resolved, realization = self._realize_dependency_lock(
+                invocation, resolved, dependency
+            )
+        executable_bytes = resolved.read_bytes()
         executables = [
             {
                 "role": "module",
-                "path": str(resolved),
+                "path": str(invocation),
+                "target": str(resolved),
                 "digest": "sha256:" + hashlib.sha256(executable_bytes).hexdigest(),
             }
         ]
         runtime: dict[str, Any] = {
             "system": platform.system(),
             "machine": platform.machine(),
-            "python": None,
+            "python": self._python_runtime(invocation, resolved),
         }
-        if resolved == Path(sys.executable).resolve():
-            distributions = []
-            for distribution in importlib.metadata.distributions():
-                name = distribution.metadata["Name"]
-                if not name:
-                    continue
-                record = distribution.read_text("RECORD")
-                distributions.append(
-                    {
-                        "name": name.lower().replace("_", "-"),
-                        "version": distribution.version,
-                        "recordDigest": (
-                            "sha256:" + hashlib.sha256(record.encode()).hexdigest()
-                            if record is not None
-                            else None
-                        ),
-                    }
-                )
-            runtime["python"] = {
-                "implementation": sys.implementation.name,
-                "version": platform.python_version(),
-                "cacheTag": sys.implementation.cache_tag,
-                "distributions": sorted(
-                    distributions,
-                    key=lambda item: (
-                        str(item["name"]),
-                        str(item["version"]),
-                        str(item["recordDigest"]),
-                    ),
-                ),
-            }
         wrapper: list[str] = []
         if deny_network:
             unshare = self._find_executable("unshare")
@@ -196,11 +503,12 @@ class LocalExecutor(Executor):
             )
         descriptor: dict[str, Any] = {
             "requestedCommand": list(argv),
-            "command": [str(resolved), *argv[1:]],
+            "command": [str(invocation), *argv[1:]],
             "wrapper": wrapper,
             "dependencyDigest": dependency.digest,
             "executables": executables,
             "runtime": runtime,
+            "realization": realization,
             "environmentPolicy": {
                 "inherited": ["HOME", "LANG", "PATH", "TZ"],
                 "additional": [],
@@ -214,6 +522,18 @@ class LocalExecutor(Executor):
                     {"role": item["role"], "digest": item["digest"]} for item in executables
                 ],
                 "runtime": runtime,
+                "realization": (
+                    None
+                    if realization is None
+                    else {
+                        "strategy": realization["strategy"],
+                        "layering": realization["layering"],
+                        "lockDigest": realization["lockDigest"],
+                        "interpreterDigest": realization["interpreterDigest"],
+                        "index": realization["options"]["index"],
+                        "wheelhouse": realization["options"]["wheelhouse"] is not None,
+                    }
+                ),
                 "environmentPolicy": descriptor["environmentPolicy"],
             }
         )

@@ -66,6 +66,7 @@ class AdmittedWorkload(BaseModel):
     module_digests: dict[str, str] = Field(default_factory=dict)
     environments: dict[str, dict[str, Any]] = Field(default_factory=dict)
     input_revisions: dict[str, str] = Field(default_factory=dict)
+    reference_revisions: dict[str, str] = Field(default_factory=dict)
     parameters: dict[str, Any] = Field(default_factory=dict)
     reproducibility: str = "lineage"
     model_package_ref: str | None = None
@@ -209,6 +210,7 @@ class StateStore:
             "modules": spec.module_digests,
             "environments": spec.environments,
             "inputs": spec.input_revisions,
+            "references": spec.reference_revisions,
             "modelPackage": spec.model_package_ref,
             "reproducibility": spec.reproducibility,
         }

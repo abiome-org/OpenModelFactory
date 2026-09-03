@@ -55,6 +55,10 @@ class ProjectPaths:
         return self.state / "packages"
 
     @property
+    def environments(self) -> Path:
+        return self.state / "environments"
+
+    @property
     def telemetry(self) -> Path:
         return self.state / "telemetry" / "telemetry.jsonl"
 
@@ -96,6 +100,7 @@ def bootstrap(
         paths.store,
         paths.runs,
         paths.packages,
+        paths.environments,
         paths.state / "telemetry",
         paths.state / "operations",
     ]

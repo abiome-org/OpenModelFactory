@@ -39,6 +39,36 @@ change also alters batch semantics, sampling, preprocessing, or inference, list
 those as additional interventions rather than calling the experiment a
 single-variable ablation.
 
+## Refine from a prior release or checkpoint
+
+A candidate may continue from evidence an earlier run produced instead of
+starting from initialization. A stage input may name any of:
+
+| Input value | What the module receives |
+| --- | --- |
+| `release/<name>` | the release's model artifact path, its state, and the model package reference |
+| `checkpoint/<name>` | the checkpoint's module-state artifact path and its protocol state |
+| `sha256:<digest>` | the restored payload of that artifact manifest |
+
+```yaml
+stages:
+  - name: refine
+    module: modules/examples/affine-regression/module.yaml
+    operation: run
+    inputs:
+      base: release/affine-v1
+      dataset: dataset/example-affine
+    outputs: [modelState, loss, model, checkpoint]
+```
+
+Each reference is pinned and verified before the run is allocated, restored
+under the stage's `inputs/` directory, and recorded as a `used` lineage edge
+from the release, checkpoint, or artifact to the consuming stage. The module
+reads `inputs.base.path` for the payload and `inputs.base.state` for the
+protocol state when the source published one. Lineage from the new run
+therefore leads back to the release it refined, and a downstream impact query
+from that release lists every refinement built on it.
+
 ## Candidate identity checklist
 
 Before running, capture:

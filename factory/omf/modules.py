@@ -15,7 +15,7 @@ from jsonschema import Draft202012Validator
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from omf.canonical import load_document, portable_relative_path
-from omf.errors import ValidationError
+from omf.errors import ConfigurationError, ValidationError
 from omf.executors.base import DependencyLock
 from omf.schema_registry import default_registry
 
@@ -223,28 +223,52 @@ def extract_module_package(package: str | Path, destination: str | Path) -> Path
     return target
 
 
-def git_source(root: str | Path, *, allow_dirty: bool = False) -> dict[str, Any]:
+def worktree_state(root: str | Path) -> dict[str, Any]:
+    """Describe the committed identity and uncommitted content of the project subtree.
+
+    A repository without any commit has no HEAD: every tracked or untracked file is then
+    uncommitted content, so the tree is dirty until the project is committed.
+    """
     cwd = Path(root)
-    commit = subprocess.run(
-        ["git", "rev-parse", "HEAD"], cwd=cwd, check=True, capture_output=True, text=True
-    ).stdout.strip()
-    patch = subprocess.run(
-        ["git", "diff", "--binary", "HEAD"], cwd=cwd, check=True, capture_output=True
-    ).stdout
-    untracked = subprocess.run(
-        ["git", "ls-files", "--others", "--exclude-standard"],
-        cwd=cwd,
-        check=True,
-        capture_output=True,
-        text=True,
-    ).stdout.splitlines()
-    if (patch or untracked) and not allow_dirty:
-        raise ValidationError("dirty Git tree requires explicit allow_dirty policy")
+
+    def git(*arguments: str, text: bool = True, check: bool = True) -> Any:
+        try:
+            return subprocess.run(
+                ["git", *arguments], cwd=cwd, check=check, capture_output=True, text=text
+            )
+        except (OSError, subprocess.CalledProcessError) as exc:
+            raise ConfigurationError(
+                "the project must be a Git working tree to admit a workload",
+                details={"root": str(cwd)},
+            ) from exc
+
+    head = git("rev-parse", "--verify", "--quiet", "HEAD", check=False)
+    commit = head.stdout.strip() if head.returncode == 0 else None
+    patch = git("diff", "--binary", "HEAD", "--", ".", text=False).stdout if commit else b""
+    uncommitted = set(
+        git("ls-files", "--others", "--exclude-standard", "--", ".").stdout.splitlines()
+    )
+    if commit is None:
+        uncommitted.update(git("ls-files", "--", ".").stdout.splitlines())
+    untracked = sorted(uncommitted)
     return {
         "commit": commit,
         "patch": patch,
-        "untracked": sorted(untracked),
-        "digest": "sha256:" + hashlib.sha256(patch).hexdigest(),
+        "untracked": untracked,
+        "dirty": bool(patch or untracked),
+        "patchDigest": "sha256:" + hashlib.sha256(patch).hexdigest(),
+    }
+
+
+def git_source(root: str | Path, *, allow_dirty: bool = False) -> dict[str, Any]:
+    state = worktree_state(root)
+    if state["dirty"] and not allow_dirty:
+        raise ValidationError("dirty Git tree requires explicit allow_dirty policy")
+    return {
+        "commit": state["commit"],
+        "patch": state["patch"],
+        "untracked": state["untracked"],
+        "digest": state["patchDigest"],
     }
 
 
