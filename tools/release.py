@@ -20,7 +20,7 @@ from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
 VERSION_FILE = ROOT / "factory/omf/_version.py"
-SOURCE_URL = "https://github.com/abiome/OpenModelFactory"
+SOURCE_URL = "https://github.com/abiome-org/OpenModelFactory"
 
 
 def _version() -> str:

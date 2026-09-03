@@ -54,9 +54,9 @@ dev = [
 omf = "omf.cli:app"
 
 [project.urls]
-Documentation = "https://github.com/abiome/OpenModelFactory"
-Repository = "https://github.com/abiome/OpenModelFactory"
-Issues = "https://github.com/abiome/OpenModelFactory/issues"
+Documentation = "https://github.com/abiome-org/OpenModelFactory"
+Repository = "https://github.com/abiome-org/OpenModelFactory"
+Issues = "https://github.com/abiome-org/OpenModelFactory/issues"
 
 [tool.hatch.version]
 path = "factory/omf/_version.py"

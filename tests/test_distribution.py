@@ -116,7 +116,7 @@ source.with_name(source.name + ".sig").write_text(hashlib.sha256(source.read_byt
         "gitCommit": revision
     }
     assert provenance["predicate"]["runDetails"]["builder"]["id"] == (
-        f"https://github.com/abiome/OpenModelFactory/blob/{revision}/tools/release.py"
+        f"https://github.com/abiome-org/OpenModelFactory/blob/{revision}/tools/release.py"
     )
     source_patch = provenance["predicate"]["buildDefinition"]["externalParameters"]["sourcePatch"]
     assert set(source_patch) == {"sha256"}
