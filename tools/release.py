@@ -327,7 +327,9 @@ def prepare(arguments: argparse.Namespace) -> dict[str, Any]:
     )
 
     destination.parent.mkdir(parents=True, exist_ok=True)
-    staging = Path(tempfile.mkdtemp(dir=destination.parent, prefix=f".{destination.name}.release-"))
+    # Stage outside the checkout: a staging directory under the repository root would itself
+    # count as an untracked source change and fail the post-build source verification.
+    staging = Path(tempfile.mkdtemp(prefix=f"omf-release-{destination.name}-"))
     try:
         artifacts = _build_reproducibly(staging, arguments.source_date_epoch)
         if _source_patch_digest() != source_patch_digest:
@@ -364,7 +366,7 @@ def prepare(arguments: argparse.Namespace) -> dict[str, Any]:
         signature = _sign(checksums, signer) if signer else None
         if destination.exists():
             destination.rmdir()
-        os.replace(staging, destination)
+        shutil.move(str(staging), str(destination))
     except Exception:
         shutil.rmtree(staging, ignore_errors=True)
         raise

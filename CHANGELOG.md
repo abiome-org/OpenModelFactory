@@ -9,6 +9,9 @@
   AppArmor restriction on unprivileged user namespaces, which the local
   executor needs to enforce module network denial; without it every workload
   run on a hosted runner is refused as not ready.
+- `make release-candidate` staged its build inside the checkout, so the
+  release tool's own post-build source check always failed. Staging now
+  happens outside the repository.
 - The local executor launches a module interpreter through the path it named
   instead of the resolved symlink target, so modules run inside the project's
   virtual environment again. Projects created by `install.sh` were affected.
