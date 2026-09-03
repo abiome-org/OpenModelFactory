@@ -1,8 +1,10 @@
+import hashlib
 import sqlite3
 
+import omf.database as database_module
 import pytest
 from omf.database import AliasRepository, Database, ResourceRepository
-from omf.errors import ConflictError, NotFoundError
+from omf.errors import ConflictError, IntegrityError, NotFoundError
 
 
 @pytest.fixture
@@ -16,6 +18,145 @@ def test_migration_idempotence_and_integrity(db):
     db.migrate()
     assert db.integrity_check()
     assert db.connection.execute("select count(*) from schema_migrations").fetchone()[0] == 4
+    assert all(
+        row[0] and row[1]
+        for row in db.connection.execute(
+            "select name,checksum from schema_migrations order by version"
+        )
+    )
+
+
+def test_legacy_migration_table_is_upgraded(tmp_path):
+    path = tmp_path / "legacy.db"
+    connection = sqlite3.connect(path)
+    connection.execute("CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY)")
+    connection.executemany("INSERT INTO schema_migrations VALUES(?)", ((1,), (2,), (3,)))
+    connection.executescript(
+        database_module._SCHEMA + database_module._SCHEMA_V2 + database_module._SCHEMA_V3
+    )
+    connection.close()
+
+    migrated = Database(path)
+    rows = migrated.connection.execute(
+        "SELECT version,name,checksum FROM schema_migrations ORDER BY version"
+    ).fetchall()
+    assert [tuple(row) for row in rows] == [
+        (item.version, item.name, item.checksum) for item in database_module._MIGRATIONS
+    ]
+    migrated.close()
+
+
+@pytest.mark.parametrize("versions", [(1, 3), (1, 2, 3, 4, 5)])
+def test_rejects_migration_gaps_and_future_versions(tmp_path, versions):
+    path = tmp_path / "invalid.db"
+    connection = sqlite3.connect(path)
+    connection.execute("CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY)")
+    connection.executemany(
+        "INSERT INTO schema_migrations VALUES(?)", ((version,) for version in versions)
+    )
+    connection.commit()
+    connection.close()
+
+    with pytest.raises(IntegrityError):
+        Database(path)
+
+
+def test_rejects_migration_checksum_drift(db):
+    db.connection.execute("UPDATE schema_migrations SET checksum='changed' WHERE version=2")
+    with pytest.raises(IntegrityError, match="drift at version 2"):
+        db.migrate()
+
+
+@pytest.mark.parametrize(
+    ("name", "checksum"),
+    [(None, None), ("api-tokens", None), (None, database_module._MIGRATIONS[1].checksum)],
+)
+def test_rejects_missing_modern_migration_metadata(tmp_path, name, checksum):
+    path = tmp_path / "modern.db"
+    connection = sqlite3.connect(path)
+    connection.execute(
+        "CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY,name TEXT,checksum TEXT)"
+    )
+    connection.executemany(
+        "INSERT INTO schema_migrations VALUES(?,?,?)",
+        ((item.version, item.name, item.checksum) for item in database_module._MIGRATIONS),
+    )
+    connection.execute(
+        "UPDATE schema_migrations SET name=?,checksum=? WHERE version=2", (name, checksum)
+    )
+    connection.commit()
+    connection.close()
+
+    with pytest.raises(IntegrityError, match="drift at version 2"):
+        Database(path)
+
+
+def test_rejects_bundled_migration_drift_before_database_mutation(tmp_path, monkeypatch):
+    path = tmp_path / "legacy.db"
+    connection = sqlite3.connect(path)
+    connection.execute("CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY)")
+    connection.execute("INSERT INTO schema_migrations VALUES(1)")
+    connection.commit()
+    connection.close()
+    before = path.read_bytes()
+    migration = database_module._MIGRATIONS[0]
+    monkeypatch.setattr(
+        database_module,
+        "_MIGRATIONS",
+        (
+            database_module._Migration(migration.version, migration.name, "0" * 64, migration.sql),
+            *database_module._MIGRATIONS[1:],
+        ),
+    )
+
+    with pytest.raises(IntegrityError, match="bundled migration checksum drift"):
+        Database(path)
+
+    assert path.read_bytes() == before
+    assert not path.with_name(path.name + "-wal").exists()
+    assert not path.with_name(path.name + "-shm").exists()
+
+
+def test_failed_migration_rolls_back_and_can_be_retried(tmp_path, monkeypatch):
+    path = tmp_path / "retry.db"
+    original = database_module._MIGRATIONS
+    sql = "CREATE TABLE partial(value TEXT);\nINSERT INTO missing VALUES(1);\n"
+    broken = database_module._Migration(
+        4, "event-order", hashlib.sha256(sql.encode()).hexdigest(), sql
+    )
+    monkeypatch.setattr(database_module, "_MIGRATIONS", (*original[:3], broken))
+
+    with pytest.raises(sqlite3.OperationalError):
+        Database(path)
+    connection = sqlite3.connect(path)
+    assert connection.execute("SELECT 1 FROM sqlite_master WHERE name='partial'").fetchone() is None
+    assert connection.execute("SELECT 1 FROM schema_migrations WHERE version=4").fetchone() is None
+    connection.close()
+
+    monkeypatch.setattr(database_module, "_MIGRATIONS", original)
+    retried = Database(path)
+    assert retried.connection.execute("SELECT 1 FROM schema_migrations WHERE version=4").fetchone()
+    retried.close()
+
+
+def test_inspection_is_read_only_non_migrating_and_does_not_touch_wal(tmp_path):
+    path = tmp_path / "inspect.db"
+    connection = sqlite3.connect(path)
+    connection.execute("PRAGMA journal_mode=WAL")
+    connection.execute("PRAGMA wal_autocheckpoint=0")
+    connection.execute("CREATE TABLE marker(value TEXT)")
+    connection.commit()
+    sidecars = [path, path.with_name(path.name + "-wal"), path.with_name(path.name + "-shm")]
+    assert all(item.exists() for item in sidecars)
+    before = {item: (item.read_bytes(), item.stat().st_mtime_ns) for item in sidecars}
+
+    inspected = Database.inspect(path)
+    assert inspected.connection.execute("SELECT 1").fetchone()[0] == 1
+    with pytest.raises(sqlite3.OperationalError, match="readonly"):
+        inspected.connection.execute("CREATE TABLE changed(value TEXT)")
+    inspected.close()
+    assert {item: (item.read_bytes(), item.stat().st_mtime_ns) for item in sidecars} == before
+    connection.close()
 
 
 def test_resource_immutable_and_idempotent(db):

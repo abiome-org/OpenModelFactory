@@ -5,15 +5,17 @@ from __future__ import annotations
 
 import builtins
 import contextlib
+import hashlib
 import json
 import sqlite3
 import threading
 from collections.abc import Iterator
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from omf.canonical import canonical_json
-from omf.errors import ConflictError, NotFoundError
+from omf.errors import ConflictError, IntegrityError, NotFoundError
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS resources(uid TEXT NOT NULL, revision TEXT NOT NULL, kind TEXT NOT NULL,
@@ -80,29 +82,112 @@ CREATE TRIGGER IF NOT EXISTS event_order_no_delete BEFORE DELETE ON event_order
 """
 
 
+@dataclass(frozen=True)
+class _Migration:
+    version: int
+    name: str
+    checksum: str
+    sql: str
+
+
+_MIGRATIONS = (
+    _Migration(
+        1,
+        "legacy-0.1-baseline",
+        "b4b91aa0e91c72692e4d4c1649d3e9c04814454ea56dc51d2a55f7ce35b22278",
+        _SCHEMA,
+    ),
+    _Migration(
+        2,
+        "api-tokens",
+        "d90790324ed34f4c64038f22b5ea04e396a33c3121c12bfcaacaee5c157815d1",
+        _SCHEMA_V2,
+    ),
+    _Migration(
+        3,
+        "query-indices",
+        "45eee84933d2ca28e50b499b2d784f610ba445f69c43b86b03591a2f79049c0a",
+        _SCHEMA_V3,
+    ),
+    _Migration(
+        4,
+        "event-order",
+        "b83be71c941c1822f395d7aca4478dbd3f2b456b2b58419d49e1a4c69a2cc149",
+        _SCHEMA_V4,
+    ),
+)
+
+
+def _validate_migration_registry() -> None:
+    versions = [migration.version for migration in _MIGRATIONS]
+    if versions != list(range(1, len(_MIGRATIONS) + 1)):
+        raise IntegrityError("bundled migration versions are not contiguous and ordered")
+    names = [migration.name for migration in _MIGRATIONS]
+    if any(not name for name in names) or len(names) != len(set(names)):
+        raise IntegrityError("bundled migration names must be non-empty and unique")
+    for migration in _MIGRATIONS:
+        if hashlib.sha256(migration.sql.encode()).hexdigest() != migration.checksum:
+            raise IntegrityError(f"bundled migration checksum drift at version {migration.version}")
+
+
+def _execute_sql(connection: sqlite3.Connection, sql: str) -> None:
+    statement = ""
+    for line in sql.splitlines():
+        statement += line + "\n"
+        if sqlite3.complete_statement(statement):
+            connection.execute(statement)
+            statement = ""
+    if statement.strip():
+        raise IntegrityError("migration contains an incomplete SQL statement")
+
+
 class Database:
     """A SQLite database; connections are isolated per thread."""
 
-    def __init__(self, path: str | Path, *, busy_timeout: int = 5000) -> None:
+    def __init__(
+        self,
+        path: str | Path,
+        *,
+        busy_timeout: int = 5000,
+        migrate: bool = True,
+        read_only: bool = False,
+    ) -> None:
         self.path = Path(path)
-        self.path.parent.mkdir(parents=True, exist_ok=True)
+        if read_only and migrate:
+            raise ValueError("a read-only database cannot run migrations")
+        if not read_only:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
         self.busy_timeout = busy_timeout
+        self.read_only = read_only
         self._local = threading.local()
         self._connections: set[sqlite3.Connection] = set()
         self._connections_lock = threading.Lock()
-        self.migrate()
+        if migrate:
+            self.migrate()
+
+    @classmethod
+    def inspect(cls, path: str | Path, *, busy_timeout: int = 5000) -> Database:
+        """Inspect a quiescent immutable snapshot without migrations or filesystem writes."""
+        return cls(path, busy_timeout=busy_timeout, migrate=False, read_only=True)
 
     def connect(self) -> sqlite3.Connection:
+        target = (
+            f"{self.path.resolve().as_uri()}?mode=ro&immutable=1" if self.read_only else self.path
+        )
         connection = sqlite3.connect(
-            self.path,
+            target,
             timeout=self.busy_timeout / 1000,
             isolation_level=None,
             check_same_thread=False,
+            uri=self.read_only,
         )
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys=ON")
         connection.execute(f"PRAGMA busy_timeout={self.busy_timeout}")
-        connection.execute("PRAGMA journal_mode=WAL")
+        if self.read_only:
+            connection.execute("PRAGMA query_only=ON")
+        else:
+            connection.execute("PRAGMA journal_mode=WAL")
         with self._connections_lock:
             self._connections.add(connection)
         return connection
@@ -128,55 +213,61 @@ class Database:
             connection.commit()
 
     def migrate(self) -> None:
+        if self.read_only:
+            raise IntegrityError("cannot migrate a read-only database")
+        _validate_migration_registry()
         connection = self.connection
         with self.transaction(immediate=True):
-            connection.execute(
-                "CREATE TABLE IF NOT EXISTS schema_migrations(version INTEGER PRIMARY KEY)"
+            exists = connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='schema_migrations'"
+            ).fetchone()
+            columns = (
+                {str(row[1]) for row in connection.execute("PRAGMA table_info(schema_migrations)")}
+                if exists
+                else set()
             )
-            if (
-                connection.execute("SELECT 1 FROM schema_migrations WHERE version=1").fetchone()
-                is None
-            ):
-                statement = ""
-                for line in _SCHEMA.splitlines():
-                    statement += line + "\n"
-                    if sqlite3.complete_statement(statement):
-                        connection.execute(statement)
-                        statement = ""
-                connection.execute("INSERT INTO schema_migrations VALUES(1)")
-            if (
-                connection.execute("SELECT 1 FROM schema_migrations WHERE version=2").fetchone()
-                is None
-            ):
-                statement = ""
-                for line in _SCHEMA_V2.splitlines():
-                    statement += line + "\n"
-                    if sqlite3.complete_statement(statement):
-                        connection.execute(statement)
-                        statement = ""
-                connection.execute("INSERT INTO schema_migrations VALUES(2)")
-            if (
-                connection.execute("SELECT 1 FROM schema_migrations WHERE version=3").fetchone()
-                is None
-            ):
-                statement = ""
-                for line in _SCHEMA_V3.splitlines():
-                    statement += line + "\n"
-                    if sqlite3.complete_statement(statement):
-                        connection.execute(statement)
-                        statement = ""
-                connection.execute("INSERT INTO schema_migrations VALUES(3)")
-            if (
-                connection.execute("SELECT 1 FROM schema_migrations WHERE version=4").fetchone()
-                is None
-            ):
-                statement = ""
-                for line in _SCHEMA_V4.splitlines():
-                    statement += line + "\n"
-                    if sqlite3.complete_statement(statement):
-                        connection.execute(statement)
-                        statement = ""
-                connection.execute("INSERT INTO schema_migrations VALUES(4)")
+            legacy = columns == {"version"}
+            if not exists:
+                connection.execute(
+                    "CREATE TABLE schema_migrations("
+                    "version INTEGER PRIMARY KEY,name TEXT NOT NULL,checksum TEXT NOT NULL)"
+                )
+            elif legacy:
+                connection.execute("ALTER TABLE schema_migrations ADD COLUMN name TEXT")
+                connection.execute("ALTER TABLE schema_migrations ADD COLUMN checksum TEXT")
+            elif columns != {"version", "name", "checksum"}:
+                raise IntegrityError("schema migration table has an unsupported shape")
+            rows = connection.execute(
+                "SELECT version,name,checksum FROM schema_migrations ORDER BY version"
+            ).fetchall()
+            versions = [int(row[0]) for row in rows]
+            if versions and versions != list(range(1, versions[-1] + 1)):
+                raise IntegrityError("schema migration history contains a version gap")
+            if versions and versions[-1] > len(_MIGRATIONS):
+                raise IntegrityError("database was created by a newer schema version")
+            for row in rows:
+                migration = _MIGRATIONS[int(row[0]) - 1]
+                if legacy:
+                    connection.execute(
+                        "UPDATE schema_migrations SET name=?,checksum=? WHERE version=?",
+                        (migration.name, migration.checksum, migration.version),
+                    )
+                elif row[1] != migration.name or row[2] != migration.checksum:
+                    raise IntegrityError(
+                        f"schema migration metadata drift at version {migration.version}"
+                    )
+
+        for migration in _MIGRATIONS:
+            with self.transaction(immediate=True):
+                if connection.execute(
+                    "SELECT 1 FROM schema_migrations WHERE version=?", (migration.version,)
+                ).fetchone():
+                    continue
+                _execute_sql(connection, migration.sql)
+                connection.execute(
+                    "INSERT INTO schema_migrations(version,name,checksum) VALUES(?,?,?)",
+                    (migration.version, migration.name, migration.checksum),
+                )
 
     def rebuild_indices(self) -> None:
         with self.transaction(immediate=True) as connection:

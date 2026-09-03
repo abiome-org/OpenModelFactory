@@ -687,12 +687,12 @@ class Factory:
             time.sleep(0.05)
         result_path = run_dir / "result.json"
         if status.state != "succeeded" or not result_path.exists():
-            stdout, stderr = executor.logs(execution_id)
+            stdout, stderr = executor.read_logs(execution_id)
             raise OMFError(
                 f"module execution {status.state}: {status.reason or 'no result'}",
                 details={
-                    "stdout": stdout.read_text(errors="replace")[-4000:],
-                    "stderr": stderr.read_text(errors="replace")[-4000:],
+                    "stdout": stdout,
+                    "stderr": stderr,
                 },
             )
         result = ProtocolResult.model_validate_json(result_path.read_bytes())

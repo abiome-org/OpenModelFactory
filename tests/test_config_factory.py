@@ -12,7 +12,7 @@ import yaml
 from omf.artifacts import ArtifactBuilder
 from omf.config import ProjectPaths, bootstrap
 from omf.database import AliasRepository
-from omf.errors import CapabilityError, ConflictError, IntegrityError, ValidationError
+from omf.errors import CapabilityError, ConflictError, IntegrityError, OMFError, ValidationError
 from omf.executors import (
     MODULE_PROTOCOL_CAPABILITIES,
     ExecutorContext,
@@ -22,6 +22,7 @@ from omf.executors import (
 )
 from omf.factory import Factory
 from omf.modules import load_manifest
+from omf.sdk import ProtocolRequest
 from omf.workloads import project_workload
 
 
@@ -923,6 +924,36 @@ def test_stale_running_operation_fails_closed_without_reexecution(tmp_path, monk
     assert failed["state"] == "failed"
     assert failed["error"]["code"] == "indeterminate_execution"
     assert not failed["error"]["retryable"]
+
+
+def test_module_failure_exposes_only_bounded_log_tails(tmp_path):
+    paths = _project(tmp_path)
+    bootstrap(paths)
+    module_root = paths.root / "modules/examples/statistical"
+    (module_root / "main.py").write_text(
+        "import sys\n"
+        "print('x' * 2000000)\n"
+        "print('y' * 2000000, file=sys.stderr)\n"
+        "raise SystemExit(2)\n"
+    )
+    manifest, code_root = load_manifest(module_root / "module.yaml", paths.root)
+
+    with Factory(paths) as factory:
+        executor = LocalExecutor()
+        environment = factory._prepare_module_environment(executor, manifest, code_root)
+        with pytest.raises(OMFError) as raised:
+            factory._execute_module(
+                manifest,
+                code_root,
+                ProtocolRequest(operation="run"),
+                paths.runs / "verbose-failure",
+                executor=executor,
+                executor_config={},
+                environment=environment,
+            )
+
+    assert len(raised.value.details["stdout"].encode()) <= 4096
+    assert len(raised.value.details["stderr"].encode()) <= 4096
 
 
 def test_running_operation_reconciles_immutable_completed_result(tmp_path, monkeypatch):

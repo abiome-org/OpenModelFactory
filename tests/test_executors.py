@@ -1,4 +1,6 @@
+import hashlib
 import shutil
+import sys
 import time
 from types import SimpleNamespace
 
@@ -155,6 +157,9 @@ def test_local_executor_success_failure_logs_and_reconcile(tmp_path):
         success_dir / "stdout.log",
         success_dir / "stderr.log",
     )
+    assert executor.read_logs(execution_id) == ("", "")
+    with pytest.raises(ValueError, match="positive"):
+        executor.read_logs(execution_id, tail_bytes=0)
     recovered = LocalExecutor()
     assert recovered.reconcile(success_dir) == execution_id
     assert recovered.status(execution_id).state == "succeeded"
@@ -257,6 +262,95 @@ def test_local_environment_rejects_nonempty_opaque_dependency_lock(tmp_path):
                 "environment.lock", "sha256:" + "1" * 64, b"\x00provider-specific\xff"
             ),
         )
+
+
+def test_local_environment_captures_python_runtime_and_distribution_inventory(tmp_path):
+    environment = LocalExecutor().prepare_environment(
+        argv=[sys.executable, "-c", "pass"],
+        cwd=tmp_path,
+        dependency=DependencyLock("requirements.lock", "sha256:test", b""),
+    )
+
+    runtime = environment["runtime"]
+    assert runtime["system"]
+    assert runtime["machine"]
+    assert runtime["python"]["version"]
+    assert runtime["python"]["implementation"]
+    assert runtime["python"]["distributions"]
+    assert environment["environmentPolicy"]["inherited"] == ["HOME", "LANG", "PATH", "TZ"]
+
+
+def test_executor_log_reads_are_tail_bounded(tmp_path):
+    executor = LocalExecutor()
+    run_dir = tmp_path / "logs"
+    execution_id = executor.submit(
+        executor.plan(
+            argv=[
+                "python3",
+                "-c",
+                "print('0123456789'); import sys; print('abcdefghij', file=sys.stderr)",
+            ],
+            run_dir=run_dir,
+            cwd=tmp_path,
+            requires_result=False,
+        )
+    )
+    executor._processes[execution_id].wait(timeout=5)
+
+    stdout, stderr = executor.read_logs(execution_id, tail_bytes=5)
+    assert stdout == "6789\n"
+    assert stderr == "ghij\n"
+
+
+def test_executor_log_error_replacement_remains_byte_bounded(tmp_path):
+    executor = LocalExecutor()
+    run_dir = tmp_path / "binary-logs"
+    execution_id = executor.submit(
+        executor.plan(
+            argv=["python3", "-c", "import sys; sys.stdout.buffer.write(b'\\xff' * 10000)"],
+            run_dir=run_dir,
+            cwd=tmp_path,
+            requires_result=False,
+        )
+    )
+    executor._processes[execution_id].wait(timeout=5)
+
+    stdout, _stderr = executor.read_logs(execution_id, tail_bytes=4096)
+    assert stdout
+    assert len(stdout.encode()) <= 4096
+
+
+def test_local_executor_bounds_log_files_without_limiting_artifacts(tmp_path):
+    executor = LocalExecutor()
+    run_dir = tmp_path / "bounded-logs"
+    artifact = run_dir / "model.bin"
+    execution_id = executor.submit(
+        executor.plan(
+            argv=[
+                "python3",
+                "-c",
+                (
+                    "from pathlib import Path; import sys; "
+                    "Path(sys.argv[1]).write_bytes(b'a' * 1500000); "
+                    "print('x' * 1500000); print('y' * 1500000, file=sys.stderr)"
+                ),
+                str(artifact),
+            ],
+            run_dir=run_dir,
+            cwd=tmp_path,
+            requires_result=False,
+        )
+    )
+    executor._processes[execution_id].wait(timeout=10)
+
+    assert executor.status(execution_id).state == "succeeded"
+    assert (run_dir / "stdout.log").stat().st_size == 1024 * 1024
+    assert (run_dir / "stderr.log").stat().st_size == 1024 * 1024
+    assert artifact.stat().st_size == 1500000
+    assert (
+        hashlib.sha256(artifact.read_bytes()).hexdigest()
+        == hashlib.sha256(b"a" * 1500000).hexdigest()
+    )
 
 
 def test_builtin_preflight_rejects_unconsumed_binding_values():

@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import hashlib
+import importlib.metadata
 import json
 import os
+import platform
 import resource
 import shutil
 import signal
@@ -26,6 +28,8 @@ from omf.executors.base import (
     Executor,
 )
 
+_DEFAULT_LOG_BYTES = 1024 * 1024
+
 
 class LocalExecutor(Executor):
     def __init__(
@@ -43,6 +47,8 @@ class LocalExecutor(Executor):
     def capabilities(self) -> frozenset[str]:
         caps = {
             "environment:executable-drift-detection",
+            "environment:python-distribution-inventory",
+            "bounded-logs",
             "process-group",
             "rlimit",
             *MODULE_PROTOCOL_CAPABILITIES,
@@ -137,6 +143,42 @@ class LocalExecutor(Executor):
                 "digest": "sha256:" + hashlib.sha256(executable_bytes).hexdigest(),
             }
         ]
+        runtime: dict[str, Any] = {
+            "system": platform.system(),
+            "machine": platform.machine(),
+            "python": None,
+        }
+        if resolved == Path(sys.executable).resolve():
+            distributions = []
+            for distribution in importlib.metadata.distributions():
+                name = distribution.metadata["Name"]
+                if not name:
+                    continue
+                record = distribution.read_text("RECORD")
+                distributions.append(
+                    {
+                        "name": name.lower().replace("_", "-"),
+                        "version": distribution.version,
+                        "recordDigest": (
+                            "sha256:" + hashlib.sha256(record.encode()).hexdigest()
+                            if record is not None
+                            else None
+                        ),
+                    }
+                )
+            runtime["python"] = {
+                "implementation": sys.implementation.name,
+                "version": platform.python_version(),
+                "cacheTag": sys.implementation.cache_tag,
+                "distributions": sorted(
+                    distributions,
+                    key=lambda item: (
+                        str(item["name"]),
+                        str(item["version"]),
+                        str(item["recordDigest"]),
+                    ),
+                ),
+            }
         wrapper: list[str] = []
         if deny_network:
             unshare = self._find_executable("unshare")
@@ -157,6 +199,11 @@ class LocalExecutor(Executor):
             "wrapper": wrapper,
             "dependencyDigest": dependency.digest,
             "executables": executables,
+            "runtime": runtime,
+            "environmentPolicy": {
+                "inherited": ["HOME", "LANG", "PATH", "TZ"],
+                "additional": [],
+            },
         }
         descriptor["digest"] = sha256_digest(
             {
@@ -165,6 +212,8 @@ class LocalExecutor(Executor):
                 "executables": [
                     {"role": item["role"], "digest": item["digest"]} for item in executables
                 ],
+                "runtime": runtime,
+                "environmentPolicy": descriptor["environmentPolicy"],
             }
         )
         return descriptor
@@ -202,6 +251,7 @@ class LocalExecutor(Executor):
                 "environmentDigest": (environment or {}).get("digest"),
                 "executables": (environment or {}).get("executables", []),
                 "argvDigest": sha256_digest(list(command)),
+                "logByteLimit": _DEFAULT_LOG_BYTES,
             },
         )
 
@@ -247,6 +297,12 @@ class LocalExecutor(Executor):
             ),
             "--argv-digest",
             str(plan.metadata["argvDigest"]),
+            "--stdout-log",
+            str(plan.run_dir / "stdout.log"),
+            "--stderr-log",
+            str(plan.run_dir / "stderr.log"),
+            "--max-log-bytes",
+            str(plan.metadata["logByteLimit"]),
             "--",
             *plan.argv,
         ]
@@ -263,17 +319,13 @@ class LocalExecutor(Executor):
                 if key in limits:
                     resource.setrlimit(kind, (int(limits[key]), int(limits[key])))
 
-        stdout, stderr = (
-            (plan.run_dir / "stdout.log").open("ab"),
-            (plan.run_dir / "stderr.log").open("ab"),
-        )
+        stdout = (plan.run_dir / "worker.log").open("ab")
         try:
             process = subprocess.Popen(
-                worker, cwd=plan.cwd, env=env, stdout=stdout, stderr=stderr, preexec_fn=setup
+                worker, cwd=plan.cwd, env=env, stdout=stdout, stderr=stdout, preexec_fn=setup
             )
         finally:
             stdout.close()
-            stderr.close()
         identity = self._identity(process.pid)
         (plan.run_dir / "execution.json").write_text(
             json.dumps(

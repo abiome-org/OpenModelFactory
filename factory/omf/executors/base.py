@@ -69,6 +69,23 @@ class Executor(ABC):
     @abstractmethod
     def logs(self, execution_id: str) -> tuple[Path, Path]: ...
 
+    def read_logs(self, execution_id: str, *, tail_bytes: int = 4096) -> tuple[str, str]:
+        """Read a bounded log tail without loading an executor's complete output."""
+        if tail_bytes < 1:
+            raise ValueError("tail_bytes must be positive")
+
+        def tail(path: Path) -> str:
+            if not path.exists():
+                return ""
+            with path.open("rb") as stream:
+                stream.seek(0, 2)
+                stream.seek(max(0, stream.tell() - tail_bytes))
+                decoded = stream.read(tail_bytes).decode(errors="replace")
+            return decoded.encode()[-tail_bytes:].decode(errors="ignore")
+
+        stdout, stderr = self.logs(execution_id)
+        return tail(stdout), tail(stderr)
+
     def attach(self, execution_id: str, run_dir: Path) -> None:
         """Restore controller-local bookkeeping after a process restart.
 

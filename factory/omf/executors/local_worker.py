@@ -13,6 +13,7 @@ import threading
 import time
 from pathlib import Path
 from types import FrameType
+from typing import BinaryIO
 
 from omf.canonical import sha256_digest
 
@@ -55,6 +56,17 @@ def _write_completion(
     os.replace(temporary, path)
 
 
+def _write_log_tail(source: BinaryIO, path: Path, limit: int) -> None:
+    tail = bytearray()
+    while block := source.read(65536):
+        tail.extend(block)
+        if len(tail) > limit:
+            del tail[: len(tail) - limit]
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_bytes(tail)
+    os.replace(temporary, path)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--completion", required=True, type=Path)
@@ -62,6 +74,9 @@ def main() -> int:
     parser.add_argument("--attested-executable", nargs=2, action="append", default=[])
     parser.add_argument("--environment-digest")
     parser.add_argument("--argv-digest", required=True)
+    parser.add_argument("--stdout-log", required=True, type=Path)
+    parser.add_argument("--stderr-log", required=True, type=Path)
+    parser.add_argument("--max-log-bytes", required=True, type=int)
     parser.add_argument("command", nargs=argparse.REMAINDER)
     args = parser.parse_args()
     command = list(args.command)
@@ -69,6 +84,8 @@ def main() -> int:
         command.pop(0)
     if not command:
         parser.error("a command is required after --")
+    if args.max_log_bytes < 1:
+        parser.error("--max-log-bytes must be positive")
     evidence: dict[str, object] = {
         "environmentDigest": args.environment_digest,
         "argvDigest": sha256_digest(command),
@@ -98,7 +115,26 @@ def main() -> int:
     signal.signal(signal.SIGTERM, _handle_stop)
     signal.signal(signal.SIGINT, _handle_stop)
     global _child
-    _child = subprocess.Popen(command, start_new_session=True)
+    _child = subprocess.Popen(
+        command,
+        start_new_session=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    assert _child.stdout is not None
+    assert _child.stderr is not None
+    readers = [
+        threading.Thread(
+            target=_write_log_tail,
+            args=(_child.stdout, args.stdout_log, args.max_log_bytes),
+        ),
+        threading.Thread(
+            target=_write_log_tail,
+            args=(_child.stderr, args.stderr_log, args.max_log_bytes),
+        ),
+    ]
+    for reader in readers:
+        reader.start()
     try:
         exit_code = _child.wait(timeout=args.timeout)
         reason = _stop_reason or ("completed" if exit_code == 0 else "nonzero-exit")
@@ -110,6 +146,8 @@ def main() -> int:
         except subprocess.TimeoutExpired:
             _signal_child(signal.SIGKILL)
             exit_code = _child.wait()
+    for reader in readers:
+        reader.join()
     _write_completion(args.completion, exit_code=exit_code, reason=reason, evidence=evidence)
     return exit_code if 0 <= exit_code <= 255 else 1
 
