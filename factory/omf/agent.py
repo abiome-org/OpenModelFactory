@@ -481,7 +481,7 @@ _ACTIONS: tuple[ActionDefinition, ...] = (
     ),
     ActionDefinition(
         "backup.create",
-        "Create a consistent local metadata backup and verify its integrity.",
+        "Archive and verify the complete durable local state.",
         "omf backup <destination>",
         "POST",
         "/v1/backups",
@@ -492,7 +492,7 @@ _ACTIONS: tuple[ActionDefinition, ...] = (
         "medium",
         "io",
         ("destination.writable",),
-        ("Database backup written and integrity-checked.",),
+        ("Metadata, identity, encrypted secrets, and local artifacts are archived and verified.",),
         approval_required=True,
     ),
 )

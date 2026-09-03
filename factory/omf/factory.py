@@ -20,6 +20,7 @@ from typing import Any
 
 from omf.agent import AgentControl
 from omf.artifacts import ArtifactBuilder, ArtifactManifest, AtomicCheckpointPublisher
+from omf.backups import create_backup
 from omf.canonical import canonical_json, load_document, sha256_digest
 from omf.config import ProjectPaths, load_project
 from omf.data import DataService, DatasetSnapshot
@@ -2648,14 +2649,7 @@ class Factory:
         return [asdict(edge) for edge in edges]
 
     def backup(self, destination: str | Path) -> dict[str, Any]:
-        destination_path = Path(destination).resolve()
-        destination_path.parent.mkdir(parents=True, exist_ok=True)
-        self.db.backup(destination_path)
-        return {
-            "path": str(destination_path),
-            "size": destination_path.stat().st_size,
-            "integrity": Database(destination_path).integrity_check(),
-        }
+        return create_backup(self.paths, self.db, self.identity, destination)
 
     @staticmethod
     def _resource_uri(resource: dict[str, Any]) -> str:

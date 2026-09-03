@@ -305,4 +305,23 @@ def test_cli_complete_local_lifecycle(tmp_path):
         == 2
     )
     assert "example" in {item["name"] for item in invoke("secret", "list")}
-    assert invoke("backup", root / "backup.db")["integrity"]
+    backup = invoke("backup", root.parent / "factory.omf-backup")
+    assert backup["integrity"]
+    restored = root.parent / "restored"
+    restored.mkdir()
+    shutil.copy(root / "omf.yaml", restored / "omf.yaml")
+    restoration = runner.invoke(
+        app,
+        [
+            "--project",
+            str(restored),
+            "--output",
+            "json",
+            "restore",
+            backup["path"],
+            "--expected-key-id",
+            backup["keyId"],
+        ],
+    )
+    assert restoration.exit_code == 0, restoration.output
+    assert json.loads(restoration.stdout)["keyId"] == backup["keyId"]

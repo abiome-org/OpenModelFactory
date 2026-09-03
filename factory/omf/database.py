@@ -273,6 +273,25 @@ class Database:
         with self.transaction(immediate=True) as connection:
             connection.execute("REINDEX")
 
+    def verify_migrations(self) -> bool:
+        """Check that the recorded schema history exactly matches this installed build."""
+        _validate_migration_registry()
+        columns = {
+            str(row[1]) for row in self.connection.execute("PRAGMA table_info(schema_migrations)")
+        }
+        if columns != {"version", "name", "checksum"}:
+            raise IntegrityError("schema migration table has an unsupported shape")
+        rows = self.connection.execute(
+            "SELECT version,name,checksum FROM schema_migrations ORDER BY version"
+        ).fetchall()
+        recorded = [(int(row[0]), str(row[1]), str(row[2])) for row in rows]
+        expected = [
+            (migration.version, migration.name, migration.checksum) for migration in _MIGRATIONS
+        ]
+        if recorded != expected:
+            raise IntegrityError("schema migration history does not match this installed build")
+        return True
+
     def integrity_check(self) -> bool:
         result = self.connection.execute("PRAGMA integrity_check").fetchone()[0]
         return bool(result == "ok")

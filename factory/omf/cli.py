@@ -19,6 +19,7 @@ from rich.console import Console
 from omf import __version__
 from omf.agent import capability_catalog, initial_context
 from omf.api import create_app
+from omf.backups import restore_backup
 from omf.config import ProjectPaths, discover_project
 from omf.config import bootstrap as bootstrap_project
 from omf.errors import OMFError
@@ -905,11 +906,22 @@ def secret_list() -> None:
 
 @app.command("backup")
 def backup(destination: Path) -> None:
+    """Archive and verify metadata, identity, secrets, and local artifacts."""
+
     def run() -> dict[str, Any]:
         with _factory() as factory:
             return factory.backup(destination)
 
     _handle(run)
+
+
+@app.command("restore")
+def restore(
+    source: Path,
+    expected_key_id: str | None = typer.Option(None, "--expected-key-id"),
+) -> None:
+    """Verify and restore a backup when the project has no existing .omf directory."""
+    _handle(lambda: restore_backup(_paths(), source, expected_key_id=expected_key_id))
 
 
 @api_app.command("serve")

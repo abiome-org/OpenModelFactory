@@ -85,26 +85,36 @@ portable workloads, restart, cancellation, checkpoints, and supported scale. See
 
 ## Backup and restore
 
-Create an online-consistent metadata backup:
+Create one verified archive containing metadata, signing and encryption keys,
+encrypted secrets, and every local content-addressed artifact:
 
 ```sh
-omf backup /secure-backups/metadata-$(date +%Y%m%d).db
+omf backup /secure-backups/factory-$(date +%Y%m%d).omf-backup
 ```
 
-Also replicate content-addressed manifests/blobs and securely back up
-`.omf/identity`. Test restoration in an isolated checkout:
+The archive contains sensitive key material and is created with mode `0600`.
+Protect and replicate it as a secret. Record the reported signing key ID in a
+separate trusted location.
+
+Restore into a checkout with the same `omf.yaml` and no `.omf` directory:
+
+```sh
+omf restore /secure-backups/factory-20260903.omf-backup \
+  --expected-key-id sha256:<recorded-key-id>
+omf doctor
+```
 
 1. stop writers;
 2. retain the failed `.omf` directory for forensics;
-3. restore identity keys with mode `0600`;
-4. restore the SQLite backup as `.omf/metadata.db`;
-5. restore or reconnect artifact stores;
-6. run `omf doctor`, verify dataset snapshots, list active goals/knowledge, and
+3. run `omf restore` with the separately recorded key ID;
+4. reconnect any external artifact stores;
+5. run `omf doctor`, verify dataset snapshots, list active goals/knowledge, and
    inspect signed event tails;
-7. resume deployments only after policy review.
+6. resume deployments only after policy review.
 
-Never restore only a signing key into a metadata history from another trust
-domain.
+Restore verifies the signed inventory, database and migration history, resource
+and event digests, local artifacts, and encrypted secrets before atomically
+creating `.omf`. It refuses to replace existing state.
 
 ## S3-compatible artifact stores
 
