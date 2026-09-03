@@ -94,6 +94,11 @@ class Executor(ABC):
         """
         del execution_id, run_dir
 
+    def recover(self, run_dir: Path) -> str | None:
+        """Recover an execution ID after submit returned but before the controller persisted it."""
+        del run_dir
+        return None
+
     def prepare_environment(
         self,
         *,

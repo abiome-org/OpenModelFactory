@@ -13,7 +13,7 @@ from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, Any, BinaryIO
 
 from omf.canonical import canonical_json, sha256_digest
-from omf.errors import IntegrityError, ValidationError
+from omf.errors import IntegrityError, NotFoundError, ValidationError
 from omf.ids import parse_digest
 
 if TYPE_CHECKING:
@@ -198,6 +198,87 @@ class ArtifactBuilder:
         return all(
             verify_content(entry.chunks, entry.digest, entry.size) for entry in manifest.entries
         )
+
+    def verify_graph(self, manifest: ArtifactManifest) -> bool:
+        """Verify artifact bytes and recursively referenced checkpoint components."""
+        verified: set[str] = set()
+        visiting: set[str] = set()
+
+        def visit(current: ArtifactManifest) -> bool:
+            digest = current.manifest_digest
+            if digest in verified:
+                return True
+            if digest in visiting or not self.verify(current):
+                return False
+            visiting.add(digest)
+            if current.logical_kind == "checkpoint":
+                components = current.provenance.get("components")
+                if not isinstance(components, dict) or not components:
+                    return False
+                for reference in components.values():
+                    if not isinstance(reference, str):
+                        return False
+                    try:
+                        component = self.store.read_manifest(reference)
+                    except (IntegrityError, NotFoundError, ValidationError):
+                        return False
+                    if not visit(component):
+                        return False
+            visiting.remove(digest)
+            verified.add(digest)
+            return True
+
+        return visit(manifest)
+
+    @staticmethod
+    def verify_restored(manifest: ArtifactManifest, target: str | Path) -> bool:
+        root = Path(target)
+        try:
+            root_mode = root.lstat().st_mode
+        except FileNotFoundError:
+            return False
+        if not stat.S_ISDIR(root_mode) or stat.S_ISLNK(root_mode):
+            return False
+
+        expected_files: dict[str, TreeEntry] = {}
+        expected_directories: set[str] = set()
+        if manifest.logical_kind == "directory":
+            expected_files = {entry.path: entry for entry in manifest.entries}
+            for entry in manifest.entries:
+                parent = PurePosixPath(entry.path).parent
+                while str(parent) != ".":
+                    expected_directories.add(str(parent))
+                    parent = parent.parent
+        else:
+            expected_files = {"payload": TreeEntry("payload", 0, manifest.size, manifest.digest)}
+
+        actual_files: dict[str, Path] = {}
+        actual_directories: set[str] = set()
+        for path in root.rglob("*"):
+            mode = path.lstat().st_mode
+            relative = path.relative_to(root).as_posix()
+            if stat.S_ISLNK(mode):
+                return False
+            if stat.S_ISDIR(mode):
+                actual_directories.add(relative)
+            elif stat.S_ISREG(mode):
+                actual_files[relative] = path
+            else:
+                return False
+        if set(actual_files) != set(expected_files) or actual_directories != expected_directories:
+            return False
+        for relative, expected in expected_files.items():
+            path = actual_files[relative]
+            with path.open("rb") as stream:
+                digest, size = _hash_stream(stream)
+            if digest != expected.digest or size != expected.size:
+                return False
+            if (
+                manifest.logical_kind == "directory"
+                and stat.S_IMODE(path.stat().st_mode) != expected.mode
+            ):
+                return False
+        return True
 
     def restore(self, manifest: ArtifactManifest, target: str | Path) -> None:
         destination = Path(target)

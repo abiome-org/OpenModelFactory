@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Any
 
 from omf.canonical import sha256_digest
-from omf.errors import CapabilityError
+from omf.errors import CapabilityError, IntegrityError
 from omf.executors.base import (
     DEPLOYMENT_PROTOCOL_CAPABILITIES,
     MODULE_PROTOCOL_CAPABILITIES,
@@ -50,6 +50,7 @@ class LocalExecutor(Executor):
             "environment:python-distribution-inventory",
             "bounded-logs",
             "process-group",
+            "recovery:attach",
             "rlimit",
             *MODULE_PROTOCOL_CAPABILITIES,
             *DEPLOYMENT_PROTOCOL_CAPABILITIES,
@@ -258,6 +259,19 @@ class LocalExecutor(Executor):
     def submit(self, plan: ExecutionPlan) -> str:
         execution_id = str(uuid.uuid4())
         plan.run_dir.mkdir(parents=True, exist_ok=True)
+        execution_path = plan.run_dir / "execution.json"
+        self._write_execution(
+            execution_path,
+            {
+                "id": execution_id,
+                "state": "launching",
+                "started": time.time(),
+                "timeout": plan.timeout,
+                "requiresResult": bool(plan.metadata.get("requiresResult", True)),
+                "environmentDigest": plan.metadata.get("environmentDigest"),
+                "argvDigest": plan.metadata["argvDigest"],
+            },
+        )
         request, result = plan.run_dir / "request.json", plan.run_dir / "result.json"
         if not request.exists():
             request.write_text("{}")
@@ -327,23 +341,37 @@ class LocalExecutor(Executor):
         finally:
             stdout.close()
         identity = self._identity(process.pid)
-        (plan.run_dir / "execution.json").write_text(
-            json.dumps(
-                {
-                    "id": execution_id,
-                    "pid": process.pid,
-                    "identity": identity,
-                    "started": time.time(),
-                    "timeout": plan.timeout,
-                    "requiresResult": bool(plan.metadata.get("requiresResult", True)),
-                    "environmentDigest": plan.metadata.get("environmentDigest"),
-                    "argvDigest": plan.metadata["argvDigest"],
-                }
-            )
+        self._write_execution(
+            execution_path,
+            {
+                "id": execution_id,
+                "state": "submitted",
+                "pid": process.pid,
+                "identity": identity,
+                "started": time.time(),
+                "timeout": plan.timeout,
+                "requiresResult": bool(plan.metadata.get("requiresResult", True)),
+                "environmentDigest": plan.metadata.get("environmentDigest"),
+                "argvDigest": plan.metadata["argvDigest"],
+            },
         )
         self._processes[execution_id] = process
         self._dirs[execution_id] = plan.run_dir
         return execution_id
+
+    @staticmethod
+    def _write_execution(path: Path, value: dict[str, Any]) -> None:
+        temporary = path.with_suffix(".json.tmp")
+        with temporary.open("w") as output:
+            json.dump(value, output, sort_keys=True, separators=(",", ":"))
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(temporary, path)
+        directory = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
 
     @staticmethod
     def _identity(pid: int) -> str | None:
@@ -425,12 +453,29 @@ class LocalExecutor(Executor):
 
     def attach(self, execution_id: str, run_dir: Path) -> None:
         record = json.loads((run_dir / "execution.json").read_text())
-        if str(record["id"]) != execution_id:
+        completed = (run_dir / "completion.json").is_file()
+        submitted_identity = (
+            record.get("state") == "submitted"
+            and isinstance(record.get("pid"), int)
+            and isinstance(record.get("identity"), str)
+        )
+        if str(record["id"]) != execution_id or not (submitted_identity or completed):
             raise RuntimeError("execution identity does not match the run directory")
         self._dirs[execution_id] = run_dir
 
-    def reconcile(self, run_dir: Path) -> str:
+    def recover(self, run_dir: Path) -> str | None:
+        path = run_dir / "execution.json"
+        if not path.exists():
+            return None
         record = json.loads((run_dir / "execution.json").read_text())
+        if record.get("state") != "submitted" and not (run_dir / "completion.json").is_file():
+            raise IntegrityError("local execution launch outcome is indeterminate")
         execution_id = str(record["id"])
         self.attach(execution_id, run_dir)
+        return execution_id
+
+    def reconcile(self, run_dir: Path) -> str:
+        execution_id = self.recover(run_dir)
+        if execution_id is None:
+            raise KeyError(run_dir)
         return execution_id

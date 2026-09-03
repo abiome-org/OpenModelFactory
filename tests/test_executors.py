@@ -5,7 +5,7 @@ import time
 from types import SimpleNamespace
 
 import pytest
-from omf.errors import CapabilityError, ConfigurationError, ValidationError
+from omf.errors import CapabilityError, ConfigurationError, IntegrityError, ValidationError
 from omf.executors import ExecutorContext, ExecutorProvider, ExecutorRegistry
 from omf.executors.base import DependencyLock
 from omf.executors.kubernetes import KubernetesExecutor
@@ -172,6 +172,27 @@ def test_local_executor_success_failure_logs_and_reconcile(tmp_path):
     )
     executor._processes[failed].wait(timeout=5)
     assert executor.status(failed).exit_code == 3
+
+
+def test_local_executor_rejects_an_ambiguous_launch_record(tmp_path):
+    run_dir = tmp_path / "ambiguous"
+    run_dir.mkdir()
+    (run_dir / "execution.json").write_text('{"id":"uncertain","state":"launching","started":0}')
+
+    with pytest.raises(IntegrityError, match="launch outcome is indeterminate"):
+        LocalExecutor().recover(run_dir)
+
+
+def test_local_executor_recovers_a_completed_launch_before_pid_persistence(tmp_path):
+    run_dir = tmp_path / "completed"
+    run_dir.mkdir()
+    (run_dir / "execution.json").write_text('{"id":"completed-id","state":"launching","started":0}')
+    (run_dir / "completion.json").write_text('{"exitCode":0,"reason":"exit:0","finished":1}')
+    (run_dir / "result.json").write_text("{}")
+    executor = LocalExecutor()
+
+    assert executor.recover(run_dir) == "completed-id"
+    assert executor.status("completed-id").state == "succeeded"
 
 
 def test_local_executor_enforces_timeout_without_controller_and_records_plain_command(tmp_path):

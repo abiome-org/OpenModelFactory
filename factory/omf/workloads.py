@@ -13,7 +13,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 from pydantic import ValidationError as PydanticValidationError
 
 from omf.canonical import portable_relative_path, sha256_digest
-from omf.errors import ValidationError
+from omf.errors import IntegrityError, ValidationError
 from omf.schema_registry import default_registry
 
 
@@ -196,18 +196,51 @@ class StateStore:
                     "state": "Draft",
                     "history": [],
                     "stages": {},
-                    "digests": {
-                        "workload": spec.digest,
-                        "workloadManifest": spec.source_digest,
-                        "binding": spec.binding_digest,
-                        "modules": spec.module_digests,
-                        "environments": spec.environments,
-                        "inputs": spec.input_revisions,
-                        "modelPackage": spec.model_package_ref,
-                        "reproducibility": spec.reproducibility,
-                    },
+                    "digests": self._digests(spec),
                 }
             )
+
+    @staticmethod
+    def _digests(spec: AdmittedWorkload) -> dict[str, Any]:
+        return {
+            "workload": spec.digest,
+            "workloadManifest": spec.source_digest,
+            "binding": spec.binding_digest,
+            "modules": spec.module_digests,
+            "environments": spec.environments,
+            "inputs": spec.input_revisions,
+            "modelPackage": spec.model_package_ref,
+            "reproducibility": spec.reproducibility,
+        }
+
+    def verify(self, spec: AdmittedWorkload) -> dict[str, Any]:
+        value = self.read()
+        if value.get("digests") != self._digests(spec):
+            raise IntegrityError("run state admission evidence differs from the admitted workload")
+        stages = value.get("stages")
+        known = {stage.name for stage in spec.stages}
+        if not isinstance(stages, dict) or not set(stages) <= known:
+            raise IntegrityError("run state contains an unknown stage")
+        for name, stage in stages.items():
+            if not isinstance(stage, dict) or stage.get("status") not in {"succeeded", "failed"}:
+                raise IntegrityError(f"run state for stage {name!r} is invalid")
+            attempt = stage.get("attempt")
+            if not isinstance(attempt, int) or isinstance(attempt, bool) or attempt < 1:
+                raise IntegrityError(f"run state attempt for stage {name!r} is invalid")
+            if stage["status"] == "succeeded" and not isinstance(stage.get("outputs"), dict):
+                raise IntegrityError(f"run state outputs for stage {name!r} are invalid")
+        if value.get("state") == RunState.SUCCEEDED.value:
+            if set(stages) != known or any(
+                stage["status"] != "succeeded" for stage in stages.values()
+            ):
+                raise IntegrityError("succeeded run state does not contain every successful stage")
+            expected_outputs = {stage.name: set(stage.outputs) for stage in spec.stages}
+            for name, expected in expected_outputs.items():
+                if not expected <= set(stages[name]["outputs"]):
+                    raise IntegrityError(
+                        f"succeeded run state is missing declared outputs for stage {name!r}"
+                    )
+        return value
 
     def _write(self, value: dict[str, Any]) -> None:
         tmp = self.path.with_suffix(".tmp")
@@ -264,8 +297,12 @@ class WorkloadRunner:
         for name in self.spec.topological_order():
             stage = next(x for x in self.spec.stages if x.name == name)
             old = value["stages"].get(name)
-            if old and old.get("status") == "succeeded" and verify(old.get("outputs", {})):
-                continue
+            if old and old.get("status") == "succeeded":
+                if verify(old.get("outputs", {})):
+                    continue
+                raise IntegrityError(
+                    f"succeeded stage {name!r} output evidence failed verification"
+                )
             for attempt in range(stage.retries + 1):
                 try:
                     outputs = execute(stage)

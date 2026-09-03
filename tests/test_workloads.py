@@ -2,7 +2,7 @@ from pathlib import Path
 
 import pytest
 import yaml
-from omf.errors import ValidationError
+from omf.errors import IntegrityError, ValidationError
 from omf.workloads import AdmittedWorkload, RunState, Stage, StateStore, project_workload
 
 
@@ -26,6 +26,12 @@ def test_cycle_retry_and_state(tmp_path):
     store = StateStore(tmp_path / "state.json")
     store.initialize(spec)
     assert store.transition(RunState.DRAFT, RunState.VALIDATED)["state"] == "Validated"
+    assert store.verify(spec)["digests"]["workload"] == spec.digest
+    value = store.read()
+    value["stages"]["unknown"] = {"status": "succeeded", "attempt": 1, "outputs": {}}
+    store._write(value)
+    with pytest.raises(IntegrityError, match="unknown stage"):
+        store.verify(spec)
 
 
 def test_canonical_workload_projection_enforces_semantics():

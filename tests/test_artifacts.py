@@ -17,16 +17,23 @@ def test_file_and_tree_roundtrip(tmp_path):
     manifest = builder.import_path(source)
     assert builder.verify(manifest)
     builder.restore(manifest, tmp_path / "restored")
+    assert builder.verify_restored(manifest, tmp_path / "restored")
     assert (tmp_path / "restored/nested/b").read_bytes() == b"def"
     assert store.read_manifest(manifest.manifest_digest) == manifest
+    (tmp_path / "restored/nested/b").write_bytes(b"changed")
+    assert not builder.verify_restored(manifest, tmp_path / "restored")
 
 
 def test_file_restore_uses_payload_name(tmp_path):
     source = tmp_path / "file"
     source.write_bytes(b"content")
     builder = ArtifactBuilder(FilesystemStore(tmp_path / "store"))
-    builder.restore(builder.import_path(source), tmp_path / "out")
+    manifest = builder.import_path(source)
+    builder.restore(manifest, tmp_path / "out")
     assert (tmp_path / "out/payload").read_bytes() == b"content"
+    assert builder.verify_restored(manifest, tmp_path / "out")
+    (tmp_path / "out/extra").write_text("unexpected")
+    assert not builder.verify_restored(manifest, tmp_path / "out")
 
 
 def test_repeated_chunks_are_valid_and_restore_in_order(tmp_path):
@@ -116,11 +123,13 @@ def test_atomic_checkpoint_publishes_only_verified_shards(tmp_path):
     )
     assert checkpoint.logical_kind == "checkpoint"
     assert builder.verify(checkpoint)
+    assert builder.verify_graph(checkpoint)
     assert checkpoint.provenance["components"] == {"model-state": shard.manifest_digest}
     assert checkpoint.provenance["replay"]["status"] == "not-claimed"
     digest_hex = shard.chunks[0].digest.removeprefix("sha256:")
     blob = tmp_path / "store/blobs" / digest_hex[:2] / digest_hex
     blob.write_bytes(b"corrupt")
+    assert not builder.verify_graph(checkpoint)
     with pytest.raises(IntegrityError, match="verification failed"):
         AtomicCheckpointPublisher(store).publish(
             {"model-state": shard},

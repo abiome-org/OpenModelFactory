@@ -5,6 +5,7 @@ import shutil
 import subprocess
 import time
 from copy import deepcopy
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -15,12 +16,13 @@ from omf.database import AliasRepository
 from omf.errors import CapabilityError, ConflictError, IntegrityError, OMFError, ValidationError
 from omf.executors import (
     MODULE_PROTOCOL_CAPABILITIES,
+    ExecutionPlan,
     ExecutorContext,
     ExecutorProvider,
     ExecutorRegistry,
     LocalExecutor,
 )
-from omf.factory import Factory
+from omf.factory import Factory, _execution_plan_digest
 from omf.modules import load_manifest
 from omf.sdk import ProtocolRequest
 from omf.workloads import project_workload
@@ -896,6 +898,244 @@ def test_pending_run_operation_executes_after_controller_restart(tmp_path):
     assert run_resource["spec"]["extensions"]["operationId"] == operation["id"]
 
 
+def test_execution_plan_digest_covers_every_execution_field(tmp_path):
+    plan = ExecutionPlan(
+        ("python3", "module.py"),
+        tmp_path / "run",
+        tmp_path / "source",
+        {"MODE": "train"},
+        {"cpu": 1},
+        30.0,
+        True,
+        {"provider": {"queue": "a"}},
+    )
+    digest = _execution_plan_digest(
+        plan, request_digest="sha256:request", environment_digest="sha256:environment"
+    )
+    changes = [
+        replace(plan, argv=("python3", "other.py")),
+        replace(plan, run_dir=tmp_path / "other-run"),
+        replace(plan, cwd=tmp_path / "other-source"),
+        replace(plan, env={"MODE": "evaluate"}),
+        replace(plan, resources={"cpu": 2}),
+        replace(plan, timeout=60.0),
+        replace(plan, deny_network=False),
+        replace(plan, metadata={"provider": {"queue": "b"}}),
+    ]
+
+    assert all(
+        _execution_plan_digest(
+            changed,
+            request_digest="sha256:request",
+            environment_digest="sha256:environment",
+        )
+        != digest
+        for changed in changes
+    )
+
+
+@pytest.mark.parametrize("interrupted_event", ["SpecValidated", "RunAdmitted"])
+def test_recovery_repairs_run_admission_event_crash_gaps(tmp_path, monkeypatch, interrupted_event):
+    paths = _project(tmp_path)
+    bootstrap(paths)
+    with Factory(paths) as factory:
+        factory.add_data(
+            paths.root / "data/numbers.jsonl",
+            name="example-numbers",
+            mode="copy",
+            rights={"license": "CC0-1.0", "trainingAllowed": True},
+        )
+        operation = factory.create_run_operation(
+            paths.root / "workloads/example-statistical.yaml",
+            paths.root / "bindings/local.yaml",
+        )
+        append = factory.events.append
+        interrupted = False
+
+        def interrupt_event(**kwargs):
+            nonlocal interrupted
+            matches_run_spec = (
+                kwargs["type"] == "SpecValidated" and kwargs["data"].get("kind") == "Run"
+            )
+            if not interrupted and (
+                kwargs["type"] == interrupted_event
+                and (interrupted_event == "RunAdmitted" or matches_run_spec)
+            ):
+                interrupted = True
+                raise KeyboardInterrupt(f"controller stopped before {interrupted_event}")
+            return append(**kwargs)
+
+        with monkeypatch.context() as patch:
+            patch.setattr(factory.events, "append", interrupt_event)
+            with pytest.raises(KeyboardInterrupt, match="controller stopped"):
+                factory.execute_run_operation(operation["id"])
+
+        completed = factory.execute_run_operation(operation["id"])
+        run = factory._run_resource(operation["id"])
+        spec_events = factory.events.query(
+            resource_uid=run["metadata"]["uid"], type="SpecValidated"
+        )
+        admission_events = factory.events.query(run_id=operation["id"], type="RunAdmitted")
+
+    assert completed["state"] == "succeeded"
+    assert len(spec_events) == 1
+    assert len(admission_events) == 1
+
+
+def test_recovery_integrity_failure_finalizes_the_durable_run(tmp_path, monkeypatch):
+    paths = _project(tmp_path)
+    bootstrap(paths)
+    with Factory(paths) as factory:
+        factory.add_data(
+            paths.root / "data/numbers.jsonl",
+            name="example-numbers",
+            mode="copy",
+            rights={"license": "CC0-1.0", "trainingAllowed": True},
+        )
+        operation = factory.create_run_operation(
+            paths.root / "workloads/example-statistical.yaml",
+            paths.root / "bindings/local.yaml",
+        )
+        append = factory.events.append
+
+        def interrupt_admission(**kwargs):
+            if kwargs["type"] == "RunAdmitted":
+                raise KeyboardInterrupt("controller stopped after run persistence")
+            return append(**kwargs)
+
+        with monkeypatch.context() as patch:
+            patch.setattr(factory.events, "append", interrupt_admission)
+            with pytest.raises(KeyboardInterrupt, match="controller stopped"):
+                factory.execute_run_operation(operation["id"])
+
+        run = factory._run_resource(operation["id"])
+        source_ref = next(iter(run["spec"]["extensions"]["moduleDigests"].values()))
+        source = factory.local_store.read_manifest(source_ref)
+        factory.local_store.quarantine_chunk(source.chunks[0].digest)
+        with pytest.raises(IntegrityError, match="source failed integrity verification"):
+            factory.execute_run_operation(operation["id"])
+        status = factory.run_status(operation["id"])
+        terminal_events = factory.events.query(
+            run_id=operation["id"], resource_uid=operation["id"], type="RunStateChanged"
+        )
+        failed_operation = factory.operations.get(operation["id"])
+
+    assert failed_operation["state"] == "failed"
+    assert status["execution"]["state"] == "Failed"
+    assert status["status"]["state"] == "Failed"
+    assert [event.data["state"] for event in terminal_events] == ["Failed"]
+
+
+def test_running_local_operation_reattaches_without_duplicate_stage_work(tmp_path):
+    paths = _project(tmp_path)
+    binding_path = paths.root / "bindings/local.yaml"
+    binding = yaml.safe_load(binding_path.read_text())
+    binding["spec"]["executor"] = "recoverable-local"
+    binding_path.write_text(yaml.safe_dump(binding))
+    bootstrap(paths)
+    observed = {"interrupted": False, "submissions": 0}
+
+    class RecoverableLocal(LocalExecutor):
+        def submit(self, plan):
+            observed["submissions"] += 1
+            return super().submit(plan)
+
+        def status(self, execution_id):
+            if not observed["interrupted"]:
+                observed["interrupted"] = True
+                raise KeyboardInterrupt("controller interrupted after durable submit")
+            return super().status(execution_id)
+
+    registry = ExecutorRegistry()
+    registry.register(
+        ExecutorProvider(
+            "recoverable-local",
+            lambda _context: RecoverableLocal(),
+            capabilities=LocalExecutor().capabilities,
+            config_contract={"type": "object", "additionalProperties": False},
+        )
+    )
+    with Factory(paths, executors=registry) as factory:
+        factory.add_data(
+            paths.root / "data/numbers.jsonl",
+            name="example-numbers",
+            mode="copy",
+            rights={"license": "CC0-1.0", "trainingAllowed": True},
+        )
+        operation = factory.create_run_operation(
+            paths.root / "workloads/example-statistical.yaml", binding_path
+        )
+        with pytest.raises(KeyboardInterrupt, match="controller interrupted"):
+            factory.execute_run_operation(operation["id"])
+        assert factory.operations.get(operation["id"])["state"] == "running"
+
+    original_module = paths.root / "modules/examples/statistical/main.py"
+    original_module.write_text("raise RuntimeError('mutable source must not be reused')\n")
+    with Factory(paths, executors=registry) as restarted:
+        completed = restarted.execute_run_operation(operation["id"])
+        admission_events = restarted.events.query(run_id=operation["id"], type="RunAdmitted")
+
+    assert completed["state"] == "succeeded"
+    assert completed["result"]["outputs"]["train.mean"] == 3.0
+    assert observed["submissions"] == 2
+    assert len(admission_events) == 1
+
+
+def test_recovery_rejects_a_changed_plan_before_executor_attachment(tmp_path):
+    paths = _project(tmp_path)
+    bootstrap(paths)
+    module_root = paths.root / "modules/examples/statistical"
+    manifest, code_root = load_manifest(module_root / "module.yaml", paths.root)
+
+    class ChangingPlanLocal(LocalExecutor):
+        changed = False
+        attached = False
+        status_calls = 0
+
+        def plan(self, **kwargs):
+            plan = super().plan(**kwargs)
+            return replace(plan, resources={"cpu": 2}) if self.changed else plan
+
+        def attach(self, execution_id, run_dir):
+            self.attached = True
+            return super().attach(execution_id, run_dir)
+
+        def status(self, execution_id):
+            self.status_calls += 1
+            raise KeyboardInterrupt("controller stopped after submit")
+
+    executor = ChangingPlanLocal()
+    with Factory(paths) as factory:
+        environment = factory._prepare_module_environment(executor, manifest, code_root)
+        request = ProtocolRequest(operation="validate")
+        stage_dir = paths.runs / "changed-plan"
+        with pytest.raises(KeyboardInterrupt, match="controller stopped"):
+            factory._execute_module(
+                manifest,
+                code_root,
+                request,
+                stage_dir,
+                executor=executor,
+                executor_config={},
+                environment=environment,
+            )
+        executor.changed = True
+        with pytest.raises(IntegrityError, match="plan differs"):
+            factory._execute_module(
+                manifest,
+                code_root,
+                request,
+                stage_dir,
+                executor=executor,
+                executor_config={},
+                environment=environment,
+                recovering=True,
+            )
+
+    assert not executor.attached
+    assert executor.status_calls == 1
+
+
 def test_stale_running_operation_fails_closed_without_reexecution(tmp_path, monkeypatch):
     paths = _project(tmp_path)
     bootstrap(paths)
@@ -1001,6 +1241,139 @@ def test_running_operation_reconciles_immutable_completed_result(tmp_path, monke
     assert status["state"] == "Succeeded"
     assert len(result_lineage) == 1
     assert [event.data["state"] for event in terminal_events] == ["Succeeded"]
+
+
+def test_running_operation_publishes_result_from_succeeded_run_state(tmp_path, monkeypatch):
+    paths = _project(tmp_path)
+    bootstrap(paths)
+    submissions = 0
+    submit = LocalExecutor.submit
+
+    def count_submit(executor, plan):
+        nonlocal submissions
+        submissions += 1
+        return submit(executor, plan)
+
+    monkeypatch.setattr(LocalExecutor, "submit", count_submit)
+    with Factory(paths) as factory:
+        factory.add_data(
+            paths.root / "data/numbers.jsonl",
+            name="example-numbers",
+            mode="copy",
+            rights={"license": "CC0-1.0", "trainingAllowed": True},
+        )
+        operation = factory.create_run_operation(
+            paths.root / "workloads/example-statistical.yaml",
+            paths.root / "bindings/local.yaml",
+        )
+        apply_resource = factory.apply_resource
+
+        def interrupt_before_result(value, **kwargs):
+            if value.get("kind") == "RunResult":
+                raise KeyboardInterrupt("controller stopped before result publication")
+            return apply_resource(value, **kwargs)
+
+        with monkeypatch.context() as patch:
+            patch.setattr(factory, "apply_resource", interrupt_before_result)
+            with pytest.raises(KeyboardInterrupt, match="controller stopped"):
+                factory.execute_run_operation(operation["id"])
+
+        assert (
+            json.loads((paths.runs / operation["id"] / "state.json").read_text())["state"]
+            == "Succeeded"
+        )
+        completed = factory.execute_run_operation(operation["id"])
+
+    assert completed["state"] == "succeeded"
+    assert completed["result"]["outputs"]["train.mean"] == 3.0
+    assert submissions == 2
+
+
+def test_succeeded_run_with_corrupt_output_evidence_fails_closed(tmp_path, monkeypatch):
+    paths = _project(tmp_path)
+    bootstrap(paths)
+    with Factory(paths) as factory:
+        factory.add_data(
+            paths.root / "data/numbers.jsonl",
+            name="example-numbers",
+            mode="copy",
+            rights={"license": "CC0-1.0", "trainingAllowed": True},
+        )
+        operation = factory.create_run_operation(
+            paths.root / "workloads/example-statistical.yaml",
+            paths.root / "bindings/local.yaml",
+        )
+        apply_resource = factory.apply_resource
+
+        def interrupt_before_result(value, **kwargs):
+            if value.get("kind") == "RunResult":
+                raise KeyboardInterrupt("controller stopped before result publication")
+            return apply_resource(value, **kwargs)
+
+        with monkeypatch.context() as patch:
+            patch.setattr(factory, "apply_resource", interrupt_before_result)
+            with pytest.raises(KeyboardInterrupt, match="controller stopped"):
+                factory.execute_run_operation(operation["id"])
+
+        state = json.loads((paths.runs / operation["id"] / "state.json").read_text())
+        model_ref = state["stages"]["train"]["outputs"]["model"]
+        model = factory.local_store.read_manifest(model_ref)
+        factory.local_store.quarantine_chunk(model.chunks[0].digest)
+        with pytest.raises(IntegrityError, match="output evidence failed verification"):
+            factory.execute_run_operation(operation["id"])
+        failed = factory.operations.get(operation["id"])
+        status = factory.run_status(operation["id"])
+        results = factory.resources.list(kind="RunResult")
+
+    assert failed["state"] == "failed"
+    assert status["status"]["state"] == "Failed"
+    assert results == []
+
+
+@pytest.mark.parametrize("tamper", ["missing-stage", "failed-stage", "missing-output"])
+def test_incomplete_succeeded_run_state_cannot_publish_a_result(tmp_path, monkeypatch, tamper):
+    paths = _project(tmp_path)
+    bootstrap(paths)
+    with Factory(paths) as factory:
+        factory.add_data(
+            paths.root / "data/numbers.jsonl",
+            name="example-numbers",
+            mode="copy",
+            rights={"license": "CC0-1.0", "trainingAllowed": True},
+        )
+        operation = factory.create_run_operation(
+            paths.root / "workloads/example-statistical.yaml",
+            paths.root / "bindings/local.yaml",
+        )
+        apply_resource = factory.apply_resource
+
+        def interrupt_before_result(value, **kwargs):
+            if value.get("kind") == "RunResult":
+                raise KeyboardInterrupt("controller stopped before result publication")
+            return apply_resource(value, **kwargs)
+
+        with monkeypatch.context() as patch:
+            patch.setattr(factory, "apply_resource", interrupt_before_result)
+            with pytest.raises(KeyboardInterrupt, match="controller stopped"):
+                factory.execute_run_operation(operation["id"])
+
+        state_path = paths.runs / operation["id"] / "state.json"
+        state = json.loads(state_path.read_text())
+        if tamper == "missing-stage":
+            state["stages"].pop("evaluate")
+        elif tamper == "failed-stage":
+            state["stages"]["evaluate"] = {"status": "failed", "attempt": 1}
+        else:
+            state["stages"]["train"]["outputs"].pop("mean")
+        state_path.write_text(json.dumps(state))
+
+        with pytest.raises(IntegrityError, match="succeeded run state"):
+            factory.execute_run_operation(operation["id"])
+        failed = factory.operations.get(operation["id"])
+        results = factory.resources.list(kind="RunResult")
+
+    assert failed["state"] == "failed"
+    assert results == []
 
 
 def test_run_operation_execution_lease_rejects_concurrent_worker(tmp_path):
