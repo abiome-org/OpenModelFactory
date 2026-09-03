@@ -5,7 +5,10 @@
 - Both GitHub Actions workflows were invalid YAML: the unquoted
   `--only-binary=:all: --require-hashes` argument was parsed as a mapping, so
   every run failed before any job started. The lines are quoted and both
-  workflows accept manual dispatch.
+  workflows accept manual dispatch. Test jobs also lift the runner's
+  AppArmor restriction on unprivileged user namespaces, which the local
+  executor needs to enforce module network denial; without it every workload
+  run on a hosted runner is refused as not ready.
 - The local executor launches a module interpreter through the path it named
   instead of the resolved symlink target, so modules run inside the project's
   virtual environment again. Projects created by `install.sh` were affected.
