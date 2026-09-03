@@ -22,7 +22,7 @@ from typing import Any
 from omf.agent import AgentControl
 from omf.artifacts import ArtifactBuilder, ArtifactManifest, AtomicCheckpointPublisher
 from omf.backups import create_backup
-from omf.canonical import canonical_json, load_document, sha256_digest
+from omf.canonical import canonical_json, load_document, portable_relative_path, sha256_digest
 from omf.config import ProjectPaths, load_project
 from omf.data import DataService, DatasetSnapshot
 from omf.database import Database, ResourceRepository
@@ -869,15 +869,21 @@ class Factory:
         )
 
     def _module_requirements(self, stages: list[Stage]) -> frozenset[str]:
-        required = set(MODULE_PROTOCOL_CAPABILITIES)
+        manifests: list[ModuleManifest] = []
         for stage in stages:
             module_path = Path(stage.module)
             if not module_path.is_absolute():
                 module_path = self.paths.root / module_path
             manifest, _code_root = load_manifest(module_path, self.paths.root)
             validate_fixtures(manifest)
-            if not manifest.network:
-                required.add("isolation:network-deny")
+            manifests.append(manifest)
+        return self._manifest_requirements(manifests)
+
+    @staticmethod
+    def _manifest_requirements(manifests: list[ModuleManifest]) -> frozenset[str]:
+        required = set(MODULE_PROTOCOL_CAPABILITIES)
+        if any(not manifest.network for manifest in manifests):
+            required.add("isolation:network-deny")
         return frozenset(required)
 
     def _admit_module_environments(
@@ -930,13 +936,18 @@ class Factory:
                 raise ValidationError("workload must be an object")
             admitted = project_workload(workload)
             self._validate_namespace(workload)
-            required = self._module_requirements(admitted.stages)
+            execution_stages = [*admitted.stages]
+            if admitted.model_package_ref is not None:
+                model_package = self._pin_model_package(admitted.model_package_ref, admitted.stages)
+                assert model_package is not None
+                execution_stages.append(self._inference_adapter_stage(model_package))
+            required = self._module_requirements(execution_stages)
         name = str(binding["spec"]["executor"])
         resolved = self._resolve_executor(name, binding, self._executor_config(binding))
         report = self.executors.preflight(resolved, required_capabilities=required)
         if workload_path is not None and report["ready"]:
             try:
-                self._admit_module_environments(admitted.stages, resolved)
+                self._admit_module_environments(execution_stages, resolved)
             except Exception as exc:
                 report["ready"] = False
                 report["issues"].append(str(exc))
@@ -956,15 +967,18 @@ class Factory:
         default_registry.validate_as(binding_raw, "Binding")
         self._validate_namespace(workload_raw)
         self._validate_namespace(binding_raw)
+        model_package = self._pin_model_package(admitted.model_package_ref, stages)
+        execution_stages = [*stages]
+        if model_package is not None:
+            execution_stages.append(self._inference_adapter_stage(model_package))
         resolved = self._resolve_executor(
             str(binding_raw["spec"]["executor"]),
             binding_raw,
             self._executor_config(binding_raw),
         )
-        self._require_executor(resolved, self._module_requirements(stages))
-        self._admit_module_environments(stages, resolved)
+        self._require_executor(resolved, self._module_requirements(execution_stages))
+        self._admit_module_environments(execution_stages, resolved)
         pinned_inputs = self._pin_stage_inputs(stages)
-        model_package = self._pin_model_package(admitted.model_package_ref, stages)
         evaluation_specs = self._pin_named_resources(
             admitted.evaluation_refs, "evaluationspec/", "EvaluationSpec"
         )
@@ -976,6 +990,12 @@ class Factory:
             validate_fixtures(manifest)
             with tempfile.NamedTemporaryFile(dir=self.paths.packages, suffix=".tar") as package:
                 module_packages[stage.name] = package_module(module_path.parent, package.name)
+        adapter_packages: dict[str, str] = {}
+        if model_package is not None:
+            adapter = self._inference_adapter_stage(model_package)
+            module_path = self._project_file(adapter.module, kind="inference adapter")
+            with tempfile.NamedTemporaryFile(dir=self.paths.packages, suffix=".tar") as package:
+                adapter_packages["inference"] = package_module(module_path.parent, package.name)
         operation_id = str(uuid7())
         return self.operations.create(
             "run",
@@ -986,6 +1006,7 @@ class Factory:
                 "workloadDigest": sha256_digest(workload_raw),
                 "bindingDigest": sha256_digest(binding_raw),
                 "modulePackages": module_packages,
+                "adapterPackages": adapter_packages,
                 "resources": {
                     "datasets": {
                         reference: self._resource_uri(resource)
@@ -1023,6 +1044,15 @@ class Factory:
                 digest = package_module(module_path.parent, package.name)
             if digest != request["modulePackages"].get(stage.name):
                 raise IntegrityError("queued module source changed before admission")
+        model_package_ref = request["resources"]["modelPackage"]
+        if model_package_ref is not None:
+            model_package = self._resource_by_uri("ModelPackage", model_package_ref)
+            adapter = self._inference_adapter_stage(model_package)
+            module_path = self._project_file(adapter.module, kind="inference adapter")
+            with tempfile.NamedTemporaryFile(dir=self.paths.packages, suffix=".tar") as package:
+                digest = package_module(module_path.parent, package.name)
+            if digest != request["adapterPackages"].get("inference"):
+                raise IntegrityError("queued inference adapter source changed before admission")
 
     def execute_run_operation(self, operation_id: str) -> dict[str, Any]:
         lease = self.paths.state / "operations" / f"{operation_id}.lock"
@@ -1126,6 +1156,7 @@ class Factory:
                 expected_workload_digest=request["workloadDigest"],
                 expected_binding_digest=request["bindingDigest"],
                 expected_module_packages=request["modulePackages"],
+                expected_adapter_packages=request.get("adapterPackages", {}),
                 expected_resources=request["resources"],
                 recovering=recovering,
             )
@@ -1269,6 +1300,7 @@ class Factory:
         expected_workload_digest: str,
         expected_binding_digest: str,
         expected_module_packages: dict[str, str],
+        expected_adapter_packages: dict[str, str],
         expected_resources: dict[str, Any],
         recovering: bool = False,
     ) -> dict[str, Any]:
@@ -1307,18 +1339,27 @@ class Factory:
         self._validate_namespace(binding_raw)
         executor_name = str(binding_raw["spec"]["executor"])
         stages = admitted.stages
-        required = self._module_requirements(stages)
+        pinned_inputs = self._pin_stage_inputs(stages, expected_resources["datasets"])
+        model_package = self._pin_model_package(
+            admitted.model_package_ref,
+            stages,
+            expected_resources["modelPackage"],
+            validate_source=not recovering,
+        )
+        inference_stage = (
+            self._inference_adapter_stage(model_package) if model_package is not None else None
+        )
+        expected_adapter_names = {"inference"} if inference_stage is not None else set()
+        if set(expected_adapter_packages) != expected_adapter_names:
+            raise IntegrityError("queued model adapter sources do not match the workload")
+        execution_stages = [*stages, *([inference_stage] if inference_stage is not None else [])]
         resolved_executor = self._resolve_executor(
             executor_name, binding_raw, self._executor_config(binding_raw)
         )
-        self._require_executor(resolved_executor, required)
-        initial_admission = (
-            None if recovering else self._admit_module_environments(stages, resolved_executor)
-        )
-        pinned_inputs = self._pin_stage_inputs(stages, expected_resources["datasets"])
-        model_package = self._pin_model_package(
-            admitted.model_package_ref, stages, expected_resources["modelPackage"]
-        )
+        initial_admission = None
+        if not recovering:
+            self._require_executor(resolved_executor, self._module_requirements(execution_stages))
+            initial_admission = self._admit_module_environments(execution_stages, resolved_executor)
         evaluation_specs = self._pin_named_resources(
             admitted.evaluation_refs,
             "evaluationspec/",
@@ -1340,17 +1381,43 @@ class Factory:
         admitted_modules: dict[str, tuple[ModuleManifest, Path, str]] = {}
         module_digests: dict[str, str] = {}
         environments: dict[str, dict[str, Any]] = {}
-        for stage in stages:
+        inference_evidence: dict[str, Any] | None = None
+        captured_sources: list[
+            tuple[
+                Stage,
+                bool,
+                ModuleManifest,
+                Path,
+                str,
+                str,
+                dict[str, Any] | None,
+            ]
+        ] = []
+        for stage in execution_stages:
+            is_inference = stage is inference_stage
+            expected_environment: dict[str, Any] | None = None
             if recovering:
                 source_root = run_dir / "sources" / stage.name
                 manifest, code_root = load_manifest(source_root / "module.yaml", source_root)
                 with tempfile.NamedTemporaryFile(dir=self.paths.packages, suffix=".tar") as package:
                     package_digest = package_module(source_root, package.name)
-                artifact_digest = run_resource["spec"]["extensions"]["moduleDigests"].get(
-                    stage.name
-                )
+                if is_inference:
+                    inference_admission = run_resource["spec"]["extensions"].get("inferenceAdapter")
+                    if not isinstance(inference_admission, dict):
+                        raise IntegrityError("recovered run has no admitted inference adapter")
+                    artifact_digest = inference_admission.get("sourceDigest")
+                    expected_environment = inference_admission.get("environment")
+                else:
+                    artifact_digest = run_resource["spec"]["extensions"]["moduleDigests"].get(
+                        stage.name
+                    )
+                    expected_environment = run_resource["spec"]["extensions"]["environments"].get(
+                        stage.name
+                    )
                 if not isinstance(artifact_digest, str):
                     raise IntegrityError("recovered run has no admitted module source")
+                if not isinstance(expected_environment, dict):
+                    raise IntegrityError("recovered run has no admitted module environment")
                 source_manifest = self.local_store.read_manifest(artifact_digest)
                 if not ArtifactBuilder(self.local_store).verify(source_manifest):
                     raise IntegrityError("recovered module source failed integrity verification")
@@ -1363,23 +1430,57 @@ class Factory:
                 manifest, code_root, package_digest, artifact_digest = self._capture_module_source(
                     module_path, extract_to=run_dir / "sources" / stage.name
                 )
-            if package_digest != expected_module_packages.get(stage.name):
+            expected_package = (
+                expected_adapter_packages.get("inference")
+                if is_inference
+                else expected_module_packages.get(stage.name)
+            )
+            if package_digest != expected_package:
                 raise IntegrityError("module source changed during admission")
+            captured_sources.append(
+                (
+                    stage,
+                    is_inference,
+                    manifest,
+                    code_root,
+                    package_digest,
+                    artifact_digest,
+                    expected_environment,
+                )
+            )
+        if recovering:
+            self._require_executor(
+                resolved_executor,
+                self._manifest_requirements([source[2] for source in captured_sources]),
+            )
+        for (
+            stage,
+            is_inference,
+            manifest,
+            code_root,
+            package_digest,
+            artifact_digest,
+            expected_environment,
+        ) in captured_sources:
             environment = self._prepare_module_environment(
                 resolved_executor.executor, manifest, code_root
             )
-            if recovering:
-                expected_environment = run_resource["spec"]["extensions"]["environments"][
-                    stage.name
-                ]
-            else:
+            if not recovering:
                 assert initial_admission is not None
                 expected_environment = initial_admission[stage.name][2]
+            assert expected_environment is not None
             if environment["digest"] != expected_environment["digest"]:
                 raise IntegrityError("module environment changed after admission")
-            admitted_modules[stage.name] = (manifest, code_root, artifact_digest)
-            module_digests[stage.name] = artifact_digest
-            environments[stage.name] = environment
+            if is_inference:
+                inference_evidence = {
+                    "sourceDigest": artifact_digest,
+                    "packageDigest": package_digest,
+                    "environment": environment,
+                }
+            else:
+                admitted_modules[stage.name] = (manifest, code_root, artifact_digest)
+                module_digests[stage.name] = artifact_digest
+                environments[stage.name] = environment
         spec = admitted.model_copy(
             update={
                 "source_digest": workload_resource["metadata"]["revision"],
@@ -1445,6 +1546,7 @@ class Factory:
                             "mixRef": spec.mix_ref,
                             "moduleDigests": spec.module_digests,
                             "environments": spec.environments,
+                            "inferenceAdapter": inference_evidence,
                             "reproducibility": spec.reproducibility,
                         },
                     },
@@ -1749,6 +1851,8 @@ class Factory:
         reference: str | None,
         stages: list[Stage],
         expected_revision: str | None = None,
+        *,
+        validate_source: bool = True,
     ) -> dict[str, Any] | None:
         if reference is None:
             if expected_revision is not None:
@@ -1791,10 +1895,11 @@ class Factory:
         workload_stages = {stage.name: stage for stage in stages}
         stage_outputs = {stage.name: set(stage.outputs) for stage in stages}
         adapters = package_spec["adapters"]
-        for name in ("trainingReference", "inferenceReference"):
-            if adapters[name]["stage"] not in stage_outputs:
-                raise ValidationError(f"ModelPackage {name} references an unknown workload stage")
         training = adapters["trainingReference"]
+        if training["stage"] not in stage_outputs:
+            raise ValidationError(
+                "ModelPackage trainingReference references an unknown workload stage"
+            )
         training_stage = workload_stages[training["stage"]]
         if training["operation"] != training_stage.operation or any(
             training_stage.config.get(key) != value for key, value in training["config"].items()
@@ -1803,6 +1908,19 @@ class Factory:
                 "ModelPackage trainingReference does not match the workload stage"
             )
         inference = adapters["inferenceReference"]
+        if "module" not in inference:
+            raise ValidationError(
+                "legacy stage-based inference adapter is ineligible; apply a ModelPackage "
+                "revision with inferenceReference.module"
+            )
+        inference_module = portable_relative_path(inference["module"], "inference adapter")
+        training_module = portable_relative_path(training_stage.module, "training adapter")
+        if inference_module == training_module:
+            raise ValidationError("ModelPackage inferenceReference must use an independent module")
+        if validate_source:
+            inference_path = self._project_file(str(inference_module), kind="inference adapter")
+            inference_manifest, _code_root = load_manifest(inference_path, self.paths.root)
+            validate_fixtures(inference_manifest)
         state_output = inference.get("stateOutput")
         if not state_output or "." not in state_output:
             raise ValidationError(
@@ -1812,6 +1930,16 @@ class Factory:
         if stage_name not in stage_outputs or output_name not in stage_outputs[stage_name]:
             raise ValidationError("ModelPackage stateOutput is not declared by the workload")
         return resource
+
+    @staticmethod
+    def _inference_adapter_stage(model_package: dict[str, Any]) -> Stage:
+        adapter = model_package["spec"]["adapters"]["inferenceReference"]
+        return Stage(
+            name="_inference",
+            module=adapter["module"],
+            operation=adapter["operation"],
+            config=adapter["config"],
+        )
 
     def _pin_named_resources(
         self,
@@ -2032,12 +2160,12 @@ class Factory:
     ) -> tuple[bool, list[dict[str, Any]], int]:
         package_spec = model_package["spec"]
         adapter = package_spec["adapters"]["inferenceReference"]
-        stage = str(adapter["stage"])
         admission = run_resource["spec"]["extensions"]
         try:
-            source_digest = admission["moduleDigests"][stage]
+            adapter_admission = admission["inferenceAdapter"]
+            source_digest = adapter_admission["sourceDigest"]
             state = run_result["spec"]["outputs"][adapter["stateOutput"]]
-        except KeyError as exc:
+        except (KeyError, TypeError) as exc:
             raise IntegrityError(
                 "model package adapter does not match admitted run outputs"
             ) from exc
@@ -2049,6 +2177,18 @@ class Factory:
         source_manifest = self.local_store.read_manifest(source_digest)
         if not ArtifactBuilder(self.local_store).verify(source_manifest):
             raise IntegrityError("admitted compatibility adapter source failed verification")
+        if source_manifest.digest != adapter_admission.get("packageDigest"):
+            raise IntegrityError("compatibility adapter source differs from run admission")
+        self.lineage.add(
+            LineageEdge(
+                f"artifact:{source_digest}",
+                f"run:{run_id}/compatibility",
+                "used",
+                "entity",
+                "activity",
+                run_id=run_id,
+            )
+        )
         failures: list[dict[str, Any]] = []
         vectors = package_spec["compatibilityVectors"]
         with tempfile.TemporaryDirectory(dir=self.paths.packages) as temporary_name:
@@ -2063,7 +2203,7 @@ class Factory:
                 | (frozenset({"isolation:network-deny"}) if not manifest.network else frozenset()),
             )
             environment = self._prepare_module_environment(resolved.executor, manifest, code_root)
-            if environment["digest"] != admission["environments"][stage]["digest"]:
+            if environment["digest"] != adapter_admission["environment"]["digest"]:
                 raise IntegrityError("compatibility adapter environment differs from run admission")
             signatures = package_spec["signatures"]
             validate_contract(signatures["state"], state, "model package state")
@@ -2306,8 +2446,20 @@ class Factory:
             raise ValidationError("a release may reference only one aggregate state artifact")
         state_digest = state_candidates[0] if state_candidates else model_digest
         admission = run_resource["spec"]["extensions"]
-        module_digests = admission["moduleDigests"]
-        required_scan_subjects = {model_digest, *module_digests.values()}
+        module_digests: dict[str, str] = admission["moduleDigests"]
+        source_digests: dict[str, str] = dict(module_digests)
+        if model_package_ref is not None:
+            inference_admission = admission.get("inferenceAdapter")
+            if not isinstance(inference_admission, dict) or not isinstance(
+                inference_admission.get("sourceDigest"), str
+            ):
+                raise IntegrityError(
+                    "legacy model compatibility evidence is ineligible for release; run again "
+                    "with an independently admitted inference adapter"
+                )
+            source_digests["inference"] = inference_admission["sourceDigest"]
+        release_artifacts = sorted({*artifact_digests, *source_digests.values()})
+        required_scan_subjects = {model_digest, *source_digests.values()}
         vulnerability_summary, vulnerability_artifact, vulnerabilities_valid = (
             self._load_vulnerability_report(vulnerability_report, required_scan_subjects)
         )
@@ -2335,7 +2487,7 @@ class Factory:
             "model": {"digest": model_digest},
             "modelPackage": {"ref": model_package_ref},
             "state": {"digest": state_digest},
-            "runtime": {"name": "omf.module/v1"},
+            "runtime": {"name": "omf.module/v1", "sources": source_digests},
             "workload": {"runId": run_id},
             "binding": {"digest": admission["bindingDigest"]},
             "dataSummary": [
@@ -2357,7 +2509,7 @@ class Factory:
                 "evaluationRevision": evaluation["metadata"]["revision"],
                 "vectors": evaluation["spec"]["extensions"].get("compatibilityVectors", 0),
             },
-            "sbom": self._release_sbom(run_id, module_digests),
+            "sbom": self._release_sbom(run_id, source_digests),
             "provenance": {"runId": run_id, "lineageComplete": evidence["lineage_complete"]},
             "vulnerabilities": vulnerability_summary,
             "deployment": {"compatible": ["batch", "service", "actor", "edge", "control"]},
@@ -2372,7 +2524,7 @@ class Factory:
                 "kind": "Release",
                 "metadata": {"name": name, "namespace": self.namespace},
                 "spec": {
-                    "artifacts": artifact_digests,
+                    "artifacts": release_artifacts,
                     "evidence": [
                         evaluation["metadata"]["revision"],
                         *([vulnerability_artifact] if vulnerability_artifact else []),
@@ -2401,7 +2553,7 @@ class Factory:
             )
         )
         for artifact_digest in [
-            *artifact_digests,
+            *release_artifacts,
             *([vulnerability_artifact] if vulnerability_artifact else []),
         ]:
             self.lineage.add(

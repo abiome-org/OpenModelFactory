@@ -47,9 +47,14 @@
           "type": "object",
           "required": ["trainingReference", "inferenceReference"],
           "properties": {
-            "trainingReference": {"$ref": "#/$defs/adapter"},
-            "inferenceReference": {"$ref": "#/$defs/adapter"},
-            "optimized": {"type": "array", "items": {"$ref": "#/$defs/adapter"}}
+            "trainingReference": {"$ref": "#/$defs/trainingAdapter"},
+            "inferenceReference": {
+              "oneOf": [
+                {"$ref": "#/$defs/inferenceAdapter"},
+                {"$ref": "#/$defs/legacyInferenceAdapter"}
+              ]
+            },
+            "optimized": {"type": "array", "items": {"$ref": "#/$defs/inferenceAdapter"}}
           },
           "additionalProperties": false
         },
@@ -92,7 +97,32 @@
   },
   "additionalProperties": false,
   "$defs": {
-    "adapter": {
+    "trainingAdapter": {
+      "type": "object",
+      "required": ["stage", "operation", "config"],
+      "properties": {
+        "stage": {"type": "string", "minLength": 1},
+        "operation": {
+          "enum": ["validate", "prepare", "run", "quiesce", "checkpoint", "restore", "stop"]
+        },
+        "config": {"type": "object"}
+      },
+      "additionalProperties": false
+    },
+    "inferenceAdapter": {
+      "type": "object",
+      "required": ["module", "operation", "stateOutput", "config"],
+      "properties": {
+        "module": {"type": "string", "minLength": 1},
+        "operation": {
+          "enum": ["validate", "prepare", "run", "quiesce", "checkpoint", "restore", "stop"]
+        },
+        "stateOutput": {"type": "string", "minLength": 1},
+        "config": {"type": "object"}
+      },
+      "additionalProperties": false
+    },
+    "legacyInferenceAdapter": {
       "type": "object",
       "required": ["stage", "operation", "config"],
       "properties": {

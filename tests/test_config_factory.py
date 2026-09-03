@@ -564,7 +564,41 @@ def test_model_neutral_from_scratch_golden_path(tmp_path):
         (paths.root / "modules/examples/affine-regression/main.py").write_text(
             "raise RuntimeError('live source must not execute')\n"
         )
+        (paths.root / "modules/examples/affine-serving/main.py").write_text(
+            "raise RuntimeError('live serving source must not execute')\n"
+        )
         evaluation = factory.evaluate(f"run/{result['runId']}")
+        admission = factory._run_resource(result["runId"])["spec"]["extensions"]
+        scan_path = paths.root / "affine-vulnerability-report.yaml"
+        scan = {
+            "scanner": {"name": "test-scanner", "version": "1"},
+            "databaseRevision": "test-db-1",
+            "generatedAt": "2026-09-01T00:00:00Z",
+            "subjects": [
+                result["outputs"]["train.model"],
+                *admission["moduleDigests"].values(),
+            ],
+            "findings": [],
+            "waivers": [],
+        }
+        scan_path.write_text(yaml.safe_dump(scan))
+        with pytest.raises(IntegrityError, match="vulnerabilities"):
+            factory.create_release(
+                result["runId"],
+                name="missing-serving-scan",
+                intended_use="test",
+                promote=True,
+                approvals=["independent-reviewer"],
+                vulnerability_report=scan_path,
+            )
+        scan["subjects"].append(admission["inferenceAdapter"]["sourceDigest"])
+        scan_path.write_text(yaml.safe_dump(scan))
+        release = factory.create_release(
+            result["runId"],
+            name="affine-release",
+            intended_use="test",
+            vulnerability_report=scan_path,
+        )
         experiment = factory.create_experiment(
             name="affine-self-check",
             baseline_ref=factory._resource_uri(evaluation),
@@ -595,6 +629,12 @@ def test_model_neutral_from_scratch_golden_path(tmp_path):
     }
     assert json.loads((restored / "payload").read_text()) == result["outputs"]["train.modelState"]
     assert evaluation["spec"]["extensions"]["compatibilityPassed"] is True
+    assert admission["inferenceAdapter"]["sourceDigest"] != admission["moduleDigests"]["train"]
+    assert (
+        release["spec"]["extensions"]["manifest"]["runtime"]["sources"]["inference"]
+        == admission["inferenceAdapter"]["sourceDigest"]
+    )
+    assert admission["inferenceAdapter"]["sourceDigest"] in release["spec"]["artifacts"]
     assert evaluation["spec"]["scores"]["training-loss"] < 1e-6
     assert experiment["spec"]["decision"] == "tie"
     assert factory._resource_uri(suite_resource) in admitted_evaluation_refs
@@ -698,17 +738,24 @@ def test_model_package_admission_rejects_adapter_and_vector_drift(tmp_path):
             ),
             "does not match the workload stage",
         )
-        rejected(
-            "missing-state-output",
-            lambda package: package["spec"]["adapters"]["inferenceReference"].pop("stateOutput"),
-            "requires stage.output",
-        )
+        missing_state = deepcopy(base)
+        missing_state["metadata"]["name"] = "missing-state-output"
+        missing_state["spec"]["adapters"]["inferenceReference"].pop("stateOutput")
+        with pytest.raises(ValidationError, match="resource failed validation"):
+            factory.apply_resource(missing_state)
         rejected(
             "invalid-state-output",
             lambda package: package["spec"]["adapters"]["inferenceReference"].update(
                 {"stateOutput": "train.missing"}
             ),
             "not declared by the workload",
+        )
+        rejected(
+            "shared-training-inference",
+            lambda package: package["spec"]["adapters"]["inferenceReference"].update(
+                {"module": "modules/examples/affine-regression/module.yaml"}
+            ),
+            "independent module",
         )
 
         admitted = deepcopy(base)
@@ -719,6 +766,37 @@ def test_model_package_admission_rejects_adapter_and_vector_drift(tmp_path):
             factory._pin_model_package("modelpackage/expected-revision", stages, reference)
             == resource
         )
+
+
+def test_legacy_model_package_is_readable_but_requires_an_explicit_serving_migration(tmp_path):
+    paths = _project(tmp_path)
+    bootstrap(paths)
+    workload = yaml.safe_load((paths.root / "workloads/example-from-scratch.yaml").read_text())
+    stages = project_workload(workload).stages
+    current = yaml.safe_load(Path("model-packages/example-affine.yaml").read_text())
+    current["metadata"]["name"] = "legacy-affine"
+    current["metadata"]["namespace"] = "local/test-project"
+    legacy = deepcopy(current)
+    legacy["spec"]["adapters"]["inferenceReference"] = {
+        "stage": "train",
+        "operation": "run",
+        "stateOutput": "train.modelState",
+        "config": {"action": "infer"},
+    }
+
+    with Factory(paths) as factory:
+        legacy_resource = factory.apply_resource(legacy)
+        with pytest.raises(ValidationError, match="legacy stage-based inference adapter"):
+            factory._pin_model_package("modelpackage/legacy-affine", stages)
+
+        migrated = factory.apply_resource(current)
+        selected = factory._pin_model_package("modelpackage/legacy-affine", stages)
+        retained_legacy = factory.resources.get(
+            legacy_resource["metadata"]["uid"], legacy_resource["metadata"]["revision"]
+        )
+
+    assert selected == migrated
+    assert retained_legacy["spec"]["adapters"]["inferenceReference"]["stage"] == "train"
 
 
 def test_resource_pinning_and_resolution_fail_closed(tmp_path):
@@ -1028,6 +1106,10 @@ def test_recovery_integrity_failure_finalizes_the_durable_run(tmp_path, monkeypa
 
 def test_running_local_operation_reattaches_without_duplicate_stage_work(tmp_path):
     paths = _project(tmp_path)
+    workload_path = paths.root / "workloads/example-from-scratch.yaml"
+    workload = yaml.safe_load(workload_path.read_text())
+    workload["metadata"]["namespace"] = "local/test-project"
+    workload_path.write_text(yaml.safe_dump(workload))
     binding_path = paths.root / "bindings/local.yaml"
     binding = yaml.safe_load(binding_path.read_text())
     binding["spec"]["executor"] = "recoverable-local"
@@ -1056,28 +1138,38 @@ def test_running_local_operation_reattaches_without_duplicate_stage_work(tmp_pat
         )
     )
     with Factory(paths, executors=registry) as factory:
+        for source in (
+            Path("model-packages/example-affine.yaml"),
+            Path("evaluations/example-affine.yaml"),
+            Path("mixes/example-affine.yaml"),
+        ):
+            resource = yaml.safe_load(source.read_text())
+            resource["metadata"]["namespace"] = "local/test-project"
+            factory.apply_resource(resource)
         factory.add_data(
-            paths.root / "data/numbers.jsonl",
-            name="example-numbers",
+            Path("data/fixtures/affine.jsonl").resolve(),
+            name="example-affine",
             mode="copy",
             rights={"license": "CC0-1.0", "trainingAllowed": True},
         )
-        operation = factory.create_run_operation(
-            paths.root / "workloads/example-statistical.yaml", binding_path
-        )
+        operation = factory.create_run_operation(workload_path, binding_path)
         with pytest.raises(KeyboardInterrupt, match="controller interrupted"):
             factory.execute_run_operation(operation["id"])
         assert factory.operations.get(operation["id"])["state"] == "running"
 
-    original_module = paths.root / "modules/examples/statistical/main.py"
-    original_module.write_text("raise RuntimeError('mutable source must not be reused')\n")
+    shutil.rmtree(paths.root / "modules/examples/affine-regression")
+    shutil.rmtree(paths.root / "modules/examples/affine-serving")
     with Factory(paths, executors=registry) as restarted:
         completed = restarted.execute_run_operation(operation["id"])
+        run_submissions = observed["submissions"]
+        evaluation = restarted.evaluate(f"run/{operation['id']}")
         admission_events = restarted.events.query(run_id=operation["id"], type="RunAdmitted")
 
     assert completed["state"] == "succeeded"
-    assert completed["result"]["outputs"]["train.mean"] == 3.0
-    assert observed["submissions"] == 2
+    assert completed["result"]["outputs"]["train.loss"] < 1e-6
+    assert evaluation["spec"]["extensions"]["compatibilityPassed"] is True
+    assert run_submissions == 2
+    assert observed["submissions"] == 3
     assert len(admission_events) == 1
 
 
@@ -1422,6 +1514,40 @@ def test_queued_run_pins_manifest_outside_code_root(tmp_path):
             factory.execute_run_operation(operation["id"])
         assert factory.operations.get(operation["id"])["state"] == "failed"
         assert factory.list_resources(kind="Run") == []
+
+
+def test_queued_run_rejects_inference_adapter_source_drift(tmp_path):
+    paths = _project(tmp_path)
+    workload_path = paths.root / "workloads/example-from-scratch.yaml"
+    workload = yaml.safe_load(workload_path.read_text())
+    workload["metadata"]["namespace"] = "local/test-project"
+    workload_path.write_text(yaml.safe_dump(workload))
+    bootstrap(paths)
+    with Factory(paths) as factory:
+        for source in (
+            Path("model-packages/example-affine.yaml"),
+            Path("evaluations/example-affine.yaml"),
+            Path("mixes/example-affine.yaml"),
+        ):
+            resource = yaml.safe_load(source.read_text())
+            resource["metadata"]["namespace"] = "local/test-project"
+            factory.apply_resource(resource)
+        factory.add_data(
+            Path("data/fixtures/affine.jsonl").resolve(),
+            name="example-affine",
+            mode="copy",
+            rights={"license": "CC0-1.0", "trainingAllowed": True},
+        )
+        operation = factory.create_run_operation(workload_path, paths.root / "bindings/local.yaml")
+        (paths.root / "modules/examples/affine-serving/main.py").write_text(
+            "raise RuntimeError('changed after queue')\n"
+        )
+
+        with pytest.raises(IntegrityError, match="inference adapter source changed"):
+            factory.execute_run_operation(operation["id"])
+        runs = factory.list_resources(kind="Run")
+
+    assert runs == []
 
 
 def test_queued_run_uses_exact_dataset_revision_after_alias_advances(tmp_path):

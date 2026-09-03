@@ -58,11 +58,6 @@ def run(request: ProtocolRequest) -> ProtocolResult:
             outputs={"passed": error <= tolerance, "maximumError": error},
             metrics={"maximum_error": error},
         )
-    if action == "infer":
-        state = request.state
-        value = float(request.inputs["input"])
-        prediction = float(state["slope"]) * value + float(state["intercept"])
-        return ProtocolResult(status="ok", outputs={"prediction": prediction})
     raise ValueError(f"unsupported action: {action}")
 
 

@@ -41,10 +41,10 @@ spec:
       operation: run
       config: {action: train}
     inferenceReference:
-      stage: train
+      module: modules/examples/affine-serving/module.yaml
       operation: run
       stateOutput: train.modelState
-      config: {action: infer}
+      config: {}
   compatibilityVectors:
     - name: positive
       method: predict

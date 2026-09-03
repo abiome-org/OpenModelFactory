@@ -100,11 +100,16 @@ def test_checked_in_workload_and_modules_use_canonical_resources():
     text_frequency = registry.load(Path("modules/examples/text-frequency/module.yaml"))
     from_scratch = registry.load(Path("workloads/example-from-scratch.yaml"))
     affine = registry.load(Path("modules/examples/affine-regression/module.yaml"))
+    serving = registry.load(Path("modules/examples/affine-serving/module.yaml"))
     model_package = registry.load(Path("model-packages/example-affine.yaml"))
     assert workload["kind"] == "WorkloadSpec"
     assert from_scratch["kind"] == "WorkloadSpec"
     assert statistical["kind"] == text_frequency["kind"] == affine["kind"] == "Module"
+    assert serving["kind"] == "Module"
     assert model_package["kind"] == "ModelPackage"
+    assert model_package["spec"]["adapters"]["inferenceReference"]["module"].endswith(
+        "affine-serving/module.yaml"
+    )
 
     with pytest.raises(ValidationError, match="unsupported apiVersion"):
         registry.validate({"stages": []})

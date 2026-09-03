@@ -33,9 +33,11 @@ omf --actor research-agent --output json evaluate run/<run-id>
 ```
 
 `EvaluationSpec` identifies output metrics and thresholds; evaluator modules own
-benchmark execution. A production evaluator should emit repeats, distributions,
-confidence intervals, slices, failures, and resource usage as immutable artifacts,
-plus an unambiguous pass result for the release gate.
+benchmark execution. Model-package vectors run the trained state through the
+separately admitted inference module, so a training implementation cannot prove
+its own serving compatibility. A production evaluator should emit repeats,
+distributions, confidence intervals, slices, failures, and resource usage as
+immutable artifacts, plus an unambiguous pass result for the release gate.
 
 ## Package a benchmark responsibly
 

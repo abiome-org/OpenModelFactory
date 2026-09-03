@@ -85,6 +85,14 @@ portable workloads, restart, cancellation, checkpoints, and supported scale. See
 
 ## Backup and restore
 
+Before upgrading, create and verify a backup. Model packages created by early
+`0.1.x` builds with a stage-based `inferenceReference` remain readable, but they
+cannot supply new compatibility or release evidence because a distinct serving
+implementation cannot be inferred safely. Apply a new immutable `ModelPackage`
+revision that names `inferenceReference.module`, then rerun and evaluate the
+model. Restore the pre-upgrade backup to roll back the factory state; OMF never
+rewrites the legacy resource revision.
+
 Create one verified archive containing metadata, signing and encryption keys,
 encrypted secrets, and every local content-addressed artifact:
 
@@ -138,8 +146,8 @@ content and publishes the manifest only after every chunk verifies.
 ## Vulnerability evidence and release promotion
 
 Promotion is denied when vulnerability evidence is absent, invalid, does not
-cover the aggregate model and admitted module artifacts, or contains an
-unwaived open high/critical finding. Import a scanner's YAML/JSON
+cover the aggregate model and admitted training and inference sources, or
+contains an unwaived open high/critical finding. Import a scanner's YAML/JSON
 report with `omf release create --vulnerability-report <path>`. The report must
 contain `scanner` (name/version object), `databaseRevision`, timezone-aware
 `generatedAt`, `subjects` (OMF artifact digests), `findings`, and `waivers`.

@@ -1,0 +1,59 @@
+apiVersion: omf.dev/v1alpha1
+kind: Module
+metadata:
+  name: affine-serving
+  namespace: omf/examples
+spec:
+  contractVersion: omf.module/v1
+  moduleKind: server
+  entryPoint:
+    command: [python3, main.py]
+    codeRoot: .
+  contracts:
+    input:
+      type: object
+      required: [input]
+      properties: {input: {type: number}}
+      additionalProperties: false
+    output:
+      type: object
+      required: [prediction]
+      properties: {prediction: {type: number}}
+      additionalProperties: false
+    config:
+      type: object
+      additionalProperties: false
+    state:
+      type: object
+      required: [slope, intercept, format]
+      properties:
+        slope: {type: number}
+        intercept: {type: number}
+        format: {const: json-affine/v1}
+      additionalProperties: false
+  environment:
+    dependencyLock: requirements.lock
+    dependencyDigest: sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+  capabilities: []
+  platforms: []
+  resources: {}
+  determinism: numerical
+  lifecycle:
+    checkpoint: false
+    sideEffects: []
+    concurrency: 1
+  access:
+    secrets: []
+    network: []
+  provenance:
+    license: Apache-2.0
+    sourceRef: repository:modules/examples/affine-serving
+  fixtures:
+    - request:
+        operation: run
+        inputs: {input: 3.0}
+        state: {slope: 2.0, intercept: 1.0, format: json-affine/v1}
+        config: {}
+      result:
+        status: ok
+        outputs: {prediction: 7.0}

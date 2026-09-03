@@ -42,11 +42,12 @@ results as the module matures.
 
 ## Module versus model package
 
-The current executable path admits `module.yaml` implementations into workload
-stages. A versioned `ModelPackage` is a later release asset that also binds
-model state, runtime behavior, compatibility test vectors, provenance, and
-serving requirements. Passing `module test` does not by itself produce or
-certify a complete `ModelPackage`.
+Workload stages and serving adapters both use `module.yaml`, but they are
+separate implementations. A versioned `ModelPackage` binds the training stage's
+state output to an independent inference module, compatibility vectors,
+provenance, and serving requirements. OMF captures both sources at run
+admission; compatibility evaluation never reloads mutable checkout code.
+Passing `module test` alone does not establish model compatibility.
 
 ## Evidence before the next chapter
 

@@ -46,8 +46,9 @@ results.
    `Binding` owns physical resources, placement, transport, and provider
    options.
 2. **Validation.** `Factory` validates semantics, records exact data, package,
-   evaluation, mix, module-source, dependency-lock, observed executable, and
-   binding revisions, then rejects unsupported capabilities before allocation.
+   evaluation, mix, training-module, inference-adapter, dependency-lock,
+   observed executable, and binding revisions, then rejects unsupported
+   capabilities before allocation.
 3. **Execution.** Modules communicate through `omf.module/v1`. Bindings select
    an exact executor provider; unknown or incomplete providers never fall back
    to local execution. A run uses its durable operation ID as stable identity.
