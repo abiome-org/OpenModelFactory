@@ -6,7 +6,7 @@ New dataset snapshots, module revisions, workload revisions, and runs are
 tested. Native `MixSpec` consumption and objective-specific training recipes are
 extension boundaries.
 
-## Declare one scientific change
+## Declare one experiment change
 
 Start from the committed baseline and state one primary intervention:
 
@@ -16,7 +16,7 @@ Start from the committed baseline and state one primary intervention:
 | Change a data mixture | source snapshots plus sampler/module configuration |
 | Change an objective | objective/trainer module package and workload revision |
 | Add post-training | new stage modules and dependencies |
-| Change only placement | binding revision; scientific workload remains unchanged |
+| Change only placement | binding revision; workload behavior remains unchanged |
 
 Do not overwrite the baseline dataset name or module source and then reuse the
 old claim. Create names such as `pretrain-baseline-v1` and
@@ -29,8 +29,9 @@ For a data candidate:
 2. Materialize a new snapshot rather than mutating the baseline snapshot.
 3. Copy the baseline workload to a candidate file.
 4. Change only the intended dataset reference or declared mixture behavior.
-5. Keep the frozen evaluator stage and binding unchanged when possible.
-6. Validate modules, preflight, review the diff, and commit desired state.
+5. Keep the fixed evaluator stage and binding unchanged when possible.
+6. Validate modules, preflight, review the diff, and commit the versioned
+   project configuration.
 
 For an objective or trainer candidate, change the role module and semantic
 configuration while retaining the same data and evaluation protocol. If the

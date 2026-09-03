@@ -23,9 +23,10 @@ Options:
   --name PROJECT_NAME   Name for a newly created project (default: directory basename).
   -h, --help            Show this help.
 
-The installer preserves existing project files. It appends idempotent managed
-sections to AGENTS.md and .gitignore, creates only missing OMF manifests, rebuilds
-its managed .venv, initializes local .omf state, and runs omf doctor.
+The installer preserves existing project files. It creates a missing
+MODEL_CARD.md, appends idempotent managed sections to AGENTS.md and .gitignore,
+creates only missing OMF configuration, rebuilds its managed .venv, initializes
+local .omf state, and runs omf doctor.
 EOF
 }
 
@@ -82,6 +83,7 @@ for required in \
   "${SOURCE_DIR}/requirements.build.lock" \
   "${SOURCE_DIR}/requirements.runtime.lock" \
   "${TEMPLATE_DIR}/AGENTS.md" \
+  "${TEMPLATE_DIR}/MODEL_CARD.md" \
   "${TEMPLATE_DIR}/gitignore" \
   "${TEMPLATE_DIR}/omf.yaml" \
   "${TEMPLATE_DIR}/bindings/local.yaml" \
@@ -178,7 +180,7 @@ project name if created: ${PROJECT_NAME}
 1. Create the target directory and create or rebuild its OMF-managed .venv.
 2. Install hash-locked runtime and build dependencies as binary wheels.
 3. Build this exact source without build isolation and install it into .venv.
-4. Preserve an existing omf.yaml, or create a local project manifest.
+4. Preserve existing MODEL_CARD.md and omf.yaml, or create their project scaffolds.
 5. Create missing workspace directories, local binding, and default policy.
 6. Preserve and extend AGENTS.md and .gitignore with managed OMF sections.
 7. Initialize Git only when the target is not already inside a repository.
@@ -632,6 +634,12 @@ PY
 )" || fail "existing omf.yaml is not a valid OMF Project"
 IFS=$'\t' read -r PROJECT_NAME PROJECT_NAMESPACE <<<"${PROJECT_METADATA}"
 
+render_template \
+  "${TEMPLATE_DIR}/MODEL_CARD.md" \
+  "${TARGET_ANCHOR}/MODEL_CARD.md" \
+  "${PROJECT_NAME}" \
+  "${PROJECT_NAMESPACE}"
+
 for directory in \
   connectors \
   data \
@@ -734,6 +742,7 @@ Activate the environment:
 First agent command:
   omf --project "${TARGET}" --output json agent context
 
-Review AGENTS.md, set an attributable --actor identity for mutations, and commit
-desired state before admitting a workload. Runtime state remains under .omf/.
+Complete MODEL_CARD.md, review AGENTS.md, set an attributable --actor identity
+for mutations, and commit desired state before admitting a workload. Runtime
+state remains under .omf/.
 EOF

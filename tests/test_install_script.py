@@ -25,6 +25,7 @@ def test_install_script_help_and_plan_are_non_mutating(tmp_path):
     )
     assert "--plan" in help_result.stdout
     assert "AGENTS.md" in help_result.stdout
+    assert "MODEL_CARD.md" in help_result.stdout
 
     target = tmp_path / "My Model Project"
     plan = subprocess.run(
@@ -35,6 +36,7 @@ def test_install_script_help_and_plan_are_non_mutating(tmp_path):
     )
     assert f"target: {target}" in plan.stdout
     assert "project name if created: my-model-project" in plan.stdout
+    assert "Preserve existing MODEL_CARD.md" in plan.stdout
     assert "No changes made." in plan.stdout
     assert not target.exists()
 
@@ -233,6 +235,16 @@ def test_install_support_creates_and_preserves_templates_and_managed_files(tmp_p
     assert not render_template(manifest_template, rendered, "changed", "local/changed")
     assert rendered.read_text(encoding="utf-8") == content
 
+    model_card = tmp_path / "MODEL_CARD.md"
+    model_card_template = Path("templates/project/MODEL_CARD.md")
+    assert render_template(model_card_template, model_card, "factory", "local/factory")
+    model_card_content = model_card.read_text(encoding="utf-8")
+    assert model_card_content.startswith("# factory model card\n")
+    assert "`local/factory`" in model_card_content
+    assert "__OMF_PROJECT_NAME__" not in model_card_content
+    assert not render_template(model_card_template, model_card, "changed", "local/changed")
+    assert model_card.read_text(encoding="utf-8") == model_card_content
+
     malformed = tmp_path / "malformed"
     malformed.write_text("no managed markers\n", encoding="utf-8")
     assert (
@@ -340,12 +352,15 @@ def test_directory_installer_is_idempotent_and_rebuilds_only_its_managed_venv(tm
     )
     agents = (target / "AGENTS.md").read_text(encoding="utf-8")
     gitignore = (target / ".gitignore").read_text(encoding="utf-8")
+    model_card = (target / "MODEL_CARD.md").read_text(encoding="utf-8")
     first_venv_inode = (target / ".venv").stat().st_ino
     assert "Open Model Factory is ready" in first.stdout
     assert agents.startswith("project agent rule\n\n")
     assert "old guide" not in agents
     assert gitignore.startswith("project-ignore\n\n")
     assert "old ignore" not in gitignore
+    assert model_card.startswith("# installed-factory model card\n")
+    assert "`local/installed-factory`" in model_card
     assert (target / ".venv").is_symlink()
     assert (target / ".venv/.omf-managed").is_file()
     entrypoint = (target / ".venv/bin/omf").read_text(encoding="utf-8").splitlines()[0]
@@ -362,6 +377,7 @@ def test_directory_installer_is_idempotent_and_rebuilds_only_its_managed_venv(tm
     assert "Open Model Factory is ready" in second.stdout
     assert (target / "AGENTS.md").read_text(encoding="utf-8") == agents
     assert (target / ".gitignore").read_text(encoding="utf-8") == gitignore
+    assert (target / "MODEL_CARD.md").read_text(encoding="utf-8") == model_card
     assert (target / ".venv").stat().st_ino != first_venv_inode
     assert len(list((target / ".omf-venvs").iterdir())) == 1
     assert not list(target.glob(".venv.omf-link-*"))
@@ -492,6 +508,7 @@ def test_operator_guide_is_bounded_and_actionable():
     assert guide.count("<!-- END OMF OPERATOR GUIDE -->") == 1
     assert "AGENTS.md standard" in guide
     assert "another `AGENTS.md`" in guide
+    assert "`MODEL_CARD.md`" in guide
     assert "--output json doctor" in guide
     assert "agent context" in guide
     assert "executor preflight" in guide

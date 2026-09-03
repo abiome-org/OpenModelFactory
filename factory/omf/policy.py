@@ -103,7 +103,7 @@ def promotion_gate(
         "lineage": bool(evidence.get("lineage_complete")),
         "rights": bool(evidence.get("rights_valid")),
         "signatures": bool(evidence.get("signatures_valid")),
-        "conformance": bool(evidence.get("conformance_passed")),
+        "compatibility": bool(evidence.get("compatibility_passed")),
         "vulnerabilities": bool(evidence.get("vulnerabilities_valid")),
         "approvals": bool(evidence.get("approvals_valid")),
         "separation": bool(evidence.get("separation_of_duties")),

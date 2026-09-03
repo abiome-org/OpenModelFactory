@@ -43,10 +43,10 @@ results as the module matures.
 ## Module versus model package
 
 The current executable path admits `module.yaml` implementations into workload
-stages. A normative `ModelPackage` is a later release asset that also binds model
-state, runtime behavior, conformance vectors, provenance, and serving
-requirements. Passing `module test` does not by itself produce or certify a
-complete `ModelPackage`.
+stages. A versioned `ModelPackage` is a later release asset that also binds
+model state, runtime behavior, compatibility test vectors, provenance, and
+serving requirements. Passing `module test` does not by itself produce or
+certify a complete `ModelPackage`.
 
 ## Evidence before the next chapter
 

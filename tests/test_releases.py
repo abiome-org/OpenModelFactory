@@ -17,7 +17,7 @@ def _manifest():
         "risk": {},
         "intendedUse": "test",
         "prohibitedUse": [],
-        "conformance": {},
+        "compatibility": {},
         "sbom": {},
         "provenance": {},
         "vulnerabilities": {},

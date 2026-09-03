@@ -1,20 +1,7 @@
-import pytest
 from omf.capacity import CapacityHarness
-from omf.errors import ValidationError
 
 
-def test_frontier_threshold_and_failure_accounting():
-    with pytest.raises(ValidationError):
-        CapacityHarness().run(
-            accelerators=1023,
-            operations=1,
-            event=lambda: None,
-            artifact=lambda: None,
-            control=lambda: None,
-            restore=lambda: None,
-            claim_frontier=True,
-        )
-
+def test_capacity_measurement_and_failure_accounting():
     def fail():
         raise RuntimeError("failure")
 
@@ -26,4 +13,8 @@ def test_frontier_threshold_and_failure_accounting():
         control=lambda: None,
         restore=lambda: None,
     )
+    assert report.accelerators_tested == 1
     assert report.failures == 2
+    assert report.event_throughput > 0
+    assert report.artifact_throughput > 0
+    assert report.control_throughput > 0

@@ -48,7 +48,7 @@ def run(request: ProtocolRequest) -> ProtocolResult:
         output.write_text(json.dumps(report, sort_keys=True), encoding="utf-8")
         return ProtocolResult(
             status="ok",
-            outputs={"passed": passed, "conformancePassed": passed, "absoluteError": error},
+            outputs={"passed": passed, "compatibilityPassed": passed, "absoluteError": error},
             metrics={"absolute_error": error},
             artifacts=[{"name": "evaluation", "kind": "evaluation", "path": output.name}],
         )

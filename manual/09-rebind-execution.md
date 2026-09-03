@@ -2,12 +2,11 @@
 
 **Status: Conditional**
 
-Local execution is tested. Built-in Slurm is conditional on explicit shared
-storage and cannot enforce network denial. Built-in Kubernetes provides
-scheduler lifecycle but lacks complete module source, request/result, and
-artifact transport. External providers must prove their own capabilities.
+Built-in executor capabilities differ, and external providers must demonstrate
+their advertised behavior. Read the [executor guide](../docs/executors.md) for
+the exact current limitations before changing a binding.
 
-## Preserve scientific intent
+## Keep workload behavior stable
 
 Keep stages, modules, dataset references, semantic parameters, and evaluation
 protocol in the workload. Put executor, resources, topology, placement,
@@ -24,8 +23,8 @@ omf --output json executor preflight bindings/site.yaml \
 ```
 
 Unknown providers, missing tools, incomplete protocol transport, or
-unenforceable required isolation must fail closed. Never silently substitute
-local execution.
+unenforceable required isolation must stop with an error. Never silently
+substitute local execution.
 
 ## Provider acceptance checklist
 
@@ -40,9 +39,9 @@ local execution.
 Rebinding can change timing and numerical behavior. Record realized topology,
 library/runtime revisions, precision, batch semantics, seeds, and divergences.
 Shape reduction, changed global batch/objective semantics, or changed sampling
-creates a new scientific workload; it is not merely another placement of the
-same run.
+changes what the workload does; it is not merely another placement of the same
+run.
 
-Scheduler acceptance or a completed job is not conformance evidence. Retain the
-measured scenario results required by the [executor guide](../docs/executors.md)
-and [specification](../SPEC.md).
+Scheduler acceptance or a completed job does not prove the provider path is
+supported. Add its transport, recovery, isolation, and scale cases to the test
+matrix described by the [executor guide](../docs/executors.md).

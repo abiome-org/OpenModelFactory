@@ -143,9 +143,9 @@ def test_clean_clone_to_signed_release_and_edge_deployment(tmp_path):
         assert release["spec"]["extensions"]["promotionDecision"]["outcome"] == "allow"
         assert release["spec"]["extensions"]["manifest"]["vulnerabilities"]["status"] == "passed"
         assert release["spec"]["extensions"]["manifest"]["sbom"]["spdxVersion"] == "SPDX-2.3"
-        assert release["spec"]["extensions"]["manifest"]["conformance"]["passed"] is True
+        assert release["spec"]["extensions"]["manifest"]["compatibility"]["passed"] is True
         assert (
-            release["spec"]["extensions"]["manifest"]["conformance"]["evaluationRevision"]
+            release["spec"]["extensions"]["manifest"]["compatibility"]["evaluationRevision"]
             == evaluation["metadata"]["revision"]
         )
         assert AliasRepository(factory.db).get("candidate")[1] == release["metadata"]["revision"]
@@ -591,7 +591,7 @@ def test_model_neutral_from_scratch_golden_path(tmp_path):
         "reason": "sampler-state-not-observed",
     }
     assert json.loads((restored / "payload").read_text()) == result["outputs"]["train.modelState"]
-    assert evaluation["spec"]["extensions"]["conformancePassed"] is True
+    assert evaluation["spec"]["extensions"]["compatibilityPassed"] is True
     assert evaluation["spec"]["scores"]["training-loss"] < 1e-6
     assert experiment["spec"]["decision"] == "tie"
     assert factory._resource_uri(suite_resource) in admitted_evaluation_refs
@@ -621,7 +621,7 @@ def test_model_package_admission_rejects_unexecutable_contracts(tmp_path):
 
         tolerance = deepcopy(base)
         tolerance["metadata"]["name"] = "invalid-tolerance"
-        tolerance["spec"]["conformanceVectors"][0]["tolerances"]["prediction"]["absolute"] = -1
+        tolerance["spec"]["compatibilityVectors"][0]["tolerances"]["prediction"]["absolute"] = -1
         factory.apply_resource(tolerance)
         with pytest.raises(ValidationError, match="finite and non-negative"):
             factory._pin_model_package("modelpackage/invalid-tolerance", stages)
@@ -666,17 +666,17 @@ def test_model_package_admission_rejects_adapter_and_vector_drift(tmp_path):
         )
         rejected(
             "invalid-vector-input",
-            lambda package: package["spec"]["conformanceVectors"][0].update({"inputs": {}}),
+            lambda package: package["spec"]["compatibilityVectors"][0].update({"inputs": {}}),
             "model package input",
         )
         rejected(
             "invalid-vector-output",
-            lambda package: package["spec"]["conformanceVectors"][0].update({"expected": {}}),
+            lambda package: package["spec"]["compatibilityVectors"][0].update({"expected": {}}),
             "model package output",
         )
         rejected(
             "invalid-tolerance-shape",
-            lambda package: package["spec"]["conformanceVectors"][0]["tolerances"].update(
+            lambda package: package["spec"]["compatibilityVectors"][0]["tolerances"].update(
                 {"prediction": {"absolute": True}}
             ),
             "finite and non-negative",
@@ -791,13 +791,13 @@ def test_resource_pinning_and_resolution_fail_closed(tmp_path):
         with pytest.raises(IntegrityError, match="identity is ambiguous"):
             factory._run_resource("missing")
 
-    assert Factory._conformance_equal(True, True, {})
-    assert Factory._conformance_equal(1.0, 1.001, {"absolute": 0.01})
-    assert Factory._conformance_equal([1, 2], [1, 2], {})
-    assert not Factory._conformance_equal([1], [1, 2], {})
-    assert Factory._conformance_equal({"x": 1}, {"x": 1}, {})
-    assert not Factory._conformance_equal({"x": 1}, {"y": 1}, {})
-    assert not Factory._conformance_equal("left", "right", {})
+    assert Factory._compatibility_equal(True, True, {})
+    assert Factory._compatibility_equal(1.0, 1.001, {"absolute": 0.01})
+    assert Factory._compatibility_equal([1, 2], [1, 2], {})
+    assert not Factory._compatibility_equal([1], [1, 2], {})
+    assert Factory._compatibility_equal({"x": 1}, {"x": 1}, {})
+    assert not Factory._compatibility_equal({"x": 1}, {"y": 1}, {})
+    assert not Factory._compatibility_equal("left", "right", {})
 
 
 def test_experiment_rejects_different_evaluation_revisions(tmp_path):

@@ -2,10 +2,10 @@
 
 **Status: Extension blueprint**
 
-The specification defines environment, inference, rollout, verifier, sampler,
-checkpoint, policy-state, and evaluation contracts. The repository does not yet
-ship an end-to-end RLVR workload, trajectory store, or CLI orchestration path.
-This chapter is an integration outline, not a runnable recipe.
+OMF exposes environment, inference, verifier, sampler, checkpoint, policy-state,
+and evaluation contracts. The repository does not yet ship an end-to-end RLVR
+workload, trajectory store, or CLI orchestration path. This chapter is an
+integration outline, not a runnable recipe.
 
 ## Required role separation
 

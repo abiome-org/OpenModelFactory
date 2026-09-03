@@ -6,7 +6,7 @@ The copy and register paths are tested. Mount and stream registration exist,
 but connector-specific consumption and `MixSpec`-driven training remain
 extension boundaries.
 
-## Freeze roles before importing bytes
+## Define roles before importing bytes
 
 Define train, development, reward, and final-holdout roles before inspecting
 candidate results. Keep each role as a distinct immutable snapshot with explicit
@@ -65,11 +65,12 @@ not imply deletion.
 ## Mixture boundary
 
 `MixSpec` defines source revisions, weights or schedules, sampling, curriculum,
-replay, and amendment intent. The current from-scratch path admits and pins a
-`MixSpec` alongside its exact dataset inputs, but the trainer still reads the
-dataset directly. Until a sampler integration emits observed `SamplerState`,
+replay, and amendment intent. The current from-scratch path validates a
+`MixSpec` and records its exact revision alongside its dataset inputs, but the
+trainer still reads the dataset directly. Until a sampler integration emits
+observed `SamplerState`,
 implement mixture delivery in a versioned module and record its exact source
-snapshots, weights, seed, and state as outputs and lineage; do not claim normative
+snapshots, weights, seed, and state as outputs and lineage; do not claim exact
 mixture replay.
 
 ## Evidence before the next chapter

@@ -1,15 +1,16 @@
 # Executor providers and portable workloads
 
-OMF keeps scientific intent in a `WorkloadSpec` and physical execution policy
-in a `Binding`. An executor provider is the replaceable bridge between that
-binding and a process, scheduler, cloud runner, or capacity broker. Moving a
-workload from a laptop to Slurm, Kubernetes, Modal, Vast.ai, or another backend
-must not require editing the workload DAG or module protocol.
+OMF keeps what a workload does in `WorkloadSpec`. A `Binding` selects the
+execution provider, resources, placement, transport, and site policy. An
+executor provider is the replaceable bridge between that binding and a process,
+scheduler, cloud runner, or capacity broker. Moving a workload from a laptop to
+Slurm, Kubernetes, Modal, Vast.ai, or another backend must not require editing
+the workload DAG or module protocol.
 
 ```diagram
 ┌──────────────┐     ┌──────────────┐     ┌───────────────────┐
 │ Workload DAG │────▶│ Binding      │────▶│ Named provider    │
-│ what/why     │     │ where/policy │     │ how to execute    │
+│ behavior     │     │ place/policy │     │ how to execute    │
 └──────┬───────┘     └──────────────┘     └─────────┬─────────┘
        │                                             │
        ▼                                             ▼
@@ -21,8 +22,8 @@ must not require editing the workload DAG or module protocol.
 
 ## Discover and preflight
 
-Provider selection is exact and fail-closed. OMF never executes an unknown or
-unready provider as `local`.
+Provider selection is exact. OMF returns an error for an unknown or unready
+provider instead of silently running it as `local`.
 
 ```sh
 omf --output json executor list
@@ -32,7 +33,7 @@ omf --output json executor preflight bindings/site.yaml \
 ```
 
 The catalog reports each provider's source, potentially supported capabilities,
-and centrally validated configuration contract. Preflight instantiates the
+and centrally validated configuration. Preflight instantiates the
 configured provider and reports actual capabilities, missing workload
 requirements, and host or control plane issues. When a workload is supplied,
 preflight also includes requirements derived from its modules, such as
@@ -43,7 +44,7 @@ The same interfaces are `GET /v1/executors` and
 `AgentContext`, so an agent can choose and diagnose an execution path without
 reading implementation code first.
 
-## Binding contract
+## Binding format
 
 Executor-specific values live under `spec.config.executor`; they never enter the
 portable workload.
@@ -71,15 +72,15 @@ spec:
 ```
 
 The provider factory receives the complete immutable declaration as
-`ExecutorContext.declaration`, repository and state roots, the attributable
-actor, and only the nested executor options as `ExecutorContext.config`. A
-provider may interpret binding resources, placement, transport, and policy, but
-must not reinterpret stage semantics.
+`ExecutorContext.declaration`, repository and state roots, the named actor, and
+only the nested executor options as `ExecutorContext.config`. A provider may
+interpret binding resources, placement, transport, and policy, but must not
+reinterpret stage semantics.
 
-Configuration is desired state and must not contain plaintext credentials.
-Refer to symbolic secrets or use the runner's workload identity. Provider code
-is trusted runtime code: installing a Python entry point authorizes it to run in
-the OMF service process.
+Versioned configuration must not contain plaintext credentials. Refer to
+symbolic secrets or use the runner's workload identity. Provider code is trusted
+runtime code: installing a Python entry point authorizes it to run in the OMF
+service process.
 
 ## End-to-end module transport
 
@@ -89,13 +90,13 @@ capabilities:
 
 | Capability | Required behavior |
 | --- | --- |
-| `protocol:omf.module/v1` | Preserve the protocol request/result contract |
+| `protocol:omf.module/v1` | Preserve the protocol request and result |
 | `transport:module-source` | Make the exact admitted source package available to the worker |
 | `transport:request-result` | Deliver `request.json`; retrieve `result.json` before success |
 | `transport:artifacts` | Retrieve declared artifacts into the stage run directory |
 
-Execution-environment claims are separate capabilities. The local profile accepts
-only a zero-byte dependency lock and records the selected executable digest. Its
+Execution-environment claims are separate capabilities. The local provider
+accepts only a zero-byte dependency lock and records the selected executable digest. Its
 worker rechecks that pathname immediately before process creation and advertises
 this honestly as `environment:executable-drift-detection`, not byte-sealed
 attestation: trusted host administration could still replace the executable in
@@ -135,9 +136,9 @@ These statements are capability facts, not product preferences. A site can
 extend an adapter in this clone, inject a registry in an embedding service, or
 install a separate provider package. A Kubernetes provider that adds an init
 container/object-store transport and result collector should use a distinct
-name until it fully replaces the built-in contract in that clone.
+name until it fully replaces the built-in behavior in that clone.
 
-Deployments use the same registry and durable attach contract. A deployment
+Deployments use the same registry and durable restart attachment. A deployment
 defaults to `local`; select another provider with
 `spec.extensions.executor` and place its options in
 `spec.extensions.executorConfig`. The provider must advertise
@@ -229,9 +230,9 @@ augments, the default registry. This makes the active trust boundary explicit.
   preemption signals to checkpoint hooks and never claim network denial unless
   site isolation enforces it.
 
-## Provider conformance checklist
+## Provider acceptance tests
 
-Before a binding is production-eligible, test:
+Before supporting a binding for production work, test:
 
 - exact provider selection, unknown-provider failure, and no local fallback;
 - clean preflight failure before run allocation;
@@ -243,7 +244,7 @@ Before a binding is production-eligible, test:
 - network, identity, secret, quota, and resource enforcement;
 - checkpoint commit/recovery and idempotent retry semantics;
 - the same representative workload unchanged on local and the target binding;
-- measured scale, cost, and recovery evidence required by `SPEC.md`.
+- measured scale, cost, and recovery behavior at the supported limits.
 
-Do not infer conformance from a provider name or a successful scheduler submit.
-The signed scenario evidence is the claim.
+Do not infer support from a provider name or a successful scheduler submit. Add
+the provider and its failure cases to the release test matrix.

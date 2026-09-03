@@ -45,7 +45,7 @@ spec:
       operation: run
       stateOutput: train.modelState
       config: {action: infer}
-  conformanceVectors:
+  compatibilityVectors:
     - name: positive
       method: predict
       inputs: {input: 3.0}

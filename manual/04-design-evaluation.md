@@ -2,11 +2,11 @@
 
 **Status: Tested now**
 
-Evaluator stages, admitted `EvaluationSpec` metrics, model-package conformance,
-and immutable pass evidence are tested. External benchmark harnesses remain
-optional evaluator modules.
+Evaluator stages, admitted `EvaluationSpec` metrics, model-package compatibility
+checks, and immutable pass evidence are tested. External benchmark harnesses
+remain optional evaluator modules.
 
-## Freeze the decision protocol
+## Set the decision protocol
 
 Before running a baseline, commit a protocol that identifies:
 
@@ -25,8 +25,8 @@ revisions may be informative, but they are not a controlled direct comparison.
 The [from-scratch example](../workloads/example-from-scratch.yaml) references a
 versioned [evaluation protocol](../evaluations/example-affine.yaml) and places an
 `evaluate` stage after `train`. After the run, this command applies its metric
-thresholds and the model package's conformance vectors, then materializes one
-immutable `EvaluationResult`:
+thresholds and the model package's compatibility test vectors, then materializes
+one immutable `EvaluationResult`:
 
 ```sh
 omf --actor research-agent --output json evaluate run/<run-id>

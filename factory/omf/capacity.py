@@ -1,12 +1,10 @@
-"""Actual-scale capacity benchmark reports and conservative profile claims."""
+"""Capacity benchmark measurements."""
 
 from __future__ import annotations
 
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
-
-from omf.errors import ValidationError
 
 
 @dataclass(frozen=True)
@@ -18,7 +16,6 @@ class CapacityReport:
     control_throughput: float
     failures: int
     restore_seconds: float
-    frontier_claim: bool
 
 
 class CapacityHarness:
@@ -31,10 +28,7 @@ class CapacityHarness:
         artifact: Callable[[], None],
         control: Callable[[], None],
         restore: Callable[[], None],
-        claim_frontier: bool = False,
     ) -> CapacityReport:
-        if claim_frontier and accelerators < 1024:
-            raise ValidationError("OMF-Frontier requires an actual test at >=1024 accelerators")
         failures = 0
         throughputs = []
         started_all = time.perf_counter()
@@ -57,5 +51,4 @@ class CapacityHarness:
             throughputs[2],
             failures,
             restore_seconds,
-            claim_frontier,
         )

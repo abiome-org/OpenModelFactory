@@ -16,5 +16,5 @@ HTTP API only behind site-managed TLS and identity controls. Never commit `.omf`
 private keys, API tokens, cloud credentials, or data payloads.
 
 Supported releases receive security fixes. Until a stable release exists, only
-the current `main` revision is supported. The specification's conformance
-profiles are claims only when accompanied by signed measured evidence.
+the current `main` revision is supported. Security behavior is supported only
+where the test suite and named deployment controls exercise it directly.

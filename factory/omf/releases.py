@@ -24,7 +24,7 @@ _REQUIRED = {
     "risk",
     "intendedUse",
     "prohibitedUse",
-    "conformance",
+    "compatibility",
     "sbom",
     "provenance",
     "vulnerabilities",

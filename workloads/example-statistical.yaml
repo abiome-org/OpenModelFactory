@@ -32,6 +32,6 @@ spec:
           tolerance: 0.0
         outputs:
           - passed
-          - conformancePassed
+          - compatibilityPassed
           - absoluteError
           - evaluation

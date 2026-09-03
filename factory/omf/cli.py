@@ -44,7 +44,6 @@ federation_app = typer.Typer(no_args_is_help=True)
 capacity_app = typer.Typer(no_args_is_help=True)
 operation_app = typer.Typer(no_args_is_help=True)
 token_app = typer.Typer(no_args_is_help=True)
-conformance_app = typer.Typer(no_args_is_help=True)
 agent_app = typer.Typer(no_args_is_help=True)
 goal_app = typer.Typer(no_args_is_help=True)
 knowledge_app = typer.Typer(no_args_is_help=True)
@@ -67,7 +66,6 @@ app.add_typer(federation_app, name="federation")
 app.add_typer(capacity_app, name="capacity")
 app.add_typer(operation_app, name="operation")
 app.add_typer(token_app, name="token")
-app.add_typer(conformance_app, name="conformance")
 app.add_typer(agent_app, name="agent")
 app.add_typer(goal_app, name="goal")
 app.add_typer(knowledge_app, name="knowledge")
@@ -864,26 +862,6 @@ def token_revoke(token_id: str) -> None:
         with _factory() as factory:
             factory.revoke_api_token(token_id)
         return {"tokenId": token_id, "revoked": True}
-
-    _handle(run)
-
-
-@conformance_app.command("build")
-def conformance_build(evidence: Path, output: Path = typer.Option(..., "--output")) -> None:
-    """Build, sign, and commit a conservative report from measured scenario evidence."""
-
-    def run() -> dict[str, Any]:
-        with _factory() as factory:
-            return factory.create_conformance_report(evidence, output)
-
-    _handle(run)
-
-
-@conformance_app.command("verify")
-def conformance_verify(report: Path) -> None:
-    def run() -> dict[str, Any]:
-        with _factory() as factory:
-            return factory.verify_conformance_report(report)
 
     _handle(run)
 

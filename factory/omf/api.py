@@ -177,17 +177,6 @@ class ApiTokenRequest(BaseModel):
     expires_at: str | None = None
 
 
-class ConformanceBuildRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-    evidence: str
-    output: str
-
-
-class ConformanceVerifyRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-    report: str
-
-
 class GoalScopeRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     resource_refs: list[str] = Field(default_factory=list)
@@ -624,20 +613,6 @@ def create_app(paths: ProjectPaths, *, executors: ExecutorRegistry | None = None
     @app.post("/v1/backups")
     def backup(request: BackupRequest, service: Factory = Depends(authorized)) -> dict[str, Any]:
         return service.backup(request.destination)
-
-    @app.post("/v1/conformance/reports")
-    def conformance_build(
-        request: ConformanceBuildRequest, service: Factory = Depends(authorized)
-    ) -> dict[str, Any]:
-        return service.create_conformance_report(
-            paths.root / request.evidence, paths.root / request.output
-        )
-
-    @app.post("/v1/conformance/verify")
-    def conformance_verify(
-        request: ConformanceVerifyRequest, service: Factory = Depends(authorized)
-    ) -> dict[str, Any]:
-        return service.verify_conformance_report(paths.root / request.report)
 
     @app.post("/v1/tokens")
     def token_create(

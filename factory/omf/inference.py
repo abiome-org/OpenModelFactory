@@ -1,4 +1,4 @@
-"""Model-neutral inference protocol and numerical train/serve conformance."""
+"""Model-neutral inference protocol and numerical train/serve compatibility."""
 
 from __future__ import annotations
 
@@ -69,7 +69,7 @@ class Tolerance:
 
 
 @dataclass(frozen=True)
-class ConformanceVector:
+class CompatibilityVector:
     request: InferenceRequest
     expected: InferenceResult
     tolerances: dict[str, Tolerance] = field(default_factory=dict)
@@ -77,7 +77,7 @@ class ConformanceVector:
 
 
 @dataclass(frozen=True)
-class ConformanceResult:
+class CompatibilityResult:
     passed: bool
     failures: tuple[str, ...]
     comparisons: int
@@ -86,7 +86,7 @@ class ConformanceResult:
 
 def _flatten(value: Any, path: str) -> list[tuple[str, float]]:
     if isinstance(value, bool) or not isinstance(value, (int, float, list, tuple)):
-        raise ValidationError(f"non-numerical conformance value at {path}")
+        raise ValidationError(f"non-numerical compatibility value at {path}")
     if isinstance(value, (int, float)):
         return [(path, float(value))]
     result: list[tuple[str, float]] = []
@@ -104,14 +104,14 @@ def _shape(value: Any) -> tuple[int, ...]:
     return (len(value), *child)
 
 
-class ConformanceRunner:
+class CompatibilityRunner:
     def run(
         self,
-        vectors: list[ConformanceVector],
+        vectors: list[CompatibilityVector],
         executor: InferenceExecutor,
         *,
         derived_revision: str | None = None,
-    ) -> ConformanceResult:
+    ) -> CompatibilityResult:
         failures: list[str] = []
         comparisons = 0
         for vector_index, vector in enumerate(vectors):
@@ -146,7 +146,7 @@ class ConformanceRunner:
                             name,
                         )
                     )
-        return ConformanceResult(not failures, tuple(failures), comparisons, derived_revision)
+        return CompatibilityResult(not failures, tuple(failures), comparisons, derived_revision)
 
     @staticmethod
     def _compare(expected: Part, actual: Part, tolerance: Tolerance, name: str) -> list[str]:

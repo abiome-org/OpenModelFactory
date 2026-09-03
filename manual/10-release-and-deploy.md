@@ -35,10 +35,10 @@ omf --actor release-operator --output json release create <run-id> \
   --promote
 ```
 
-Promotion fails closed when evidence is missing or invalid. A signed release
-binds model/state artifacts, workload and binding provenance, data rights,
-evaluation, vulnerabilities, limitations, intended use, risk decision, SBOM,
-and rollback information.
+Promotion is denied when evidence is missing or invalid. A signed release binds
+model/state artifacts, workload and binding provenance, data rights, evaluation,
+vulnerabilities, limitations, intended use, risk decision, SBOM, and rollback
+information.
 
 Create a deployment manifest referencing the promoted release, review its
 provider and routing intent, then apply and observe it:
@@ -52,6 +52,6 @@ For rollback, first read the exact current `statusVersion`, then use it as the
 compare-and-set guard. Refresh status after a stale-version response rather than
 retrying blindly.
 
-Deployment success does not establish security, availability, latency, scale,
-or frontier conformance. Those claims require the measured signed evidence and
-site controls defined by the specification.
+Deployment success does not establish security, availability, latency, or
+scale. Test those properties under the applicable site controls before treating
+them as supported.

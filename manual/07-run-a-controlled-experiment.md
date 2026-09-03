@@ -10,9 +10,9 @@ revisions. Rich statistical decisions remain evaluator- or analysis-module-owned
 
 Before either run, record the fields that must remain equal: evaluation data and
 verifier, preprocessing, inference policy, seeds, thresholds, binding when
-feasible, and all scientific inputs outside the declared intervention. Record
-expected numerical nondeterminism and the number of repeats needed for the
-decision.
+feasible, and all inputs that determine workload behavior outside the declared
+intervention. Record expected numerical nondeterminism and the number of repeats
+needed for the decision.
 
 Run baseline and candidate as separate admitted workloads. For each run inspect:
 
@@ -56,16 +56,16 @@ quantitative distributions, uncertainty, slices, and resource measurements in
 the evaluator artifact or a separately versioned analysis module. Do not derive
 a broad claim from the pass bit alone.
 
-## Make an attributable decision
+## Tie the decision to a named actor
 
-Apply the decision rule frozen in chapter 4. Report regressions and invalid
+Apply the decision rule set in chapter 4. Report regressions and invalid
 cases as prominently as improvements. If evidence supports a bounded claim,
 record it without rewriting previous knowledge:
 
 ```sh
 omf --actor research-agent --output json knowledge record candidate-result \
   --category observation \
-  --claim "candidate improved the frozen protocol within the declared scope" \
+  --claim "candidate improved results under the fixed protocol within the declared scope" \
   --confidence 0.95 \
   --evidence evaluation/<candidate-evaluation> \
   --run-id <candidate-run-id> \

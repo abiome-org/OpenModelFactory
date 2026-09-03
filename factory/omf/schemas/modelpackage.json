@@ -17,7 +17,7 @@
         "initialization",
         "checkpointMapping",
         "adapters",
-        "conformanceVectors",
+        "compatibilityVectors",
         "capabilities",
         "provenance"
       ],
@@ -53,7 +53,7 @@
           },
           "additionalProperties": false
         },
-        "conformanceVectors": {
+        "compatibilityVectors": {
           "type": "array",
           "minItems": 1,
           "items": {

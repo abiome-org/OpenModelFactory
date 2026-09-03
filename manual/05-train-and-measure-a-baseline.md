@@ -4,10 +4,11 @@
 
 ## Outcome
 
-You will produce one attributable run with immutable module packages, workload
-and binding digests, dataset lineage, stage outputs, and boolean evaluation
-evidence. Use the [canonical lifecycle](README.md#canonical-tested-local-lifecycle)
-for the tested commands.
+You will produce one run tied to a named actor, with immutable module packages,
+workload and binding digests, dataset lineage, stage outputs, and boolean
+evaluation evidence. Use the
+[canonical lifecycle](README.md#canonical-tested-local-lifecycle) for the tested
+commands.
 
 ## Read the graph before spending compute
 
@@ -34,8 +35,8 @@ capabilities. It creates no run and is not evidence that the workload succeeded.
 
 ## Admit, observe, and evaluate
 
-Run the committed graph with an attributable actor, retain the returned
-`runId`, and inspect terminal status and lineage before evaluation:
+Run the committed graph with a named actor, retain the returned `runId`, and
+inspect terminal status and lineage before evaluation:
 
 ```sh
 omf --actor research-agent --output json run \

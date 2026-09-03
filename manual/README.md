@@ -2,11 +2,13 @@
 
 **Status: Tested now**
 
-This manual is the task-oriented path from a clean project to an attributable
-model-development decision. It complements the normative [specification](../SPEC.md),
-the concise [project overview](../README.md), and the operational references in
-[`docs/`](../docs/operations.md). When prose conflicts with the specification or
-the executable schemas, the specification and schemas win.
+This manual is the task-oriented path from a greenfield model card or existing
+project to a benchmarked model-development decision tied to a named actor. It
+supports a repeated loop, not only a one-time training run. It complements the
+concise [project overview](../README.md),
+[architecture and system map](../docs/architecture.md), and operational
+references in [`docs/`](../docs/operations.md). When prose conflicts with
+versioned schemas or executable interfaces, those interfaces win.
 
 ## Status labels
 
@@ -16,12 +18,12 @@ Every chapter declares one of these statuses:
   CLI and checked-in example.
 - **Conditional** — the path works only with named external infrastructure,
   evidence, or independent authorization.
-- **Extension blueprint** — the contracts exist, but the repository does not
+- **Extension blueprint** — the interfaces exist, but the repository does not
   yet provide the claimed end-to-end workflow. Blueprints contain no invented
   commands.
 
 The example is intentionally a tiny from-scratch affine model implemented with
-the Python standard library. It proves model-package and MixSpec admission,
+the Python standard library. It exercises model-package and MixSpec admission,
 training, checkpoint publication, evaluation, and experiment mechanics—not mix
 delivery/replay, model quality, benchmark coverage, RLVR readiness, or scale.
 Framework- and modality-specific conveniences belong in optional starter packs,
@@ -42,7 +44,7 @@ not factory core.
 
 ## Global integrity rules
 
-- Freeze evaluation data, preprocessing, inference policy, metrics, seeds,
+- Set evaluation data, preprocessing, inference policy, metrics, seeds,
   thresholds, slices, and decision rules before comparing candidates. Any
   change creates a new protocol revision and breaks direct comparability.
 - Keep training data, development data, reward tasks, reward verifiers, and
@@ -53,18 +55,17 @@ not factory core.
 - Keep hidden tests, verifier logic, credentials, prompts, sensitive samples,
   and signed URLs out of actor inputs, Git, logs, events, and knowledge claims.
 - A scheduler accepting a job does not prove source transport, result
-  retrieval, artifact completeness, recovery, security, scale, or conformance.
-- Never claim cluster, federation, air-gap, security, scale, or frontier
-  conformance without the measured and signed scenario evidence required by
-  the specification.
+  retrieval, artifact completeness, recovery, security, or scale.
+- Support cluster, federation, air-gap, security, and scale behavior only after
+  direct tests on the environment and limits being described.
 
 ## Canonical tested local lifecycle
 
 Run this once from a clean clone after installing OMF. The commands use only
 the checked-in fixture, example module, workload, and local binding. Set
-`OMF_ACTOR` to the real attributable operator identity; the scaffold default is
-used below only for the local example. This is the only shell transcript marked
-for execution by the manual test.
+`OMF_ACTOR` to the real named operator identity; the scaffold default is used
+below only for the local example. This is the only shell transcript marked for
+execution by the manual test.
 
 <!-- manual-test: local-lifecycle -->
 ```sh

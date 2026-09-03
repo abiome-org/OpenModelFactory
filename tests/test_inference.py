@@ -1,8 +1,8 @@
 import pytest
 from omf.errors import ValidationError
 from omf.inference import (
-    ConformanceRunner,
-    ConformanceVector,
+    CompatibilityRunner,
+    CompatibilityVector,
     InferenceRequest,
     InferenceResult,
     Part,
@@ -25,8 +25,8 @@ def _request():
 def test_tolerance_pass_and_comparison_count():
     expected = InferenceResult((Part("y", [1.0], dtype="f32"),), "m", "s", "r")
     actual = InferenceResult((Part("y", [1.01], dtype="f32"),), "m", "s", "r")
-    result = ConformanceRunner().run(
-        [ConformanceVector(_request(), expected, {"y": Tolerance(0.02, 0)})], Executor(actual)
+    result = CompatibilityRunner().run(
+        [CompatibilityVector(_request(), expected, {"y": Tolerance(0.02, 0)})], Executor(actual)
     )
     assert result.passed
     assert result.comparisons == 1
@@ -35,8 +35,8 @@ def test_tolerance_pass_and_comparison_count():
 @pytest.mark.parametrize("actual", [Part("y", [[1.0]], dtype="f32"), Part("y", [1.0], dtype="f64")])
 def test_shape_or_dtype_mismatch(actual):
     expected = InferenceResult((Part("y", [1.0], dtype="f32"),), "m", "s", "r")
-    result = ConformanceRunner().run(
-        [ConformanceVector(_request(), expected)],
+    result = CompatibilityRunner().run(
+        [CompatibilityVector(_request(), expected)],
         Executor(InferenceResult((actual,), "m", "s", "r")),
     )
     assert not result.passed

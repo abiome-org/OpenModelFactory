@@ -14,4 +14,4 @@ spec:
       minimum: 1.0
   data: []
   inferencePolicy:
-    conformance: model-package
+    compatibility: model-package

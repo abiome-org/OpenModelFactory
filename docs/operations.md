@@ -1,6 +1,6 @@
 # Operations runbook
 
-## Install and bootstrap
+## Install and initialize
 
 Use the directory installer for a new or existing project. Inspect its complete
 plan before allowing package downloads or local state creation:
@@ -13,12 +13,13 @@ omf --project /path/to/model-project --output json agent context
 ```
 
 The installer preserves existing manifests and appends rather than replaces an
-existing `AGENTS.md` or `.gitignore`. It creates missing local desired state,
-initializes Git only when needed, prints and applies the bootstrap plan, then
-requires `omf doctor` and bounded agent context to succeed. Reinstallation
-builds a fresh environment from the selected base interpreter and atomically
-replaces only a `.venv` carrying the OMF installer marker; an unrelated
-pre-existing `.venv` is rejected rather than executed or overwritten. Pip may
+existing `MODEL_CARD.md`, `AGENTS.md`, or `.gitignore`. It creates missing
+versioned project configuration, initializes Git only when needed, prints and
+applies the initialization plan, then requires `omf doctor` and bounded agent
+context to succeed. Reinstallation builds a fresh environment from the selected
+base interpreter and atomically replaces only a `.venv` carrying the OMF
+installer marker. An unrelated pre-existing `.venv` is rejected rather than
+executed or overwritten. Pip may
 use the configured package index only for hash-locked binary runtime and build
 dependencies; OMF itself builds without an isolated backend download. The plan
 discloses that network effect. OMF creates no hosted account, uploads no project
@@ -37,21 +38,23 @@ omf bootstrap
 omf doctor
 ```
 
-`omf bootstrap` is idempotent. It creates repository-local state under `.omf`
-with a restrictive umask. Back up `.omf/identity` separately from artifact data
-and restrict it to the factory operator. The local bearer token is encrypted in
-the metadata database and is intentionally never printed by the CLI.
+The literal `omf bootstrap` command is idempotent. It initializes
+repository-local state under `.omf` with a restrictive umask. Back up
+`.omf/identity` separately from artifact data and restrict it to the factory
+operator. The local bearer token is encrypted in the metadata database and is
+intentionally never printed by the CLI.
 
 ## Service operation
 
-`docker compose up --build -d` starts the authenticated API after bootstrap.
-Terminate TLS at the site's ingress or reverse proxy; the built-in server does
-not provide TLS or mutual workload authentication. The bootstrap credential is
-an all-scope local operator token; obtain it through an authorized operator
-workflow, not logs or Git. Create attributable, expiring least-privilege
-credentials with `omf token create --actor <identity> --scope read` and revoke
-them with `omf token revoke <token-id>`. Token values are stored only as hashes
-and are returned once at creation.
+`docker compose up --build -d` starts the authenticated API after the project
+has been initialized. Terminate TLS at the site's ingress or reverse proxy; the
+built-in server does not provide TLS or mutual workload authentication. The
+initial operator credential is an all-scope local token; obtain it through an
+authorized operator workflow, not logs or Git. Create expiring least-privilege
+credentials tied to a named actor with
+`omf token create --actor <identity> --scope read`. Revoke them with
+`omf token revoke <token-id>`. Token values are stored only as hashes and are
+returned once at creation.
 
 For direct service operation:
 
@@ -75,9 +78,9 @@ omf --output json executor preflight bindings/site.yaml --workload workloads/tra
 
 Installed `omf.executors` entry points are trusted code loaded into the API
 process. Unknown providers, missing protocol transport, unavailable scheduler
-tools, and unenforceable isolation fail closed before OMF allocates a run. A
-successful scheduler preflight is not scale conformance; retain measured
-portable-workload, restart, cancellation, checkpoint, and scale evidence. See
+tools, and unenforceable isolation stop with an error before OMF allocates a
+run. A successful scheduler preflight does not prove operation at scale; test
+portable workloads, restart, cancellation, checkpoints, and supported scale. See
 [the executor provider guide](executors.md) for backend-specific requirements.
 
 ## Backup and restore
@@ -103,7 +106,7 @@ Also replicate content-addressed manifests/blobs and securely back up
 Never restore only a signing key into a metadata history from another trust
 domain.
 
-## S3-compatible holding sites
+## S3-compatible artifact stores
 
 Store credentials as an encrypted JSON secret with purpose
 `artifact-store-credentials`. Accepted keys are `aws_access_key_id`,
@@ -124,9 +127,9 @@ content and publishes the manifest only after every chunk verifies.
 
 ## Vulnerability evidence and release promotion
 
-Promotion is fail-closed when vulnerability evidence is absent, invalid, does
-not cover the aggregate model and admitted module artifacts, or
-contains an unwaived open high/critical finding. Import a scanner's YAML/JSON
+Promotion is denied when vulnerability evidence is absent, invalid, does not
+cover the aggregate model and admitted module artifacts, or contains an
+unwaived open high/critical finding. Import a scanner's YAML/JSON
 report with `omf release create --vulnerability-report <path>`. The report must
 contain `scanner` (name/version object), `databaseRevision`, timezone-aware
 `generatedAt`, `subjects` (OMF artifact digests), `findings`, and `waivers`.
@@ -164,8 +167,8 @@ python -m pip install --no-index --find-links ./wheels open-model-factory
 ```
 
 Run with network namespace denial or a site sandbox and verify no external
-traffic. An air-gap conformance claim additionally requires the signed scenario
-evidence specified in `SPEC.md`; offline installation alone is not a claim.
+traffic. Offline installation alone does not prove that the full lifecycle is
+air-gapped; test the complete supported workflow with egress denied.
 
 ## Incident and recovery rules
 
@@ -182,5 +185,5 @@ evidence specified in `SPEC.md`; offline installation alone is not a claim.
   `omf operation get <operation-id>`, then run
   `omf operation reconcile <operation-id>` under the original actor identity.
 - Alias and deployment changes require a recorded passing policy decision.
-- Do not claim `OMF-Frontier` without a reproducible report from at least 1,024
-  actual accelerators.
+- State capacity limits only from reproducible benchmark runs on the actual
+  hardware and topology being described.

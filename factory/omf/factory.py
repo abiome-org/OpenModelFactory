@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import contextlib
 import fcntl
-import hashlib
 import json
 import math
 import re
@@ -23,7 +22,6 @@ from omf.agent import AgentControl
 from omf.artifacts import ArtifactBuilder, ArtifactManifest, AtomicCheckpointPublisher
 from omf.canonical import canonical_json, load_document, sha256_digest
 from omf.config import ProjectPaths, load_project
-from omf.conformance import build_report, verify_report
 from omf.data import DataService, DatasetSnapshot
 from omf.database import Database, ResourceRepository
 from omf.errors import (
@@ -1170,7 +1168,7 @@ class Factory:
         metric_names = [
             metric["name"] for suite in evaluation_specs for metric in suite["spec"]["metrics"]
         ]
-        reserved_scores = {"conformancePassed", "passed"}
+        reserved_scores = {"compatibilityPassed", "passed"}
         if len(metric_names) != len(set(metric_names)) or reserved_scores.intersection(
             metric_names
         ):
@@ -1566,8 +1564,8 @@ class Factory:
                 )
         validate_contract_schema(package_spec["architecture"]["parameterSchema"], "parameters")
         if package_spec["adapters"].get("optimized"):
-            raise ValidationError("optimized model adapters are not executable in this profile")
-        for vector in package_spec["conformanceVectors"]:
+            raise ValidationError("optimized model adapters are not executable by this factory")
+        for vector in package_spec["compatibilityVectors"]:
             validate_contract(signatures["input"], vector["inputs"], "model package input")
             validate_contract(signatures["output"], vector["expected"], "model package output")
             for tolerance in vector.get("tolerances", {}).values():
@@ -1764,7 +1762,7 @@ class Factory:
         return result
 
     @staticmethod
-    def _conformance_equal(expected: Any, actual: Any, tolerance: dict[str, Any]) -> bool:
+    def _compatibility_equal(expected: Any, actual: Any, tolerance: dict[str, Any]) -> bool:
         if isinstance(expected, bool) or isinstance(actual, bool):
             return bool(expected == actual)
         if isinstance(expected, (int, float)) and isinstance(actual, (int, float)):
@@ -1776,17 +1774,17 @@ class Factory:
             )
         if isinstance(expected, list) and isinstance(actual, list):
             return len(expected) == len(actual) and all(
-                Factory._conformance_equal(left, right, tolerance)
+                Factory._compatibility_equal(left, right, tolerance)
                 for left, right in zip(expected, actual, strict=True)
             )
         if isinstance(expected, dict) and isinstance(actual, dict):
             return expected.keys() == actual.keys() and all(
-                Factory._conformance_equal(expected[key], actual[key], tolerance)
+                Factory._compatibility_equal(expected[key], actual[key], tolerance)
                 for key in expected
             )
         return bool(expected == actual)
 
-    def _evaluate_model_conformance(
+    def _evaluate_model_compatibility(
         self,
         run_id: str,
         run_resource: dict[str, Any],
@@ -1811,9 +1809,9 @@ class Factory:
         self._require_executor(resolved, MODULE_PROTOCOL_CAPABILITIES)
         source_manifest = self.local_store.read_manifest(source_digest)
         if not ArtifactBuilder(self.local_store).verify(source_manifest):
-            raise IntegrityError("admitted conformance adapter source failed verification")
+            raise IntegrityError("admitted compatibility adapter source failed verification")
         failures: list[dict[str, Any]] = []
-        vectors = package_spec["conformanceVectors"]
+        vectors = package_spec["compatibilityVectors"]
         with tempfile.TemporaryDirectory(dir=self.paths.packages) as temporary_name:
             temporary = Path(temporary_name)
             archive = temporary / "archive"
@@ -1827,7 +1825,7 @@ class Factory:
             )
             environment = self._prepare_module_environment(resolved.executor, manifest, code_root)
             if environment["digest"] != admission["environments"][stage]["digest"]:
-                raise IntegrityError("conformance adapter environment differs from run admission")
+                raise IntegrityError("compatibility adapter environment differs from run admission")
             signatures = package_spec["signatures"]
             validate_contract(signatures["state"], state, "model package state")
             for index, vector in enumerate(vectors):
@@ -1840,7 +1838,7 @@ class Factory:
                         "config": adapter["config"],
                         "context": {
                             "runId": run_id,
-                            "conformanceVector": vector["name"],
+                            "compatibilityVector": vector["name"],
                             "inference": {
                                 "method": vector["method"],
                                 "seed": vector.get("seed"),
@@ -1852,20 +1850,20 @@ class Factory:
                     manifest,
                     code_root,
                     request,
-                    self.paths.runs / run_id / "evaluations" / "conformance" / str(index),
+                    self.paths.runs / run_id / "evaluations" / "compatibility" / str(index),
                     executor=resolved.executor,
                     executor_config=resolved.config,
                     environment=environment,
                 )
                 validate_contract(signatures["output"], result.outputs, "model package output")
                 for output, expected in vector["expected"].items():
-                    if output not in result.outputs or not self._conformance_equal(
+                    if output not in result.outputs or not self._compatibility_equal(
                         expected,
                         result.outputs.get(output),
                         vector.get("tolerances", {}).get(output, {}),
                     ):
                         failures.append(
-                            {"kind": "conformance", "vector": vector["name"], "output": output}
+                            {"kind": "compatibility", "vector": vector["name"], "output": output}
                         )
         return not failures, failures, len(vectors)
 
@@ -1906,24 +1904,24 @@ class Factory:
         model_package_ref = run_resource["spec"]["extensions"].get("modelPackageRef")
         if model_package_ref:
             model_package = self._resource_by_uri("ModelPackage", model_package_ref)
-            conformance_passed, conformance_failures, vector_count = (
-                self._evaluate_model_conformance(run_id, run_resource, run_result, model_package)
+            compatibility_passed, compatibility_failures, vector_count = (
+                self._evaluate_model_compatibility(run_id, run_resource, run_result, model_package)
             )
-            failures.extend(conformance_failures)
+            failures.extend(compatibility_failures)
         else:
             explicit = {
                 key: value
                 for key, value in outputs.items()
-                if key.lower().endswith((".conformancepassed", ".conformance_passed"))
+                if key.lower().endswith((".compatibilitypassed", ".compatibility_passed"))
                 and isinstance(value, bool)
             }
-            conformance_passed = bool(explicit) and all(explicit.values())
+            compatibility_passed = bool(explicit) and all(explicit.values())
             vector_count = 0
-            if not conformance_passed:
+            if not compatibility_passed:
                 failures.append(
-                    {"kind": "conformance", "message": "no model conformance evidence found"}
+                    {"kind": "compatibility", "message": "no model compatibility evidence found"}
                 )
-        passed = not failures and all(passing.values()) and conformance_passed
+        passed = not failures and all(passing.values()) and compatibility_passed
         resource = self.apply_resource(
             {
                 "apiVersion": "omf.dev/v1alpha1",
@@ -1937,7 +1935,7 @@ class Factory:
                     "scores": {
                         **passing,
                         **metric_scores,
-                        "conformancePassed": conformance_passed,
+                        "compatibilityPassed": compatibility_passed,
                         "passed": passed,
                     },
                     "provenance": {
@@ -1950,8 +1948,8 @@ class Factory:
                     "failures": failures,
                     "extensions": {
                         "passed": passed,
-                        "conformancePassed": conformance_passed,
-                        "conformanceVectors": vector_count,
+                        "compatibilityPassed": compatibility_passed,
+                        "compatibilityVectors": vector_count,
                         "evaluationRefs": run_resource["spec"]["extensions"].get(
                             "evaluationRefs", []
                         ),
@@ -2077,13 +2075,13 @@ class Factory:
         datasets = self.resources.list(kind="DatasetSnapshot")
         rights_valid = all(bool(item["spec"].get("rights")) for item in datasets)
         approval_list = approvals or []
-        conformance_passed = bool(evaluation["spec"]["extensions"].get("conformancePassed"))
+        compatibility_passed = bool(evaluation["spec"]["extensions"].get("compatibilityPassed"))
         evidence = {
             "evaluation_passed": True,
             "lineage_complete": bool(self.lineage.by_run(run_id)),
             "rights_valid": rights_valid,
             "signatures_valid": self._signing_identity_valid(),
-            "conformance_passed": conformance_passed,
+            "compatibility_passed": compatibility_passed,
             "vulnerabilities_valid": vulnerabilities_valid,
             "approvals_valid": bool(approval_list),
             "separation_of_duties": any(actor != self.actor for actor in approval_list),
@@ -2114,11 +2112,11 @@ class Factory:
             "risk": {"promotionDecision": asdict(decision)},
             "intendedUse": intended_use,
             "prohibitedUse": ["uses not authorized by data and release policy"],
-            "conformance": {
+            "compatibility": {
                 "moduleProtocol": "omf.module/v1",
-                "passed": conformance_passed,
+                "passed": compatibility_passed,
                 "evaluationRevision": evaluation["metadata"]["revision"],
-                "vectors": evaluation["spec"]["extensions"].get("conformanceVectors", 0),
+                "vectors": evaluation["spec"]["extensions"].get("compatibilityVectors", 0),
             },
             "sbom": self._release_sbom(run_id, module_digests),
             "provenance": {"runId": run_id, "lineageComplete": evidence["lineage_complete"]},
@@ -2658,45 +2656,6 @@ class Factory:
             "size": destination_path.stat().st_size,
             "integrity": Database(destination_path).integrity_check(),
         }
-
-    def create_conformance_report(
-        self, evidence_path: str | Path, output_path: str | Path
-    ) -> dict[str, Any]:
-        evidence = load_document(Path(evidence_path).read_bytes())
-        if not isinstance(evidence, dict):
-            raise ValidationError("conformance evidence must be an object")
-        specification = self.paths.root / "SPEC.md"
-        spec_revision = "sha256:" + hashlib.sha256(specification.read_bytes()).hexdigest()
-        signed = build_report(evidence, identity=self.identity, spec_revision=spec_revision)
-        destination = Path(output_path)
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        destination.write_bytes(canonical_json(signed))
-        artifact = ArtifactBuilder(self.local_store).import_path(
-            destination,
-            logical_kind="conformance-report",
-            provenance={"keyId": self.identity.key_id, "reportDigest": signed["digest"]},
-        )
-        self.events.append(
-            type="ConformanceMeasured",
-            source=f"omf://{self.namespace}",
-            subject=str(signed["digest"]),
-            resource_uid=str(uuid7()),
-            revision=str(signed["digest"]),
-            actor=self.actor,
-            data={
-                "profilesClaimed": signed["report"]["profilesClaimed"],
-                "profilesDenied": signed["report"]["profilesDenied"],
-                "artifactManifest": artifact.manifest_digest,
-            },
-            dataschema="https://schemas.omf.dev/events/conformance-measured/v1",
-        )
-        return {**signed, "artifactManifest": artifact.manifest_digest, "path": str(destination)}
-
-    def verify_conformance_report(self, report_path: str | Path) -> dict[str, Any]:
-        value = load_document(Path(report_path).read_bytes())
-        if not isinstance(value, dict):
-            raise ValidationError("signed conformance report must be an object")
-        return verify_report(value, self.identity.public_bytes)
 
     @staticmethod
     def _resource_uri(resource: dict[str, Any]) -> str:

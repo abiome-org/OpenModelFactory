@@ -3,7 +3,7 @@ FROM python:3.11-slim-bookworm AS build
 
 ENV PIP_DISABLE_PIP_VERSION_CHECK=1 PIP_NO_CACHE_DIR=1
 WORKDIR /src
-COPY pyproject.toml README.md SPEC.md LICENSE requirements.build.lock requirements.runtime.lock ./
+COPY pyproject.toml README.md LICENSE requirements.build.lock requirements.runtime.lock ./
 COPY factory ./factory
 RUN python -m pip install --only-binary=:all: --require-hashes -r requirements.build.lock \
     && python -m pip wheel --only-binary=:all: --require-hashes \
