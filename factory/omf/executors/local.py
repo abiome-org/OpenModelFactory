@@ -1,5 +1,3 @@
-"""Local no-shell executor with durable protocol files and honest isolation."""
-
 from __future__ import annotations
 
 import fcntl
@@ -178,12 +176,6 @@ class LocalExecutor(Executor):
 
     @staticmethod
     def _locate_executable(name: str, cwd: Path) -> tuple[Path, Path] | None:
-        """Return the invocation path with its final symlink retained, plus the real file.
-
-        A virtual environment interpreter is a symlink to its base interpreter. Executing the
-        resolved target would silently drop the environment's site-packages, so the module is
-        launched through the path it named while the digest attests the resolved bytes.
-        """
         if "/" in name:
             candidate = Path(cwd) / name
         else:
@@ -266,13 +258,6 @@ class LocalExecutor(Executor):
     def _realize_dependency_lock(
         self, invocation: Path, resolved: Path, dependency: DependencyLock
     ) -> tuple[Path, Path, dict[str, Any]]:
-        """Materialize a lock into a cached environment keyed by lock and interpreter identity.
-
-        The realized environment contains exactly the lock's hash-pinned binary distributions,
-        installed with pip's hash checking, plus the site directories of the interpreter the
-        module named so that ``omf.sdk`` and the module's toolchain remain importable. The
-        inherited layers are appended after installation, so the lock always shadows them.
-        """
         if self.environment_root is None:
             raise CapabilityError(
                 "local executor has no environment cache root for dependency lock realization",
@@ -374,8 +359,6 @@ class LocalExecutor(Executor):
             ]
             if not realized_site:
                 raise CapabilityError("realized environment site directory is not local")
-            # ``site.addsitedir`` lines make the interpreter's own layers visible, including
-            # the editable-install finders in their ``.pth`` files, after the lock's packages.
             (Path(realized_site[0]) / _INHERITED_LAYERS).write_text(
                 "".join(
                     f"import site; site.addsitedir({entry!r})\n"

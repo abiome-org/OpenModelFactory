@@ -1,13 +1,9 @@
-"""Domain errors with stable, actionable machine-readable envelopes."""
-
 from __future__ import annotations
 
 from typing import Any
 
 
 class OMFError(Exception):
-    """Base error presented consistently by the CLI and HTTP API."""
-
     code = "omf_error"
     status_code = 400
     default_retryable = False

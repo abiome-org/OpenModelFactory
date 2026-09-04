@@ -2,6 +2,32 @@
 
 ## Unreleased
 
+- Removed everything no run path used: the federation, capacity, telemetry,
+  sampler, feedback, environment, inference, evaluation, and deployment-plan
+  modules with their schemas; `MixSpec`; the preview Slurm and Kubernetes
+  executors; checkpoint replay claims; `starter-packs/`; and the unread
+  manifest fields of every kind. Database migration 6 drops the federation
+  tables.
+- Manifests declare only what the runtime enforces. `metadata.namespace` is
+  optional and defaults to the project namespace. A `Binding` names its
+  executor, optional POSIX limits under `spec.resources` (`cpuSeconds`,
+  `addressSpaceBytes`, `processes`, `fileSizeBytes`, `timeoutSeconds`), and
+  provider options directly under `spec.config`. A `Module` needs only
+  `entryPoint` and `environment`; contracts default to open objects and a
+  module without fixtures is tested with one `validate` request.
+- `omf token`, `omf secret`, `omf backup`, and `omf restore` moved under
+  `omf admin`. Table output prints aligned columns for lists and YAML for
+  objects.
+- Added `omf runs list`, `omf release list`, `omf release show`,
+  `omf release evidence` (the vulnerability report skeleton a run needs),
+  `omf deployment list`, and `omf module init`. Experiment references accept
+  `run/<id>` and evaluation result names as well as URIs.
+- `install.sh` copies the runnable starter example into a new project and
+  makes the initial commit, so a fresh project can run a workload immediately.
+- Cyclomatic-complexity limits and a no-comments rule are enforced by
+  `make lint`, an editor hook, and `make hooks`; the tests no longer patch or
+  fake any OMF code path.
+
 - Both GitHub Actions workflows were invalid YAML: the unquoted
   `--only-binary=:all: --require-hashes` argument was parsed as a mapping, so
   every run failed before any job started. The lines are quoted and both

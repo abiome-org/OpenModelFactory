@@ -1,5 +1,3 @@
-"""Executor adapter contract."""
-
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
@@ -9,8 +7,6 @@ from typing import Any, Literal
 
 ExecutionState = Literal["pending", "running", "succeeded", "failed", "canceled", "unknown"]
 
-# These capabilities mean that an executor can carry the complete module protocol across its
-# execution boundary. Scheduler submission alone is deliberately not enough.
 MODULE_PROTOCOL_CAPABILITIES = frozenset(
     {
         "protocol:omf.module/v1",
@@ -43,8 +39,6 @@ class ExecutionStatus:
 
 @dataclass(frozen=True)
 class DependencyLock:
-    """Exact opaque dependency declaration supplied to an executor provider."""
-
     relative_path: str
     digest: str
     contents: bytes = field(repr=False)
@@ -70,7 +64,6 @@ class Executor(ABC):
     def logs(self, execution_id: str) -> tuple[Path, Path]: ...
 
     def read_logs(self, execution_id: str, *, tail_bytes: int = 4096) -> tuple[str, str]:
-        """Read a bounded log tail without loading an executor's complete output."""
         if tail_bytes < 1:
             raise ValueError("tail_bytes must be positive")
 
@@ -87,20 +80,9 @@ class Executor(ABC):
         return tail(stdout), tail(stderr)
 
     def attach(self, execution_id: str, run_dir: Path) -> None:
-        """Restore controller-local bookkeeping after a process restart.
-
-        The operation must be idempotent and must reject a run directory that does not belong to
-        ``execution_id``. Executors whose scheduler identity is sufficient may keep the default
-        no-op. Adapters that use the local run directory for status or logs should override it.
-        """
         del execution_id, run_dir
 
     def recover(self, run_dir: Path) -> str | None:
-        """Recover an ID after allocation but before the controller persisted it.
-
-        Return ``None`` only when the provider can establish that no execution was allocated.
-        Raise when allocation may have happened but cannot be identified safely.
-        """
         del run_dir
         raise RuntimeError("executor cannot identify an interrupted submission")
 
@@ -112,6 +94,5 @@ class Executor(ABC):
         dependency: DependencyLock,
         deny_network: bool = False,
     ) -> dict[str, Any]:
-        """Pin an executable environment or fail before run allocation."""
         del argv, cwd, dependency, deny_network
         raise RuntimeError("executor cannot attest the declared module environment")

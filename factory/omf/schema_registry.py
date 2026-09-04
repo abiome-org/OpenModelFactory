@@ -1,5 +1,3 @@
-"""Bundled JSON Schema registry for OMF v1alpha1 resources."""
-
 from __future__ import annotations
 
 import json
@@ -18,8 +16,6 @@ API_VERSION = "omf.dev/v1alpha1"
 
 
 class SchemaRegistry:
-    """Discover and validate schemas bundled with the installed package."""
-
     def __init__(self) -> None:
         root = files("omf").joinpath("schemas")
         base = json.loads(root.joinpath("base.json").read_text(encoding="utf-8"))
@@ -38,18 +34,15 @@ class SchemaRegistry:
 
     @property
     def kinds(self) -> tuple[str, ...]:
-        """Return registered kinds in stable order."""
         return tuple(sorted(self._schemas))
 
     def schema_for(self, kind: str) -> dict[str, Any]:
-        """Return an independent copy of a kind's schema."""
         try:
             return deepcopy(self._schemas[kind])
         except KeyError as exc:
             raise ValidationError(f"unknown resource kind: {kind}") from exc
 
     def validate(self, resource: Any) -> dict[str, Any]:
-        """Validate a resource and report every error with a JSON path."""
         if not isinstance(resource, dict):
             raise ValidationError("resource must be an object")
         if resource.get("apiVersion") != API_VERSION:
@@ -79,19 +72,16 @@ class SchemaRegistry:
         return deepcopy(resource)
 
     def validate_as(self, resource: Any, expected_kind: str) -> dict[str, Any]:
-        """Validate a resource at a boundary that requires one exact kind."""
         value = self.validate(resource)
         if value["kind"] != expected_kind:
             raise ValidationError(f"expected {expected_kind} resource, received {value['kind']}")
         return value
 
     def load(self, data: str | bytes | Path) -> dict[str, Any]:
-        """Load and validate YAML/JSON text or a path."""
         raw = data.read_bytes() if isinstance(data, Path) else data
         return self.validate(load_document(raw))
 
     def normalize(self, resource: dict[str, Any], *, actor: str, **kwargs: Any) -> dict[str, Any]:
-        """Validate authoring input then return a finalized independent resource."""
         self.validate(resource)
         return finalize_resource(resource, actor=actor, **kwargs)
 

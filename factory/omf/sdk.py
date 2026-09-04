@@ -1,5 +1,3 @@
-"""Language-neutral OMF module protocol v1 and Python dispatcher."""
-
 from __future__ import annotations
 
 import argparse
@@ -47,7 +45,6 @@ Handler = Callable[[ProtocolRequest], ProtocolResult | Mapping[str, Any] | None]
 
 
 def dispatch(handlers: Mapping[str, Handler], request_path: Path, result_path: Path) -> int:
-    """Read one canonical JSON request and atomically write one result; logs stay untouched."""
     try:
         request = ProtocolRequest.model_validate_json(request_path.read_bytes())
         handler = handlers.get(request.operation)
@@ -59,7 +56,7 @@ def dispatch(handlers: Mapping[str, Handler], request_path: Path, result_path: P
             if isinstance(value, ProtocolResult)
             else ProtocolResult(status="ok", **(dict(value) if value is not None else {}))
         )
-    except Exception as exc:  # protocol boundary must always produce a result
+    except Exception as exc:
         result = ProtocolResult(
             status="error",
             error=ProtocolError(

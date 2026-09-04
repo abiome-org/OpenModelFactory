@@ -1,5 +1,3 @@
-"""Optional S3-backed artifact store."""
-
 from __future__ import annotations
 
 import hashlib

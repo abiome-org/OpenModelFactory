@@ -1,11 +1,3 @@
-"""Local HTTP serving worker that runs a release's admitted inference adapter per request.
-
-The worker is launched by ``omf deploy`` for a ``service`` deployment that names no command.
-It owns the network endpoint; every inference request becomes one ``omf.module/v1`` protocol
-exchange with the adapter, executed as a subprocess from the admitted source with the
-release's model state. Request and result values never appear in error responses.
-"""
-
 from __future__ import annotations
 
 import argparse

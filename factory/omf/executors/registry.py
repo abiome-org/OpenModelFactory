@@ -1,5 +1,3 @@
-"""Trusted executor-provider discovery and fail-closed binding resolution."""
-
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
@@ -22,8 +20,6 @@ EXECUTOR_API_VERSION = "omf.executor/v1"
 
 @dataclass(frozen=True)
 class ExecutorContext:
-    """Isolated project and desired-state context supplied to a trusted provider factory."""
-
     project_root: Path
     state_root: Path
     actor: str
@@ -36,8 +32,6 @@ ExecutorFactory = Callable[[ExecutorContext], Executor]
 
 @dataclass(frozen=True)
 class ExecutorProvider:
-    """One named provider implementation and its agent-readable configuration contract."""
-
     name: str
     api_version: str
     factory: ExecutorFactory = field(repr=False, compare=False)
@@ -55,8 +49,6 @@ class ResolvedExecutor:
 
 
 class ExecutorRegistry:
-    """Explicit provider registry; unknown or ambiguous names never fall back to local."""
-
     def __init__(self) -> None:
         self._providers: dict[str, tuple[ExecutorProvider, str]] = {}
 
@@ -89,7 +81,6 @@ class ExecutorRegistry:
         self._providers[name] = (provider, source)
 
     def discover(self) -> None:
-        """Load trusted installed providers from the ``omf.executors`` entry-point group."""
         selected = metadata.entry_points().select(group=ENTRY_POINT_GROUP)
         for entry_point in sorted(selected, key=lambda item: (item.name, item.value)):
             try:

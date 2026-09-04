@@ -1,5 +1,3 @@
-"""Deterministic deny-overrides authorization and promotion gates."""
-
 from __future__ import annotations
 
 from collections.abc import Callable
@@ -169,8 +167,6 @@ def _policy_documents(location: Path, namespace: str | None) -> list[tuple[str, 
 
 @dataclass(frozen=True)
 class ProjectPolicy:
-    """Every policy document in the project's policy directory, loaded as one decision source."""
-
     engine: PolicyEngine
     config: dict[str, Any]
     documents: tuple[dict[str, Any], ...]

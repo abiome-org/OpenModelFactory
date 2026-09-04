@@ -1,5 +1,3 @@
-"""Authenticated FastAPI surface for the Open Model Factory service."""
-
 from __future__ import annotations
 
 from collections.abc import AsyncIterator, Callable, Iterator

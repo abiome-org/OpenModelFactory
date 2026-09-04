@@ -1,9 +1,11 @@
 import json
+import subprocess
+import sys
 
-from omf.sdk import ProtocolResult, dispatch, main
+from omf.sdk import ProtocolResult, dispatch
 
 
-def test_protocol_dispatch_success_error_and_unsupported(tmp_path, monkeypatch):
+def test_protocol_dispatch_success_error_and_unsupported(tmp_path):
     request = tmp_path / "request.json"
     result = tmp_path / "result.json"
     request.write_text(json.dumps({"operation": "run", "inputs": {"value": 2}}))
@@ -30,5 +32,22 @@ def test_protocol_dispatch_success_error_and_unsupported(tmp_path, monkeypatch):
     assert dispatch({"run": fail}, request, result) == 1
     assert "worker failed" in result.read_text()
 
-    monkeypatch.setattr("sys.argv", ["worker", "--request", str(request), "--result", str(result)])
-    assert main({"run": lambda _request: ProtocolResult(status="ok")}) == 0
+    worker = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "from omf.sdk import ProtocolResult, main\n"
+                "raise SystemExit(main({'run': lambda _request: ProtocolResult(status='ok')}))"
+            ),
+            "--request",
+            str(request),
+            "--result",
+            str(result),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert worker.returncode == 0, worker.stderr
+    assert json.loads(result.read_text())["status"] == "ok"

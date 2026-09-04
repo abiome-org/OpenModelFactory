@@ -44,5 +44,6 @@ def check(paths: list[str]) -> list[str]:
 
 if __name__ == "__main__":
     problems = check(sys.argv[1:])
-    print("\n".join(problems))
+    for problem in problems:
+        print(problem)
     raise SystemExit(1 if problems else 0)

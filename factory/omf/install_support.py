@@ -1,5 +1,3 @@
-"""Standard-library file operations used by the directory installer."""
-
 from __future__ import annotations
 
 import argparse
@@ -80,7 +78,6 @@ def _validate_markers(content: str, begin: str, end: str) -> None:
 
 
 def validate_managed_file(destination: Path, begin: str, end: str) -> None:
-    """Reject malformed managed sections without changing the destination."""
 
     if not os.path.lexists(destination):
         return
@@ -99,7 +96,6 @@ def _temporary_name(destination_name: str) -> str:
 
 
 def upsert_managed_section(source: Path, destination: Path, begin: str, end: str) -> bool:
-    """Atomically add or replace one managed section while preserving other content."""
 
     section = source.read_text(encoding="utf-8").rstrip("\n")
     section_lines = section.splitlines()
@@ -163,7 +159,6 @@ def upsert_managed_section(source: Path, destination: Path, begin: str, end: str
 
 
 def render_template(source: Path, destination: Path, name: str, namespace: str) -> bool:
-    """Create one manifest from a template, or preserve an existing regular file."""
 
     content = source.read_text(encoding="utf-8")
     content = content.replace("__OMF_PROJECT_NAME__", name)

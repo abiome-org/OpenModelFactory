@@ -1,5 +1,3 @@
-"""Command-line interface for the Open Model Factory."""
-
 from __future__ import annotations
 
 import json
@@ -91,7 +89,6 @@ def main(
     actor: str = typer.Option("local-user", "--actor", help="Attributable local actor"),
     version: bool = typer.Option(False, "--version", callback=_version, is_eager=True),
 ) -> None:
-    """Repository-centered, model-neutral development and release system."""
     del version
     if output not in {"table", "json", "yaml"}:
         raise typer.BadParameter("output must be table, json, or yaml")
@@ -175,13 +172,11 @@ def bootstrap(
     profile: str = typer.Option("local", help="Bootstrap profile"),
     plan: bool = typer.Option(False, "--plan", "--dry-run", help="Show changes only"),
 ) -> None:
-    """Create or reconcile a complete repository-scoped factory profile."""
     _handle(lambda: bootstrap_project(_paths(), profile=profile, plan=plan))
 
 
 @app.command()
 def doctor() -> None:
-    """Validate the host, project, storage, identity, and recovery prerequisites."""
 
     def run() -> dict[str, Any]:
         with _factory() as factory:
@@ -192,7 +187,6 @@ def doctor() -> None:
 
 @executor_app.command("list")
 def executor_list() -> None:
-    """List built-in and trusted plugin providers with their configuration contracts."""
 
     def run() -> dict[str, Any]:
         with _factory() as factory:
@@ -206,7 +200,6 @@ def executor_preflight(
     binding: Path,
     workload: Path | None = typer.Option(None, "--workload"),
 ) -> None:
-    """Check provider transport capabilities and prerequisites without allocating a run."""
 
     def run() -> dict[str, Any]:
         with _factory() as factory:
@@ -217,7 +210,6 @@ def executor_preflight(
 
 @agent_app.command("capabilities")
 def agent_capabilities() -> None:
-    """List stable action contracts, preconditions, effects, risk, and cost class."""
     _handle(capability_catalog)
 
 
@@ -228,7 +220,6 @@ def agent_context(
     since: str | None = typer.Option(None, "--since", help="Increment from an event cursor"),
     max_bytes: int = typer.Option(65_536, "--max-bytes", min=16_384, max=1_048_576),
 ) -> None:
-    """Return a bounded, digestible situation and deterministic next actions."""
 
     def run() -> dict[str, Any]:
         paths = _paths()
@@ -270,7 +261,6 @@ def goal_create(
     resource_ref: list[str] | None = typer.Option(None, "--resource-ref"),
     run_id: list[str] | None = typer.Option(None, "--run-id"),
 ) -> None:
-    """Persist measurable intent and initialize its guarded lifecycle status."""
 
     def run() -> dict[str, Any]:
         with _factory() as factory:
@@ -308,7 +298,6 @@ def goal_status(
     expected_version: int = typer.Option(..., "--expected-version", min=0),
     reason: str = typer.Option(..., "--reason"),
 ) -> None:
-    """Compare-and-set a goal status without losing concurrent decisions."""
 
     def run() -> dict[str, Any]:
         with _factory() as factory:
@@ -336,7 +325,6 @@ def knowledge_record(
     supersedes: list[str] | None = typer.Option(None, "--supersedes"),
     expires_at: str | None = typer.Option(None, "--expires-at"),
 ) -> None:
-    """Commit evidence-backed durable knowledge; never put secrets in claims."""
 
     def run() -> dict[str, Any]:
         with _factory() as factory:
@@ -634,7 +622,6 @@ def runs_status(run_id: str) -> None:
 
 @app.command("evaluate")
 def evaluate(subject: str) -> None:
-    """Materialize or inspect immutable evaluation evidence for a run."""
 
     def run() -> dict[str, Any]:
         with _factory() as factory:
@@ -722,7 +709,6 @@ def experiment_create(
 
 @app.command("deploy")
 def deploy(path: Path) -> None:
-    """Policy-check and apply a deployment resource."""
 
     def run() -> dict[str, Any]:
         with _factory() as factory:
@@ -789,7 +775,6 @@ def operation_get(operation_id: str) -> None:
 
 @operation_app.command("reconcile")
 def operation_reconcile(operation_id: str) -> None:
-    """Execute pending work or reconcile completion evidence without uncertain replay."""
 
     def run() -> dict[str, Any]:
         with _factory() as factory:
@@ -804,7 +789,6 @@ def token_create(
     scope: list[str] | None = typer.Option(None, "--scope"),
     expires_at: str | None = typer.Option(None, "--expires-at"),
 ) -> None:
-    """Create an attributable API credential; the token is returned only once."""
 
     def run() -> dict[str, Any]:
         with _factory() as factory:
@@ -880,7 +864,6 @@ def secret_list() -> None:
 
 @admin_app.command("backup")
 def backup(destination: Path) -> None:
-    """Archive and verify metadata, identity, secrets, and local artifacts."""
 
     def run() -> dict[str, Any]:
         with _factory() as factory:
@@ -894,7 +877,6 @@ def restore(
     source: Path,
     expected_key_id: str | None = typer.Option(None, "--expected-key-id"),
 ) -> None:
-    """Verify and restore a backup when the project has no existing .omf directory."""
     _handle(lambda: restore_backup(_paths(), source, expected_key_id=expected_key_id))
 
 
@@ -903,7 +885,6 @@ def api_serve(
     host: str = typer.Option("127.0.0.1"),
     port: int = typer.Option(8080, min=1, max=65535),
 ) -> None:
-    """Run the authenticated HTTP API. Keep it behind site TLS when exposed."""
     uvicorn.run(create_app(_paths()), host=host, port=port, log_level="info")
 
 

@@ -169,7 +169,6 @@ spec: {owners: [release-test], extensions: {}}
 """
     )
     _run(["git", "init", "-q"], cwd=project)
-    # Hosted runners have no global identity; the candidate project must commit regardless.
     _run(["git", "config", "user.name", "OMF distribution test"], cwd=project)
     _run(["git", "config", "user.email", "distribution-test@omf.invalid"], cwd=project)
     _run(["git", "add", "omf.yaml"], cwd=project)

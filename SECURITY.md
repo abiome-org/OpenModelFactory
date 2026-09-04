@@ -10,7 +10,7 @@ and disclosure timeline with the reporter.
 
 ## Security boundary
 
-OMF treats module, dataset, release, and federation input as untrusted. Local
+OMF treats module, dataset, and release input as untrusted. Local
 process resource limits are defense-in-depth, not a VM-grade sandbox. Expose the
 HTTP API only behind site-managed TLS and identity controls. Never commit `.omf`,
 private keys, API tokens, cloud credentials, or data payloads.

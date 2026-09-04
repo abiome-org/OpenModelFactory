@@ -1,5 +1,3 @@
-"""Module manifests, safe resolution, and reproducible source packages."""
-
 from __future__ import annotations
 
 import hashlib
@@ -22,8 +20,6 @@ from omf.schema_registry import default_registry
 
 
 class ModuleManifest(BaseModel):
-    """Validated runtime projection of the canonical Module resource."""
-
     model_config = ConfigDict(extra="forbid")
     name: str
     code_root: str = "."
@@ -158,7 +154,6 @@ def scaffold_module(directory: str | Path, name: str | None = None) -> Path:
 
 
 def dependency_lock(manifest: ModuleManifest) -> DependencyLock:
-    """Return the already-confined and digest-verified lock as opaque provider input."""
     return DependencyLock(
         relative_path=manifest.dependency_lock,
         digest=manifest.dependency_digest,
@@ -179,7 +174,6 @@ _EXCLUDED = {
 
 
 def package_module(code_root: str | Path, output: str | Path) -> str:
-    """Create a byte-reproducible tar, rejecting links/special files and secret areas."""
     root, destination = Path(code_root).resolve(), Path(output)
     with (
         destination.open("wb") as raw,
@@ -208,7 +202,6 @@ def package_module(code_root: str | Path, output: str | Path) -> str:
 
 
 def extract_module_package(package: str | Path, destination: str | Path) -> Path:
-    """Materialize a validated module tar without tar traversal or special-file behavior."""
     target = Path(destination)
     if target.exists():
         raise ValidationError("module extraction destination already exists")
@@ -240,11 +233,6 @@ def extract_module_package(package: str | Path, destination: str | Path) -> Path
 
 
 def worktree_state(root: str | Path) -> dict[str, Any]:
-    """Describe the committed identity and uncommitted content of the project subtree.
-
-    A repository without any commit has no HEAD: every tracked or untracked file is then
-    uncommitted content, so the tree is dirty until the project is committed.
-    """
     cwd = Path(root)
 
     def git(*arguments: str, text: bool = True, check: bool = True) -> Any:
@@ -289,7 +277,6 @@ def git_source(root: str | Path, *, allow_dirty: bool = False) -> dict[str, Any]
 
 
 def validate_contract(contract: Any, value: Any, name: str) -> None:
-    """Validate a protocol value without including untrusted values in errors."""
     errors = sorted(
         Draft202012Validator(contract).iter_errors(value),
         key=lambda error: tuple(str(item) for item in error.absolute_path),
@@ -314,7 +301,6 @@ def validate_contract(contract: Any, value: Any, name: str) -> None:
 
 
 def validate_contract_schema(contract: Any, name: str) -> None:
-    """Validate an embedded, self-contained JSON Schema at admission."""
     reject_schema_references(contract, name)
     try:
         Draft202012Validator.check_schema(contract)
@@ -323,7 +309,6 @@ def validate_contract_schema(contract: Any, name: str) -> None:
 
 
 def reject_schema_references(value: Any, name: str) -> None:
-    """Reject actual JSON Schema reference keywords without inspecting instance literals."""
     if isinstance(value, dict):
         if isinstance(value.get("$ref"), str) or isinstance(value.get("$dynamicRef"), str):
             raise ValidationError(f"module {name} contract references are not supported")

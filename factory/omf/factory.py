@@ -1,5 +1,3 @@
-"""Integrated Open Model Factory application service."""
-
 from __future__ import annotations
 
 import contextlib
@@ -87,7 +85,6 @@ def _utc_now() -> str:
 
 @contextlib.contextmanager
 def _operation_lease(path: Path) -> Iterator[None]:
-    """Exclude concurrent workers and make a released running record detectably stale."""
     with path.open("a+") as handle:
         try:
             fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -181,19 +178,14 @@ def _recovered_execution(
         return execution_id
     if record.get("state") != "launching":
         raise IntegrityError("recovered executor record is invalid")
-    execution_id = executor.recover(run_dir)
-    if execution_id is None:
+    recovered = executor.recover(run_dir)
+    if recovered is None:
         raise IntegrityError("executor launch outcome is indeterminate")
     _write_execution_record(
         run_dir / "controller-execution.json",
-        {
-            "version": 1,
-            "state": "submitted",
-            "planDigest": plan_digest,
-            "executionId": execution_id,
-        },
+        {"version": 1, "state": "submitted", "planDigest": plan_digest, "executionId": recovered},
     )
-    return execution_id
+    return recovered
 
 
 def _ensure_execution(
@@ -288,8 +280,6 @@ MODULE_EXECUTION_CAPABILITIES = MODULE_PROTOCOL_CAPABILITIES | frozenset({"isola
 
 
 class Factory:
-    """One authenticated application boundary shared by CLI and HTTP interfaces."""
-
     def __init__(
         self,
         paths: ProjectPaths,
@@ -338,7 +328,6 @@ class Factory:
 
     @property
     def policy(self) -> ProjectPolicy:
-        """The project's policy documents, reloaded whenever a document changes on disk."""
         extensions = self.project["spec"].get("extensions", {})
         directory = self.paths.root / str(extensions.get("policyDirectory", "policies"))
         signature: tuple[tuple[str, int, int], ...] = ()
@@ -371,7 +360,6 @@ class Factory:
     def _authorize(
         self, action: str, *, purpose: str | None = None, resource: str | None = None
     ) -> PolicyDecision:
-        """Evaluate the project policy for one named action or raise a recorded denial."""
         policy = self.policy
         context: dict[str, Any] = {
             "actor": self.actor,
@@ -411,7 +399,6 @@ class Factory:
         )
 
     def _admission_worktree(self) -> dict[str, Any]:
-        """Apply the dirty-worktree policy and describe the source state a run admits."""
         state = worktree_state(self.paths.root)
         mode = self.policy.dirty_worktree
         record: dict[str, Any] = {
@@ -451,7 +438,6 @@ class Factory:
 
     @contextlib.contextmanager
     def _dataset_rights_locks(self, datasets: list[dict[str, Any]]) -> Iterator[None]:
-        """Serialize rights changes with final use of the affected dataset identities."""
         lock_root = self.paths.state / "operations" / "data-rights"
         lock_root.mkdir(parents=True, exist_ok=True)
         handles: list[Any] = []
@@ -474,7 +460,6 @@ class Factory:
         self.close()
 
     def authenticate(self, token: str) -> bool:
-        """Constant-time local API token verification."""
         return self.authenticate_principal(token) is not None
 
     def authenticate_principal(self, token: str) -> ApiPrincipal | None:
@@ -486,7 +471,6 @@ class Factory:
         self.api_tokens.revoke(token_id)
 
     def doctor(self) -> dict[str, Any]:
-        """Run non-destructive readiness checks with actionable findings."""
         checks: list[dict[str, Any]] = []
 
         def check(name: str, function: Any, remediation: str) -> None:
@@ -1497,7 +1481,6 @@ class Factory:
             self._run_state_event(run_resource, run_id, "Failed", reason)
 
     def _reconcile_completed_run(self, operation_id: str) -> dict[str, Any] | None:
-        """Recover publication only from an immutable result; never rerun uncertain work."""
         runs = [
             resource
             for resource in self.resources.list(kind="Run")
@@ -2342,12 +2325,6 @@ class Factory:
         stages: list[Stage],
         expected: dict[str, dict[str, Any]] | None = None,
     ) -> dict[str, dict[str, Any]]:
-        """Pin prior releases, checkpoints, and artifacts named as stage inputs.
-
-        Refinement consumes earlier evidence by exact identity: every referenced artifact must
-        exist and verify in the local store before a run identity is allocated, and a queued
-        run must see the same pinned identities at admission.
-        """
         pinned: dict[str, dict[str, Any]] = {}
         for stage in stages:
             for reference in stage.inputs.values():
@@ -2783,7 +2760,6 @@ class Factory:
         return not failures, failures, len(vectors)
 
     def evaluate(self, subject: str) -> dict[str, Any]:
-        """Materialize immutable evaluation evidence from evaluator stages in a run."""
         run_id = subject.removeprefix("run/")
         run_status = self.run_status(run_id)
         run_resource = self._run_resource(run_id)
@@ -2912,7 +2888,6 @@ class Factory:
         vulnerability_report: str | Path | None = None,
         evaluation_ref: str | None = None,
     ) -> dict[str, Any]:
-        """Build a signed complete release and optionally move a policy-gated alias."""
         self._authorize("release.create")
         if promote:
             self._authorize("release.promote")
@@ -3397,7 +3372,6 @@ class Factory:
         return True
 
     def deploy(self, deployment_path: str | Path) -> dict[str, Any]:
-        """Apply a deployment resource through its explicitly selected executor provider."""
         self._authorize("deployment.apply")
         raw = self._load_resource(deployment_path, kind="DeploymentSpec")
         release_name = str(raw["spec"]["releaseRef"]).removeprefix("release/")
@@ -3498,13 +3472,6 @@ class Factory:
         return self._resolve_executor(name, resource, config)
 
     def _prepare_serving(self, resource: dict[str, Any], run_dir: Path) -> tuple[list[str], str]:
-        """Stage the release's admitted inference adapter and model state for local serving.
-
-        The adapter source is the exact package admitted with the run, its environment must
-        match the admitted environment digest, and the model state is the run result output
-        the model package declared. The worker then answers each request through one
-        ``omf.module/v1`` exchange with that adapter.
-        """
         extension = resource["spec"].get("extensions", {})
         release_name = str(resource["spec"]["releaseRef"]).removeprefix("release/")
         release = self.find_resource("Release", release_name)

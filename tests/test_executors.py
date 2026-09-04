@@ -1,4 +1,5 @@
 import hashlib
+import importlib
 import json
 import os
 import subprocess
@@ -6,14 +7,21 @@ import sys
 import time
 import venv
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 from omf.errors import CapabilityError, ConfigurationError, IntegrityError, ValidationError
-from omf.executors import EXECUTOR_API_VERSION, ExecutorContext, ExecutorProvider, ExecutorRegistry
+from omf.executors import EXECUTOR_API_VERSION, ExecutorProvider, ExecutorRegistry
 from omf.executors.base import DependencyLock
 from omf.executors.local import LocalExecutor
 from omf.executors.registry import default_executor_registry
+
+
+def _install_plugin(site: Path, dist: str, entry: str, target: str, source: str) -> None:
+    info = site / f"{dist}.dist-info"
+    info.mkdir(parents=True)
+    (info / "METADATA").write_text(f"Metadata-Version: 2.1\nName: {dist}\nVersion: 1.0\n")
+    (info / "entry_points.txt").write_text(f"[omf.executors]\n{entry} = {target}\n")
+    (site / f"{target.partition(':')[0]}.py").write_text(source)
 
 
 def test_executor_registry_catalog_duplicates_unknown_and_discovery(tmp_path, monkeypatch):
@@ -34,22 +42,25 @@ def test_executor_registry_catalog_duplicates_unknown_and_discovery(tmp_path, mo
             declaration={},
         )
 
-    custom = ExecutorRegistry()
-    provider = ExecutorProvider(
+    site = tmp_path / "site"
+    _install_plugin(
+        site,
+        "example-provider",
         "custom",
-        EXECUTOR_API_VERSION,
-        lambda context: LocalExecutor() if isinstance(context, ExecutorContext) else None,
-        config_contract={"type": "object", "additionalProperties": False},
+        "example_provider:provider",
+        "from omf.executors import EXECUTOR_API_VERSION, ExecutorContext, ExecutorProvider\n"
+        "from omf.executors.local import LocalExecutor\n\n"
+        "provider = ExecutorProvider(\n"
+        '    "custom",\n'
+        "    EXECUTOR_API_VERSION,\n"
+        "    lambda context: LocalExecutor() if isinstance(context, ExecutorContext) else None,\n"
+        '    config_contract={"type": "object", "additionalProperties": False},\n'
+        ")\n",
     )
-    entry_point = SimpleNamespace(
-        name="custom",
-        value="example.provider:provider",
-        dist=SimpleNamespace(name="example-provider"),
-        load=lambda: provider,
-    )
-    entry_points = SimpleNamespace(select=lambda **_kwargs: [entry_point])
-    monkeypatch.setattr("omf.executors.registry.metadata.entry_points", lambda: entry_points)
+    monkeypatch.syspath_prepend(str(site))
+    custom = ExecutorRegistry()
     custom.discover()
+    provider = importlib.import_module("example_provider").provider
     assert custom.catalog()["providers"][0]["source"].startswith("entry-point:example-provider")
 
     with pytest.raises(ValidationError, match="provider contract") as invalid:
@@ -108,26 +119,34 @@ def test_executor_registry_rejects_invalid_plugins_and_controller_fields(tmp_pat
     with pytest.raises(ConfigurationError, match="invalid adapter"):
         invalid_executor.resolve("invalid", **resolve)
 
-    bad_entry_point = SimpleNamespace(
-        name="broken",
-        value="broken:provider",
-        load=lambda: (_ for _ in ()).throw(ImportError("unavailable")),
+    broken_site = tmp_path / "broken-site"
+    _install_plugin(
+        broken_site,
+        "broken-provider",
+        "broken",
+        "broken_provider:provider",
+        'raise ImportError("unavailable")\n',
     )
-    entry_points = SimpleNamespace(select=lambda **_kwargs: [bad_entry_point])
-    monkeypatch.setattr("omf.executors.registry.metadata.entry_points", lambda: entry_points)
-    with pytest.raises(ConfigurationError, match="could not be loaded"):
-        ExecutorRegistry().discover()
+    with monkeypatch.context() as patch:
+        patch.syspath_prepend(str(broken_site))
+        with pytest.raises(ConfigurationError, match="could not be loaded"):
+            ExecutorRegistry().discover()
 
-    wrong_entry_point = SimpleNamespace(
-        name="declared-name",
-        value="wrong:provider",
-        load=lambda: ExecutorProvider(
-            "different-name", EXECUTOR_API_VERSION, lambda _context: LocalExecutor()
-        ),
+    wrong_site = tmp_path / "wrong-site"
+    _install_plugin(
+        wrong_site,
+        "wrong-provider",
+        "declared-name",
+        "wrong_provider:provider",
+        "from omf.executors import EXECUTOR_API_VERSION, ExecutorProvider\n"
+        "from omf.executors.local import LocalExecutor\n\n"
+        'provider = ExecutorProvider("different-name", EXECUTOR_API_VERSION, '
+        "lambda _context: LocalExecutor())\n",
     )
-    entry_points = SimpleNamespace(select=lambda **_kwargs: [wrong_entry_point])
-    with pytest.raises(ConfigurationError, match="does not match"):
-        ExecutorRegistry().discover()
+    with monkeypatch.context() as patch:
+        patch.syspath_prepend(str(wrong_site))
+        with pytest.raises(ConfigurationError, match="does not match"):
+            ExecutorRegistry().discover()
 
 
 def test_executor_plugin_wheel_is_discovered_in_an_isolated_environment(tmp_path):
@@ -344,9 +363,10 @@ def test_local_executor_enforces_timeout_without_controller_and_records_plain_co
     assert executor.status(plain).state == "succeeded"
 
 
-def test_local_executor_attests_executable_under_network_wrapper(tmp_path, monkeypatch):
+def test_local_executor_attests_executable_under_network_wrapper(tmp_path):
+    if not LocalExecutor._network_namespace_available():
+        pytest.skip("unprivileged user namespaces are unavailable on this host")
     executor = LocalExecutor()
-    monkeypatch.setattr(executor, "_network_namespace_available", lambda _path=None: True)
     environment = executor.prepare_environment(
         argv=["python3", "-c", "pass"],
         cwd=tmp_path,

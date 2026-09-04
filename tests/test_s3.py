@@ -1,76 +1,117 @@
 import hashlib
 import io
 import json
-from types import SimpleNamespace
+import subprocess
+import sys
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from typing import ClassVar
+from urllib.parse import parse_qs, unquote, urlsplit
 
 import pytest
+from botocore.config import Config
 from omf.artifacts import ArtifactManifest, ChunkDescriptor
 from omf.errors import ConflictError, IntegrityError, NotFoundError
 from omf.stores.s3 import S3Store
 
 
-class ClientError(Exception):
-    def __init__(self, code):
-        self.response = {"Error": {"Code": code}}
+class _ObjectStore(BaseHTTPRequestHandler):
+    objects: ClassVar[dict[str, bytes]] = {}
 
+    def log_message(self, *_arguments):
+        return
 
-class Client:
-    def __init__(self):
-        self.objects = {}
+    def _error(self, status, code):
+        body = f"<?xml version='1.0'?><Error><Code>{code}</Code><Message>{code}</Message></Error>"
+        self.send_response(status)
+        self.send_header("Content-Type", "application/xml")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(body.encode())
 
-    def head_object(self, *, Bucket, Key):
-        del Bucket
-        if Key not in self.objects:
-            raise ClientError("404")
-        return {"ContentLength": len(self.objects[Key])}
+    def _key(self):
+        parts = urlsplit(self.path)
+        return unquote(parts.path).split("/", 2)[2] if parts.path.count("/") >= 2 else "", parts
 
-    def get_object(self, *, Bucket, Key, Range=None):
-        del Bucket
-        if Key not in self.objects:
-            raise ClientError("NoSuchKey")
-        value = self.objects[Key]
-        if Range:
-            start, end = Range.removeprefix("bytes=").split("-")
-            value = value[int(start) : int(end) + 1 if end else None]
-        return {"Body": io.BytesIO(value)}
+    def do_HEAD(self):
+        key, _parts = self._key()
+        if key not in self.objects:
+            return self._error(404, "NotFound")
+        self.send_response(200)
+        self.send_header("Content-Length", str(len(self.objects[key])))
+        self.end_headers()
 
-    def upload_fileobj(self, source, bucket, key, ExtraArgs):
-        del bucket, ExtraArgs
-        self.objects[key] = source.read()
+    def do_GET(self):
+        key, parts = self._key()
+        if not key:
+            prefix = parse_qs(parts.query).get("prefix", [""])[0]
+            keys = "".join(
+                f"<Contents><Key>{item}</Key></Contents>"
+                for item in sorted(self.objects)
+                if item.startswith(prefix)
+            )
+            body = (
+                "<?xml version='1.0'?><ListBucketResult><IsTruncated>false</IsTruncated>"
+                f"{keys}</ListBucketResult>"
+            ).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/xml")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        if key not in self.objects:
+            return self._error(404, "NoSuchKey")
+        body = self.objects[key]
+        status = 200
+        if "Range" in self.headers:
+            start, _, end = self.headers["Range"].removeprefix("bytes=").partition("-")
+            body = body[int(start) : int(end) + 1 if end else None]
+            status = 206
+        self.send_response(status)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
 
-    def put_object(self, *, Bucket, Key, Body, **kwargs):
-        del Bucket, kwargs
-        if Key in self.objects:
-            raise ClientError("PreconditionFailed")
-        self.objects[Key] = Body
-
-    def get_paginator(self, name):
-        assert name == "list_objects_v2"
-        client = self
-
-        class Paginator:
-            def paginate(self, *, Bucket, Prefix):
-                del Bucket
-                return [
-                    {"Contents": [{"Key": key} for key in client.objects if key.startswith(Prefix)]}
-                ]
-
-        return Paginator()
+    def do_PUT(self):
+        key, _parts = self._key()
+        body = self.rfile.read(int(self.headers.get("Content-Length", "0")))
+        if self.headers.get("If-None-Match") == "*" and key in self.objects:
+            return self._error(412, "PreconditionFailed")
+        self.objects[key] = body
+        self.send_response(200)
+        self.send_header("ETag", '"' + hashlib.md5(body).hexdigest() + '"')
+        self.send_header("Content-Length", "0")
+        self.end_headers()
 
 
 @pytest.fixture
-def s3(monkeypatch):
-    client = Client()
-
-    def importer(name):
-        if name == "boto3":
-            return SimpleNamespace(client=lambda *_args, **_kwargs: client)
-        if name == "botocore.exceptions":
-            return SimpleNamespace(ClientError=ClientError)
-        raise ImportError(name)
-
-    monkeypatch.setattr("omf.stores.s3.importlib.import_module", importer)
-    return S3Store("bucket", "prefix", endpoint_url="https://object.example"), client
+def s3():
+    _ObjectStore.objects = {}
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _ObjectStore)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield (
+            S3Store(
+                "bucket",
+                "prefix",
+                endpoint_url=f"http://127.0.0.1:{server.server_port}",
+                aws_access_key_id="test",
+                aws_secret_access_key="test",
+                region_name="us-east-1",
+                config=Config(
+                    s3={"addressing_style": "path"},
+                    request_checksum_calculation="when_required",
+                    response_checksum_validation="when_required",
+                ),
+            ),
+            _ObjectStore.objects,
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
 
 
 def _manifest(payload=b"payload"):
@@ -84,7 +125,7 @@ def _manifest(payload=b"payload"):
 
 
 def test_s3_chunk_manifest_range_listing_and_idempotence(s3):
-    store, _client = s3
+    store, objects = s3
     manifest = _manifest()
     chunk = manifest.chunks[0]
     assert not store.has_chunk(chunk.digest)
@@ -96,32 +137,41 @@ def test_s3_chunk_manifest_range_listing_and_idempotence(s3):
     assert store.publish_manifest(manifest) == manifest.manifest_digest
     assert store.read_manifest(manifest.manifest_digest) == manifest
     assert list(store.list_manifests()) == [manifest.manifest_digest]
+    assert objects[store._key("blobs", chunk.digest)] == b"payload"
     assert "credential" not in repr(store)
-    assert store.config()["endpoint_url"] == "https://object.example"
+    assert store.config()["endpoint_url"].startswith("http://127.0.0.1:")
 
 
 def test_s3_rejects_corruption_conflict_and_missing(s3):
-    store, client = s3
+    store, objects = s3
     manifest = _manifest()
     with pytest.raises(IntegrityError):
         store.write_chunk(manifest.digest, io.BytesIO(b"wrong"), len(b"wrong"))
     with pytest.raises(NotFoundError):
         store.read_chunk(manifest.digest)
     store.write_chunk(manifest.digest, io.BytesIO(b"payload"))
-    key = store._key("blobs", manifest.digest)
-    client.objects[key] = b"corrupt"
+    objects[store._key("blobs", manifest.digest)] = b"corrupt"
     assert not store.verify_chunk(manifest.digest)
     store.publish_manifest(manifest)
     manifest_key = store._key("manifests", manifest.manifest_digest, ".json")
-    client.objects[manifest_key] = json.dumps({"different": True}).encode()
+    objects[manifest_key] = json.dumps({"different": True}).encode()
     with pytest.raises(ConflictError):
         store.publish_manifest(manifest)
 
 
-def test_s3_optional_dependency_error(monkeypatch):
-    monkeypatch.setattr(
-        "omf.stores.s3.importlib.import_module",
-        lambda name: (_ for _ in ()).throw(ImportError(name)),
+def test_s3_optional_dependency_error():
+    probe = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import sys\nsys.modules['boto3'] = None\n"
+                "from omf.stores.s3 import S3Store\nS3Store('bucket')"
+            ),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
     )
-    with pytest.raises(Exception, match="requires installation"):
-        S3Store("bucket")
+    assert probe.returncode == 1
+    assert "requires installation" in probe.stderr

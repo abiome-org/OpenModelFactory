@@ -1,4 +1,3 @@
-"""Local signing identity, trust bundles, and encrypted secrets."""
 # ruff: noqa: E501
 
 from __future__ import annotations
@@ -38,8 +37,6 @@ class ApiPrincipal:
 
 
 class ApiTokenStore:
-    """Hashed, attributable, scoped API credentials with expiry and revocation."""
-
     def __init__(self, database: Database) -> None:
         self.db = database
 

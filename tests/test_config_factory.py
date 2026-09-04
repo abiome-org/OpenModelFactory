@@ -1,6 +1,5 @@
 import fcntl
 import hashlib
-import importlib.metadata
 import json
 import os
 import shutil
@@ -12,7 +11,6 @@ import venv
 from copy import deepcopy
 from dataclasses import replace
 from pathlib import Path
-from types import SimpleNamespace
 
 import httpx
 import pytest
@@ -41,6 +39,7 @@ from omf.executors import (
 )
 from omf.factory import Factory, _execution_plan_digest
 from omf.modules import load_manifest
+from omf.policy import PolicyDecision
 from omf.releases import promote_alias
 from omf.sdk import ProtocolRequest
 from omf.workloads import project_workload
@@ -320,15 +319,17 @@ def test_injected_executor_runs_unchanged_workload(tmp_path):
 
 
 def test_stable_executor_plugin_acceptance(tmp_path, monkeypatch):
-    plugin_root = Path("tests/fixtures/executor_plugin/src").resolve()
-    monkeypatch.syspath_prepend(str(plugin_root))
-    entry_point = importlib.metadata.EntryPoint(
-        name="stable-test",
-        value="omf_stable_executor:provider",
-        group="omf.executors",
+    site = tmp_path / "site"
+    info = site / "omf_stable_executor_test_plugin-1.0.0.dist-info"
+    info.mkdir(parents=True)
+    (info / "METADATA").write_text(
+        "Metadata-Version: 2.1\nName: omf-stable-executor-test-plugin\nVersion: 1.0.0\n"
     )
-    entry_points = importlib.metadata.EntryPoints([entry_point])
-    monkeypatch.setattr("omf.executors.registry.metadata.entry_points", lambda: entry_points)
+    (info / "entry_points.txt").write_text(
+        "[omf.executors]\nstable-test = omf_stable_executor:provider\n"
+    )
+    monkeypatch.syspath_prepend(str(site))
+    monkeypatch.syspath_prepend(str(Path("tests/fixtures/executor_plugin/src").resolve()))
     registry = ExecutorRegistry()
     registry.discover()
     assert registry.catalog() == {
@@ -338,7 +339,9 @@ def test_stable_executor_plugin_acceptance(tmp_path, monkeypatch):
             {
                 "name": "stable-test",
                 "apiVersion": EXECUTOR_API_VERSION,
-                "source": "entry-point:unknown:omf_stable_executor:provider",
+                "source": (
+                    "entry-point:omf-stable-executor-test-plugin:omf_stable_executor:provider"
+                ),
                 "description": "Independent acceptance-test executor.",
                 "capabilities": sorted(
                     MODULE_PROTOCOL_CAPABILITIES
@@ -710,8 +713,6 @@ def test_module_test_executes_inside_symlink_virtual_environment(tmp_path, monke
     if not python.is_symlink():
         pytest.skip("this platform does not create symlink interpreters")
     module_dir = paths.root / "modules/examples/statistical"
-    # The protocol is language neutral, so the fixture needs no omf import to prove which
-    # interpreter environment actually ran it.
     (module_dir / "main.py").write_text(
         "import json, os, sys\n"
         f"EXPECTED = {str(environment_path)!r}\n"
@@ -872,7 +873,7 @@ def test_alias_promotion_moves_between_releases(tmp_path):
                 revision=first["metadata"]["revision"],
                 expected_version=1,
                 actor="tester",
-                policy_decision=SimpleNamespace(outcome="allow", policy_digest="sha256:policy"),
+                policy_decision=PolicyDecision("allow", "sha256:policy", ()),
             )
         assert aliases.get("candidate")[2] == 2
         moved = list(factory.events.query(type="AliasMoved"))
@@ -1012,7 +1013,6 @@ def test_service_deployment_serves_release_through_admitted_adapter(tmp_path):
             approvals=["independent-reviewer"],
             vulnerability_report=_scan_for(paths, factory, run),
         )
-        # Serving must come from the admitted adapter source, never the live checkout.
         (paths.root / "modules/examples/affine-serving/main.py").write_text(
             "raise RuntimeError('live serving source must not execute')\n"
         )
@@ -2630,7 +2630,7 @@ def test_queued_run_uses_exact_dataset_revision_after_alias_advances(tmp_path):
     assert completed["result"]["outputs"]["train.mean"] == 3.0
 
 
-def test_run_operation_records_admission_and_worker_failures(tmp_path, monkeypatch):
+def test_run_operation_records_admission_and_worker_failures(tmp_path):
     paths = _project(tmp_path)
     bootstrap(paths)
     with Factory(paths) as factory:
@@ -2642,68 +2642,46 @@ def test_run_operation_records_admission_and_worker_failures(tmp_path, monkeypat
         with pytest.raises(ValidationError, match="actor does not match"):
             factory.execute_run_operation(wrong_actor["id"])
 
-        def operation():
-            return factory.operations.create(
-                "run",
-                {
-                    "actor": factory.actor,
-                    "workload": "workloads/unused.yaml",
-                    "binding": "bindings/unused.yaml",
-                    "workloadDigest": "sha256:" + "0" * 64,
-                    "bindingDigest": "sha256:" + "0" * 64,
-                    "modulePackages": {},
-                    "resources": {},
-                },
-            )
+        factory.add_data(
+            paths.root / "data/numbers.jsonl",
+            name="example-numbers",
+            mode="copy",
+            rights={"license": "CC0-1.0", "trainingAllowed": True},
+        )
+        workload = paths.root / "workloads/example-statistical.yaml"
+        binding = paths.root / "bindings/local.yaml"
 
-        admission_domain = operation()
-        with monkeypatch.context() as patch:
-            patch.setattr(
-                factory,
-                "_verify_run_request",
-                lambda _request: (_ for _ in ()).throw(IntegrityError("admission domain")),
-            )
-            with pytest.raises(IntegrityError, match="admission domain"):
-                factory.execute_run_operation(admission_domain["id"])
-        assert factory.operations.get(admission_domain["id"])["error"]["code"] == "integrity_error"
+        def failure(operation_id: str, error: type[Exception], match: str) -> str:
+            with pytest.raises(error, match=match):
+                factory.execute_run_operation(operation_id)
+            return str(factory.operations.get(operation_id)["error"]["code"])
 
-        admission_generic = operation()
-        with monkeypatch.context() as patch:
-            patch.setattr(
-                factory,
-                "_verify_run_request",
-                lambda _request: (_ for _ in ()).throw(RuntimeError("admission generic")),
-            )
-            with pytest.raises(RuntimeError, match="admission generic"):
-                factory.execute_run_operation(admission_generic["id"])
+        admission_domain = factory.create_run_operation(workload, binding)
+        original = workload.read_text()
+        workload.write_text(original.replace("expected: 3.0", "expected: 4.0"))
         assert (
-            factory.operations.get(admission_generic["id"])["error"]["code"]
+            failure(admission_domain["id"], IntegrityError, "desired state changed")
+            == "integrity_error"
+        )
+        workload.write_text(original)
+
+        admission_generic = factory.create_run_operation(workload, binding)
+        binding.rename(paths.root / "bindings/moved.yaml")
+        assert (
+            failure(admission_generic["id"], FileNotFoundError, "local.yaml")
             == "run_admission_error"
         )
+        (paths.root / "bindings/moved.yaml").rename(binding)
 
-        worker_domain = operation()
-        with monkeypatch.context() as patch:
-            patch.setattr(factory, "_verify_run_request", lambda _request: None)
-            patch.setattr(
-                factory,
-                "_run_impl",
-                lambda *_args, **_kwargs: (_ for _ in ()).throw(ValidationError("worker domain")),
-            )
-            with pytest.raises(ValidationError, match="worker domain"):
-                factory.execute_run_operation(worker_domain["id"])
-        assert factory.operations.get(worker_domain["id"])["error"]["code"] == "validation_error"
+        worker_generic = factory.create_run_operation(workload, binding)
+        state = paths.runs / worker_generic["id"] / "state.json"
+        state.parent.mkdir(parents=True)
+        state.write_text("not json")
+        assert failure(worker_generic["id"], ValueError, "Expecting value") == "run_worker_error"
 
-        worker_generic = operation()
-        with monkeypatch.context() as patch:
-            patch.setattr(factory, "_verify_run_request", lambda _request: None)
-            patch.setattr(
-                factory,
-                "_run_impl",
-                lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("worker generic")),
-            )
-            with pytest.raises(RuntimeError, match="worker generic"):
-                factory.execute_run_operation(worker_generic["id"])
-        assert factory.operations.get(worker_generic["id"])["error"]["code"] == "run_worker_error"
+        worker_domain = factory.create_run_operation(workload, binding)
+        factory.revoke_data("example-numbers", reason="consent withdrawn")
+        assert failure(worker_domain["id"], ValidationError, "current rights") == "validation_error"
 
 
 @pytest.mark.parametrize("failure", ["multiple", "state", "declaration"])

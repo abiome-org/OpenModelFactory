@@ -1,5 +1,3 @@
-"""Durable operation records used by CLI detach/reattach and APIs."""
-
 from __future__ import annotations
 
 import builtins
@@ -97,7 +95,6 @@ class OperationStore:
     def recent(
         self, *, states: set[str] | None = None, limit: int = 20
     ) -> builtins.list[dict[str, Any]]:
-        """Return a bounded newest-first operation window."""
         if limit < 1:
             return []
         query = "SELECT id FROM operations"

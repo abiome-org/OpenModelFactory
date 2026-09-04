@@ -1,4 +1,3 @@
-"""Signed CloudEvents log with a transactional outbox."""
 # ruff: noqa: A002, E501
 
 from __future__ import annotations
@@ -55,8 +54,6 @@ class CloudEvent:
 
 @dataclass(frozen=True)
 class EventWindow:
-    """A bounded event page with a stable incremental cursor."""
-
     items: tuple[CloudEvent, ...]
     cursor: str | None
     total: int
@@ -235,7 +232,6 @@ class EventStore:
     def window(
         self, *, limit: int, after: str | None = None, focus: str | None = None
     ) -> EventWindow:
-        """Read a bounded recent or incremental event window without payload expansion."""
         if limit < 1:
             raise ValueError("event window limit must be positive")
         clauses: list[str] = []

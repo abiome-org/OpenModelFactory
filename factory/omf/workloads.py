@@ -1,5 +1,3 @@
-"""Validated workload DAG and atomic state history."""
-
 from __future__ import annotations
 
 import fcntl
@@ -49,8 +47,6 @@ class Stage(BaseModel):
 
 
 class AdmittedWorkload(BaseModel):
-    """Internal execution projection of one canonical WorkloadSpec resource."""
-
     model_config = ConfigDict(extra="forbid")
     stages: list[Stage]
     source_digest: str
@@ -108,7 +104,6 @@ class AdmittedWorkload(BaseModel):
 
 
 def project_workload(resource: Any) -> AdmittedWorkload:
-    """Validate and project the only supported WorkloadSpec authoring contract."""
     value = default_registry.validate_as(resource, "WorkloadSpec")
     spec = value["spec"]
     try:
@@ -246,8 +241,6 @@ def _verify_succeeded(spec: AdmittedWorkload, stages: dict[str, Any]) -> None:
 
 
 class WorkloadRunner:
-    """Mechanical synchronous runner; callable receives Stage and returns output digest mapping."""
-
     def __init__(self, spec: AdmittedWorkload, store: StateStore) -> None:
         self.spec = spec
         self.store = store

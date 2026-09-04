@@ -1,4 +1,3 @@
-"""SQLite durable control-plane storage."""
 # ruff: noqa: E501
 
 from __future__ import annotations
@@ -217,8 +216,6 @@ def _verify_migration_history(connection: sqlite3.Connection, legacy: bool) -> N
 
 
 class Database:
-    """A SQLite database; connections are isolated per thread."""
-
     def __init__(
         self,
         path: str | Path,
@@ -242,7 +239,6 @@ class Database:
 
     @classmethod
     def inspect(cls, path: str | Path, *, busy_timeout: int = 5000) -> Database:
-        """Inspect a quiescent immutable snapshot without migrations or filesystem writes."""
         return cls(path, busy_timeout=busy_timeout, migrate=False, read_only=True)
 
     def connect(self) -> sqlite3.Connection:
@@ -311,7 +307,6 @@ class Database:
             connection.execute("REINDEX")
 
     def verify_migrations(self) -> bool:
-        """Check that the recorded schema history exactly matches this installed build."""
         _validate_migration_registry()
         columns = {
             str(row[1]) for row in self.connection.execute("PRAGMA table_info(schema_migrations)")
@@ -399,7 +394,6 @@ class ResourceRepository:
     def latest(
         self, *, kind: str | None = None, limit: int | None = None
     ) -> builtins.list[dict[str, Any]]:
-        """Return the newest immutable revision of each logical resource."""
         if limit is not None and limit < 1:
             return []
         where = "WHERE resources.kind=?" if kind is not None else ""
@@ -421,7 +415,6 @@ class ResourceRepository:
         return [json.loads(row[0]) for row in self.db.connection.execute(query, args)]
 
     def inventory(self) -> builtins.list[dict[str, Any]]:
-        """Return bounded per-kind object/revision counts without loading resource bodies."""
         rows = self.db.connection.execute(
             """
             SELECT kind,COUNT(DISTINCT uid),COUNT(*),MAX(created_at)

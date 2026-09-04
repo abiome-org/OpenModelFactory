@@ -1,5 +1,3 @@
-"""Immutable, model-neutral artifact manifests and builders."""
-
 from __future__ import annotations
 
 import hashlib
@@ -201,7 +199,6 @@ class ArtifactBuilder:
         )
 
     def verify_graph(self, manifest: ArtifactManifest) -> bool:
-        """Verify artifact bytes and recursively referenced checkpoint components."""
         verified: set[str] = set()
         visiting: set[str] = set()
 
@@ -354,8 +351,6 @@ def _entry_matches(path: Path, expected: TreeEntry, logical_kind: str) -> bool:
 
 
 class AtomicCheckpointPublisher:
-    """Publish a role-mapped checkpoint only after every component is verified."""
-
     def __init__(self, store: ArtifactStore) -> None:
         self.store = store
 

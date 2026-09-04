@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-"""Build and inventory a reproducible Open Model Factory distribution release."""
 
 from __future__ import annotations
 
@@ -327,8 +326,6 @@ def prepare(arguments: argparse.Namespace) -> dict[str, Any]:
     )
 
     destination.parent.mkdir(parents=True, exist_ok=True)
-    # Stage outside the checkout: a staging directory under the repository root would itself
-    # count as an untracked source change and fail the post-build source verification.
     staging = Path(tempfile.mkdtemp(prefix=f"omf-release-{destination.name}-"))
     try:
         artifacts = _build_reproducibly(staging, arguments.source_date_epoch)

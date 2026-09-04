@@ -9,7 +9,6 @@ on:
       - "workloads/**"
       - "model-packages/**"
       - "evaluations/**"
-      - "mixes/**"
       - "factory/**"
       - "tests/test_manual.py"
   push:
@@ -20,7 +19,6 @@ on:
       - "workloads/**"
       - "model-packages/**"
       - "evaluations/**"
-      - "mixes/**"
       - "factory/**"
       - "tests/test_manual.py"
 

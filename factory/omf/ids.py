@@ -1,5 +1,3 @@
-"""UUIDv7 and content digest identifiers."""
-
 from __future__ import annotations
 
 import re
@@ -16,7 +14,6 @@ _last = 0
 
 
 def uuid7() -> uuid.UUID:
-    """Create an RFC 9562 UUIDv7, monotonically ordered in this process."""
     global _last
     with _lock:
         now = int(time.time_ns() // 1_000_000)
@@ -34,7 +31,6 @@ def uuid7() -> uuid.UUID:
 
 
 def validate_uuid7(value: str | uuid.UUID) -> uuid.UUID:
-    """Parse and validate an RFC variant UUIDv7."""
     try:
         parsed = value if isinstance(value, uuid.UUID) else uuid.UUID(value)
     except (ValueError, AttributeError) as exc:
@@ -45,7 +41,6 @@ def validate_uuid7(value: str | uuid.UUID) -> uuid.UUID:
 
 
 def parse_digest(value: str) -> tuple[str, str]:
-    """Parse an algorithm:value digest and validate SHA-256 length."""
     match = _DIGEST.fullmatch(value)
     if not match:
         raise ValidationError("invalid digest; expected algorithm:lowercase-hex")

@@ -1,5 +1,3 @@
-"""Atomic, identity-preserving backups for the complete durable local factory state."""
-
 from __future__ import annotations
 
 import hashlib
@@ -169,7 +167,6 @@ def create_backup(
     identity: SigningIdentity,
     destination: str | Path,
 ) -> dict[str, Any]:
-    """Create one verified archive containing metadata, identity, and local artifacts."""
     target = Path(destination).resolve()
     if target == paths.state.resolve() or paths.state.resolve() in target.parents:
         raise ValidationError("backup destination must be outside .omf")
@@ -349,7 +346,6 @@ def restore_backup(
     *,
     expected_key_id: str | None = None,
 ) -> dict[str, Any]:
-    """Verify and atomically activate a backup into a project with no existing .omf state."""
     supplied_archive = Path(source)
     if supplied_archive.is_symlink():
         raise ValidationError("backup archive must be a regular file")

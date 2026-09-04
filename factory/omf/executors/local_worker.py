@@ -1,5 +1,3 @@
-"""Detached local execution monitor that durably records command completion."""
-
 from __future__ import annotations
 
 import argparse

@@ -1,5 +1,3 @@
-"""Project discovery, local bootstrap, and configuration loading."""
-
 from __future__ import annotations
 
 import os
@@ -18,8 +16,6 @@ from omf.stores.filesystem import FilesystemStore
 
 @dataclass(frozen=True)
 class ProjectPaths:
-    """All repository-scoped paths used by the local profile."""
-
     root: Path
 
     @property
@@ -60,7 +56,6 @@ class ProjectPaths:
 
 
 def discover_project(start: str | Path | None = None) -> ProjectPaths:
-    """Find the nearest parent containing ``omf.yaml`` without crossing the filesystem root."""
     current = Path(start or Path.cwd()).resolve()
     if current.is_file():
         current = current.parent
@@ -71,7 +66,6 @@ def discover_project(start: str | Path | None = None) -> ProjectPaths:
 
 
 def load_project(paths: ProjectPaths) -> dict[str, Any]:
-    """Load and validate the project resource."""
     value = load_document(paths.config.read_bytes())
     if not isinstance(value, dict):
         raise ValidationError("omf.yaml must contain one resource object")
@@ -84,7 +78,6 @@ def bootstrap(
     profile: str = "local",
     plan: bool = False,
 ) -> dict[str, Any]:
-    """Idempotently initialize a repository-scoped local factory."""
     if profile != "local":
         raise ConfigurationError(
             "the built-in bootstrap profile is local; site profiles use bindings"

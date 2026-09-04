@@ -36,19 +36,17 @@ successor starts either clock.
 
 ## Post-1.0 direction
 
-The built-in Slurm and Kubernetes integrations remain preview lifecycle
-adapters. A remote provider becomes supported only after its source,
-environment, request/result, artifact, isolation, cancellation, recovery, and
-unchanged-workload paths pass the ordinary release suite on named infrastructure.
-Federation, additional stores, modalities, frameworks, and measured scale follow
-the same rule.
+Only the local executor is built in. A remote provider becomes supported only
+after its source, environment, request/result, artifact, isolation,
+cancellation, recovery, and unchanged-workload paths pass the ordinary release
+suite on named infrastructure. Additional stores, modalities, frameworks, and
+measured scale follow the same rule.
 
-Sampler replay remains explicitly unclaimed until sampler state is observed and
-bound into atomic checkpoints. The local executor realizes hash-pinned binary
-dependency locks into cached virtual environments layered over the module's
-interpreter; it does not build source distributions or claim a closed runtime.
-Offline candidate installation is tested, but full air-gap and
-production-scale claims require direct deployment-specific evidence.
+The local executor realizes hash-pinned binary dependency locks into cached
+virtual environments layered over the module's interpreter; it does not build
+source distributions or claim a closed runtime. Offline candidate installation
+is tested, but full air-gap and production-scale claims require direct
+deployment-specific evidence.
 
 Change this roadmap when product evidence changes. Prefer deleting completed or
 duplicated prose over growing another planning document.

@@ -1,5 +1,3 @@
-"""Bounded, deterministic control and accumulated-knowledge surface for agents."""
-
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -40,8 +38,6 @@ def _instant(value: datetime | None = None) -> datetime:
 
 @dataclass(frozen=True)
 class ActionDefinition:
-    """Stable machine contract for one agent-operable action."""
-
     action: str
     description: str
     command: str
@@ -759,7 +755,6 @@ _ACTION_BY_NAME = {item.action: item for item in _ACTIONS}
 
 
 def capability_catalog() -> dict[str, Any]:
-    """Return the action catalog without requiring initialized factory state."""
     actions = [item.as_dict() for item in _ACTIONS]
     body = {"apiVersion": "omf.agent/v1alpha1", "catalogVersion": 1, "actions": actions}
     return {**body, "catalogDigest": sha256_digest(body)}
@@ -773,7 +768,6 @@ def initial_context(
     since: str | None = None,
     max_bytes: int = 65_536,
 ) -> dict[str, Any]:
-    """Return an actionable context before repository-local state exists."""
     from omf.config import bootstrap, load_project
     from omf.executors import default_executor_registry
 
@@ -853,8 +847,6 @@ def initial_context(
 
 
 class AgentControl:
-    """Agent-facing projection over the authoritative factory state."""
-
     def __init__(self, factory: Factory) -> None:
         self.factory = factory
 
@@ -1157,7 +1149,6 @@ class AgentControl:
         max_bytes: int = 65_536,
         at: datetime | None = None,
     ) -> dict[str, Any]:
-        """Build a bounded projection of facts needed for the next control decision."""
         self._check_limit(limit)
         if max_bytes < 16_384 or max_bytes > 1_048_576:
             raise ValidationError("max_bytes must be between 16384 and 1048576")

@@ -1,5 +1,3 @@
-"""Hermetic wheel construction for dependency-lock tests; no index or build backend needed."""
-
 from __future__ import annotations
 
 import base64
@@ -15,7 +13,6 @@ def build_wheel(
     version: str = "1.0",
     source: str = 'VERSION = "1.0"\n',
 ) -> tuple[Path, str]:
-    """Write a minimal pure-Python wheel and return its path and SHA-256 hex digest."""
     dist_info = f"{name}-{version}.dist-info"
     files: dict[str, bytes] = {
         f"{name}/__init__.py": source.encode(),
