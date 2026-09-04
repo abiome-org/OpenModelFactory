@@ -15,7 +15,7 @@ commands.
 The current [from-scratch workload](../workloads/example-from-scratch.yaml) uses
 the canonical `graph.stages` form. Each stage declares a module, operation,
 inputs, semantic configuration, dependencies, and expected outputs. It also
-references a `ModelPackage`, `EvaluationSpec`, and `MixSpec`. The training stage
+references a `ModelPackage` and an `EvaluationSpec`. The training stage
 consumes `dataset/example-affine`; the evaluator consumes the trained state.
 
 The [local binding](../bindings/local.yaml) owns physical execution, resources,
@@ -51,8 +51,7 @@ declared outputs, readable artifact manifests, non-empty input/module lineage,
 and an evaluation result tied to that exact run.
 
 The example checkpoint binds verified `module-state` and `protocol-state`
-components. Its replay status is `not-claimed` because this workload has no
-observed sampler state; checkpoint publication is not a restore/replay claim.
+components. Checkpoint publication is not a restore claim.
 
 ## Baseline record
 

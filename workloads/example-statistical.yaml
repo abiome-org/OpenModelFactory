@@ -2,10 +2,7 @@ apiVersion: omf.dev/v1alpha1
 kind: WorkloadSpec
 metadata:
   name: example-statistical
-  namespace: local/open-model-factory
 spec:
-  parameters: {}
-  reproducibility: lineage
   graph:
     stages:
       - name: train

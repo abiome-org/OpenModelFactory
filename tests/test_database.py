@@ -17,7 +17,7 @@ def db(tmp_path):
 def test_migration_idempotence_and_integrity(db):
     db.migrate()
     assert db.integrity_check()
-    assert db.connection.execute("select count(*) from schema_migrations").fetchone()[0] == 5
+    assert db.connection.execute("select count(*) from schema_migrations").fetchone()[0] == 6
     assert all(
         row[0] and row[1]
         for row in db.connection.execute(
@@ -46,7 +46,7 @@ def test_legacy_migration_table_is_upgraded(tmp_path):
     migrated.close()
 
 
-@pytest.mark.parametrize("versions", [(1, 3), (1, 2, 3, 4, 5, 6)])
+@pytest.mark.parametrize("versions", [(1, 3), (1, 2, 3, 4, 5, 6, 7)])
 def test_rejects_migration_gaps_and_future_versions(tmp_path, versions):
     path = tmp_path / "invalid.db"
     connection = sqlite3.connect(path)

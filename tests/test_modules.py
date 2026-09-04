@@ -102,7 +102,7 @@ def test_module_contract_dynamic_references_are_rejected(tmp_path):
     shutil.copytree("modules/examples/statistical", module)
     manifest_path = module / "module.yaml"
     manifest = yaml.safe_load(manifest_path.read_text())
-    manifest["spec"]["contracts"]["input"] = {"$dynamicRef": "#input"}
+    manifest["spec"]["contracts"] = {"input": {"$dynamicRef": "#input"}}
     manifest_path.write_text(yaml.safe_dump(manifest))
 
     with pytest.raises(ValidationError, match="references are not supported"):
@@ -115,9 +115,8 @@ def test_module_contract_allows_instance_property_named_ref(tmp_path):
     shutil.copytree("modules/examples/statistical", module)
     manifest_path = module / "module.yaml"
     manifest = yaml.safe_load(manifest_path.read_text())
-    manifest["spec"]["contracts"]["input"] = {
-        "type": "object",
-        "properties": {"$ref": {"type": "string"}},
+    manifest["spec"]["contracts"] = {
+        "input": {"type": "object", "properties": {"$ref": {"type": "string"}}}
     }
     manifest_path.write_text(yaml.safe_dump(manifest))
 

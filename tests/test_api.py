@@ -1,14 +1,10 @@
 import subprocess
-from dataclasses import asdict
-from datetime import UTC, datetime, timedelta
 
 import yaml
 from fastapi.testclient import TestClient
 from omf.api import create_app
 from omf.config import ProjectPaths, bootstrap
 from omf.factory import Factory
-from omf.federation import FederationBroker
-from omf.security import SigningIdentity
 
 
 def _paths(tmp_path):
@@ -54,7 +50,7 @@ def test_api_health_auth_schemas_resources_and_doctor(tmp_path):
         headers = {"Authorization": f"Bearer {token}"}
         assert client.get("/v1/doctor", headers=headers).json()["ready"]
         providers = client.get("/v1/executors", headers=headers).json()["providers"]
-        assert {item["name"] for item in providers} >= {"local", "kubernetes", "slurm"}
+        assert {item["name"] for item in providers} >= {"local"}
         preflight = client.post(
             "/v1/executors/preflight",
             headers=headers,
@@ -252,84 +248,3 @@ def test_agent_goal_and_knowledge_api_parity_scopes_and_etags(tmp_path):
         assert invalid.status_code == 422
         assert invalid.json()["error"]["code"] == "request_validation_error"
         assert "sensitive-input-must-not-echo" not in invalid.text
-
-
-def test_api_federation_outbox_reconciliation_and_capacity(tmp_path):
-    paths = _paths(tmp_path)
-    with Factory(paths) as factory:
-        token = factory.secrets.get("local-api-token", "api-authentication").decode()
-    headers = {"Authorization": f"Bearer {token}"}
-    sender = FederationBroker(SigningIdentity(tmp_path / "sender.key"))
-    expires = (datetime.now(UTC) + timedelta(hours=1)).isoformat().replace("+00:00", "Z")
-
-    with TestClient(create_app(paths)) as client:
-        assert "keyId" in client.get("/v1/federation/identity", headers=headers).json()
-        trust = client.post(
-            "/v1/federation/trust",
-            headers=headers,
-            json={"peer_id": "sender", "trust_bundle": sender.identity.export_trust_bundle()},
-        )
-        assert trust.json() == {"peerId": "sender", "trusted": True}
-        lease = client.post(
-            "/v1/federation/leases",
-            headers=headers,
-            json={
-                "lease_id": "lease",
-                "peer_id": "sender",
-                "expires_at": expires,
-                "policy_epoch": 1,
-            },
-        )
-        assert lease.status_code == 200
-
-        remote_event = sender.emit("sender", "lease", "artifact", "model", {"revision": 1})
-        reconciled = client.post(
-            "/v1/federation/reconcile", headers=headers, json=asdict(remote_event)
-        )
-        assert reconciled.json()["accepted"]
-        duplicate = client.post(
-            "/v1/federation/reconcile", headers=headers, json=asdict(remote_event)
-        )
-        assert not duplicate.json()["accepted"]
-
-        emitted = client.post(
-            "/v1/federation/events",
-            headers=headers,
-            json={
-                "peer_id": "receiver",
-                "lease_id": "remote-lease",
-                "kind": "artifact",
-                "resource": "candidate",
-                "content": {"digest": "sha256:value"},
-            },
-        ).json()
-        outbox = client.get("/v1/federation/outbox?peer_id=receiver", headers=headers).json()
-        assert [item["event_id"] for item in outbox] == [emitted["event_id"]]
-        published = client.post(
-            "/v1/federation/outbox/published",
-            headers=headers,
-            json={"peer_id": "receiver", "event_id": emitted["event_id"]},
-        )
-        assert published.json()["published"]
-        assert client.get("/v1/federation/outbox", headers=headers).json() == []
-
-        placement = client.post(
-            "/v1/capacity/place",
-            headers=headers,
-            json={
-                "offers": [
-                    {
-                        "peer_id": "eu-cell",
-                        "labels": ["gpu", "residency:eu"],
-                        "capacity": {"gpu": 8},
-                        "policy_epoch": 1,
-                    }
-                ],
-                "required_labels": ["gpu"],
-                "residency": "eu",
-                "resource": "gpu",
-                "amount": 4,
-            },
-        )
-        assert placement.status_code == 200
-        assert placement.json()["peer_id"] == "eu-cell"

@@ -14,9 +14,7 @@ from jsonschema.exceptions import SchemaError
 
 from omf.errors import CapabilityError, ConfigurationError, ValidationError
 from omf.executors.base import Executor
-from omf.executors.kubernetes import KubernetesExecutor
 from omf.executors.local import LocalExecutor
-from omf.executors.slurm import SlurmExecutor
 
 ENTRY_POINT_GROUP = "omf.executors"
 EXECUTOR_API_VERSION = "omf.executor/v1"
@@ -248,42 +246,10 @@ def _local_provider(context: ExecutorContext) -> Executor:
     if not isinstance(index, bool):
         raise ValidationError("local dependencyIndex must be a boolean")
     return LocalExecutor(
-        binding_resources=resources,
-        binding_spec=binding_spec,
+        limits=resources,
         environment_root=context.state_root / "environments",
         dependency_wheelhouse=wheelhouse_path,
         dependency_index=index,
-    )
-
-
-def _kubernetes_provider(context: ExecutorContext) -> Executor:
-    value = context.config.get("context")
-    if value is not None and not isinstance(value, str):
-        raise ValidationError("kubernetes executor context must be a string")
-    spec = context.declaration.get("spec", {})
-    if not isinstance(spec, dict):
-        raise ValidationError("Kubernetes binding spec must be an object")
-    binding_spec = spec if context.declaration.get("kind") == "Binding" else {}
-    return KubernetesExecutor(context=value, binding_spec=binding_spec)
-
-
-def _slurm_provider(context: ExecutorContext) -> Executor:
-    shared = context.config.get("sharedFilesystem", False)
-    if not isinstance(shared, bool):
-        raise ValidationError("slurm sharedFilesystem must be a boolean")
-    spec = context.declaration.get("spec", {})
-    if not isinstance(spec, Mapping):
-        raise ValidationError("slurm binding spec must be an object")
-    binding_spec = spec if context.declaration.get("kind") == "Binding" else {}
-    resources = binding_spec.get("resources", {})
-    placement = binding_spec.get("placement", {})
-    if not isinstance(resources, dict) or not isinstance(placement, dict):
-        raise ValidationError("slurm binding resources and placement must be objects")
-    return SlurmExecutor(
-        shared_filesystem=shared,
-        binding_resources=resources,
-        placement=placement,
-        binding_spec=dict(binding_spec),
     )
 
 
@@ -315,43 +281,6 @@ def default_executor_registry(*, discover: bool = True) -> ExecutorRegistry:
                         ),
                     },
                 },
-                "additionalProperties": False,
-            },
-        ),
-        source="builtin",
-    )
-    registry.register(
-        ExecutorProvider(
-            "kubernetes",
-            EXECUTOR_API_VERSION,
-            _kubernetes_provider,
-            "Kubernetes Job/JobSet lifecycle adapter; module transport is not built in.",
-            KubernetesExecutor().capabilities,
-            {
-                "type": "object",
-                "properties": {
-                    "context": {"type": "string", "minLength": 1},
-                    "image": {
-                        "type": "string",
-                        "pattern": "@sha256:[0-9a-f]{64}$",
-                        "description": "Immutable image digest.",
-                    },
-                },
-                "additionalProperties": False,
-            },
-        ),
-        source="builtin",
-    )
-    registry.register(
-        ExecutorProvider(
-            "slurm",
-            EXECUTOR_API_VERSION,
-            _slurm_provider,
-            "Slurm lifecycle adapter; module transport requires an explicit shared filesystem.",
-            SlurmExecutor(shared_filesystem=True).capabilities,
-            {
-                "type": "object",
-                "properties": {"sharedFilesystem": {"type": "boolean"}},
                 "additionalProperties": False,
             },
         ),

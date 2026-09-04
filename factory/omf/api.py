@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator, Iterator
 from contextlib import asynccontextmanager
-from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
@@ -18,7 +17,6 @@ from omf.config import ProjectPaths
 from omf.errors import AuthorizationError, OMFError
 from omf.executors import ExecutorRegistry
 from omf.factory import Factory
-from omf.federation import CapacityOffer, FederatedEvent, FederationBroker, Lease
 from omf.schema_registry import default_registry
 
 
@@ -115,66 +113,6 @@ class DeploymentRequest(BaseModel):
 class DeploymentRollbackRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     expected_version: int = Field(ge=1)
-
-
-class FederationTrustRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-    peer_id: str
-    trust_bundle: dict[str, str]
-
-
-class FederationLeaseRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-    lease_id: str
-    peer_id: str
-    expires_at: str
-    policy_epoch: int = Field(ge=1)
-
-
-class FederationEventRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-    peer_id: str
-    event_id: str
-    sequence: int = Field(ge=1)
-    policy_epoch: int = Field(ge=1)
-    lease_id: str
-    kind: str
-    resource: str
-    content_digest: str
-    key_id: str
-    signature: str
-
-
-class FederationEmitRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-    peer_id: str
-    lease_id: str
-    kind: str
-    resource: str
-    content: Any
-
-
-class FederationPublishRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-    peer_id: str
-    event_id: str
-
-
-class CapacityOfferRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-    peer_id: str
-    labels: set[str]
-    capacity: dict[str, int]
-    policy_epoch: int = Field(ge=1)
-
-
-class PlacementRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-    offers: list[CapacityOfferRequest]
-    required_labels: set[str] = Field(default_factory=set)
-    residency: str
-    resource: str
-    amount: int = Field(default=1, ge=1)
 
 
 class ApiTokenRequest(BaseModel):
@@ -301,8 +239,6 @@ def create_app(paths: ProjectPaths, *, executors: ExecutorRegistry | None = None
             raise AuthorizationError("valid Bearer authentication is required")
         admin_paths = {
             "/v1/backups",
-            "/v1/federation/trust",
-            "/v1/federation/leases",
         }
         read_post_paths = {"/v1/executors/preflight"}
         required_scope = (
@@ -674,85 +610,6 @@ def create_app(paths: ProjectPaths, *, executors: ExecutorRegistry | None = None
         operation_id: str, service: Factory = Depends(authorized)
     ) -> dict[str, Any]:
         return service.execute_run_operation(operation_id)
-
-    @app.post("/v1/federation/trust")
-    def federation_trust(
-        request: FederationTrustRequest, service: Factory = Depends(authorized)
-    ) -> dict[str, Any]:
-        service.federation.trust(request.peer_id, request.trust_bundle)
-        return {"peerId": request.peer_id, "trusted": True}
-
-    @app.get("/v1/federation/identity")
-    def federation_identity(service: Factory = Depends(authorized)) -> dict[str, str]:
-        return service.identity.export_trust_bundle()
-
-    @app.post("/v1/federation/leases")
-    def federation_lease(
-        request: FederationLeaseRequest, service: Factory = Depends(authorized)
-    ) -> dict[str, Any]:
-        lease = Lease(
-            request.lease_id,
-            request.peer_id,
-            request.expires_at,
-            request.policy_epoch,
-        )
-        service.federation.issue_lease(lease)
-        return asdict(lease)
-
-    @app.post("/v1/federation/reconcile")
-    def federation_reconcile(
-        request: FederationEventRequest, service: Factory = Depends(authorized)
-    ) -> dict[str, Any]:
-        accepted = service.federation.reconcile(FederatedEvent(**request.model_dump()))
-        return {"accepted": accepted, "eventId": request.event_id}
-
-    @app.post("/v1/federation/events")
-    def federation_emit(
-        request: FederationEmitRequest, service: Factory = Depends(authorized)
-    ) -> dict[str, Any]:
-        return asdict(
-            service.federation.emit(
-                request.peer_id,
-                request.lease_id,
-                request.kind,
-                request.resource,
-                request.content,
-            )
-        )
-
-    @app.get("/v1/federation/outbox")
-    def federation_outbox(
-        peer_id: str | None = None, service: Factory = Depends(authorized)
-    ) -> list[dict[str, Any]]:
-        return [asdict(event) for event in service.federation.pending(peer_id)]
-
-    @app.post("/v1/federation/outbox/published")
-    def federation_published(
-        request: FederationPublishRequest, service: Factory = Depends(authorized)
-    ) -> dict[str, Any]:
-        service.federation.mark_published(request.peer_id, request.event_id)
-        return {"peerId": request.peer_id, "eventId": request.event_id, "published": True}
-
-    @app.post("/v1/capacity/place")
-    def capacity_place(
-        request: PlacementRequest, _service: Factory = Depends(authorized)
-    ) -> dict[str, Any]:
-        offer = FederationBroker.place(
-            [
-                CapacityOffer(
-                    item.peer_id,
-                    frozenset(item.labels),
-                    item.capacity,
-                    item.policy_epoch,
-                )
-                for item in request.offers
-            ],
-            required_labels=request.required_labels,
-            residency=request.residency,
-            resource=request.resource,
-            amount=request.amount,
-        )
-        return asdict(offer)
 
     return app
 

@@ -90,7 +90,6 @@ def test_finalization_excludes_status_and_does_not_mutate():
 def test_checked_in_deployment_manifest_is_valid():
     value = SchemaRegistry().load(Path("deployments/example-edge.yaml"))
     assert value["kind"] == "DeploymentSpec"
-    assert value["metadata"]["namespace"] == "local/open-model-factory"
 
 
 def test_checked_in_workload_and_modules_use_canonical_resources():

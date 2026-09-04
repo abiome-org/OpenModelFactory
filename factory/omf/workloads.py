@@ -46,14 +46,6 @@ class Stage(BaseModel):
     config: dict[str, Any] = Field(default_factory=dict)
     inputs: dict[str, str] = Field(default_factory=dict)
     outputs: list[str] = Field(default_factory=list)
-    checkpoint_trigger: dict[str, Any] | None = Field(
-        default=None, validation_alias="checkpointTrigger"
-    )
-    evaluation_trigger: dict[str, Any] | None = Field(
-        default=None, validation_alias="evaluationTrigger"
-    )
-    idempotent: bool = False
-    retries: int = 0
 
 
 class AdmittedWorkload(BaseModel):
@@ -67,14 +59,8 @@ class AdmittedWorkload(BaseModel):
     environments: dict[str, dict[str, Any]] = Field(default_factory=dict)
     input_revisions: dict[str, str] = Field(default_factory=dict)
     reference_revisions: dict[str, str] = Field(default_factory=dict)
-    parameters: dict[str, Any] = Field(default_factory=dict)
-    reproducibility: str = "lineage"
     model_package_ref: str | None = None
-    mix_ref: str | None = None
     evaluation_refs: list[str] = Field(default_factory=list)
-    budget: dict[str, Any] = Field(default_factory=dict)
-    policies: list[str] = Field(default_factory=list)
-    child_work: dict[str, Any] = Field(default_factory=dict)
 
     @model_validator(mode="after")
     def graph(self) -> AdmittedWorkload:
@@ -85,8 +71,6 @@ class AdmittedWorkload(BaseModel):
         for stage in self.stages:
             if stage.name in stage.needs or not set(stage.needs) <= known:
                 raise ValueError(f"invalid dependency for {stage.name}")
-            if stage.retries and not stage.idempotent:
-                raise ValueError("retries require idempotent stage")
             for reference in stage.inputs.values():
                 producer, separator, output = reference.partition(".")
                 if separator and producer in known:
@@ -134,50 +118,20 @@ def project_workload(resource: Any) -> AdmittedWorkload:
         admitted = AdmittedWorkload(
             stages=stages,
             source_digest="pending",
-            parameters=spec["parameters"],
-            reproducibility=str(spec.get("reproducibility", "lineage")),
             model_package_ref=spec.get("modelPackageRef"),
-            mix_ref=spec.get("mixRef"),
             evaluation_refs=spec.get("evaluationRefs", []),
-            budget=spec.get("budget", {}),
-            policies=spec.get("policies", []),
-            child_work=spec.get("childWork", {}),
         )
     except PydanticValidationError as exc:
         raise ValidationError(
             "workload semantic validation failed",
             details={"errors": exc.error_count()},
         ) from exc
-    unsupported = [
-        field
-        for field in (
-            "parameters",
-            "budget",
-            "policies",
-            "childWork",
-        )
-        if spec.get(field)
-    ]
-    if any(stage.checkpoint_trigger or stage.evaluation_trigger for stage in stages):
-        unsupported.append("stageTriggers")
-    if any(stage.retries for stage in stages):
-        unsupported.append("retries")
-    if unsupported:
-        raise ValidationError(
-            "workload requests lifecycle features that are not executable",
-            details={"fields": unsupported},
-        )
-    reproducibility = admitted.reproducibility
-    if reproducibility != "lineage":
-        raise ValidationError(
-            f"reproducibility class {reproducibility!r} is not executable; use 'lineage'"
-        )
     desired = {
         "apiVersion": value["apiVersion"],
         "kind": value["kind"],
         "metadata": {
             "name": value["metadata"]["name"],
-            "namespace": value["metadata"]["namespace"],
+            "namespace": value["metadata"].get("namespace"),
         },
         "spec": spec,
     }
@@ -212,7 +166,6 @@ class StateStore:
             "inputs": spec.input_revisions,
             "references": spec.reference_revisions,
             "modelPackage": spec.model_package_ref,
-            "reproducibility": spec.reproducibility,
         }
 
     def verify(self, spec: AdmittedWorkload) -> dict[str, Any]:
@@ -305,19 +258,12 @@ class WorkloadRunner:
                 raise IntegrityError(
                     f"succeeded stage {name!r} output evidence failed verification"
                 )
-            for attempt in range(stage.retries + 1):
-                try:
-                    outputs = execute(stage)
-                    value["stages"][name] = {
-                        "status": "succeeded",
-                        "attempt": attempt + 1,
-                        "outputs": outputs,
-                    }
-                    self.store._write(value)
-                    break
-                except Exception:
-                    if attempt == stage.retries:
-                        value["stages"][name] = {"status": "failed", "attempt": attempt + 1}
-                        self.store._write(value)
-                        raise
+            try:
+                outputs = execute(stage)
+            except Exception:
+                value["stages"][name] = {"status": "failed", "attempt": 1}
+                self.store._write(value)
+                raise
+            value["stages"][name] = {"status": "succeeded", "attempt": 1, "outputs": outputs}
+            self.store._write(value)
         return value

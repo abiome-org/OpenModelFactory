@@ -3,8 +3,7 @@
 **Status: Tested now**
 
 The copy and register paths are tested. Mount and stream registration exist,
-but connector-specific consumption and `MixSpec`-driven training remain
-extension boundaries.
+but connector-specific consumption remains an extension boundary.
 
 ## Define roles before importing bytes
 
@@ -64,14 +63,9 @@ not imply deletion.
 
 ## Mixture boundary
 
-`MixSpec` defines source revisions, weights or schedules, sampling, curriculum,
-replay, and amendment intent. The current from-scratch path validates a
-`MixSpec` and records its exact revision alongside its dataset inputs, but the
-trainer still reads the dataset directly. Until a sampler integration emits
-observed `SamplerState`,
-implement mixture delivery in a versioned module and record its exact source
-snapshots, weights, seed, and state as outputs and lineage; do not claim exact
-mixture replay.
+There is no mixture resource. Implement mixture delivery in a versioned module
+and record its exact source snapshots, weights, seed, and state as outputs and
+lineage; do not claim exact mixture replay.
 
 ## Evidence before the next chapter
 

@@ -348,20 +348,11 @@ class AtomicCheckpointPublisher:
         self,
         components: dict[str, ArtifactManifest],
         context: dict[str, str],
-        replay: dict[str, str],
     ) -> ArtifactManifest:
         if not components or any(
             re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", role) is None for role in components
         ):
             raise ValidationError("checkpoint components require normalized role names")
-        if replay.get("status") not in {"not-claimed", "bound"}:
-            raise ValidationError("checkpoint replay status must be explicit")
-        if replay["status"] == "not-claimed" and not replay.get("reason"):
-            raise ValidationError("checkpoint replay non-claim requires a reason")
-        if replay["status"] == "bound" and not all(
-            replay.get(field) for field in ("samplerStateRef", "mixRef")
-        ):
-            raise ValidationError("bound checkpoint replay requires sampler and mix revisions")
         verifier = ArtifactBuilder(self.store)
         if not all(
             verifier.verify(component)
@@ -372,9 +363,7 @@ class AtomicCheckpointPublisher:
         component_refs = {
             role: component.manifest_digest for role, component in sorted(components.items())
         }
-        payload = canonical_json(
-            {"components": component_refs, "context": context, "replay": replay}
-        )
+        payload = canonical_json({"components": component_refs, "context": context})
         digest = "sha256:" + hashlib.sha256(payload).hexdigest()
         self.store.write_chunk(digest, __import__("io").BytesIO(payload), len(payload))
         manifest = ArtifactManifest(
@@ -383,11 +372,7 @@ class AtomicCheckpointPublisher:
             digest,
             (ChunkDescriptor(digest, len(payload), 0),),
             logical_kind="checkpoint",
-            provenance={
-                "components": component_refs,
-                "context": context,
-                "replay": replay,
-            },
+            provenance={"components": component_refs, "context": context},
         )
         self.store.publish_manifest(manifest)
         return manifest

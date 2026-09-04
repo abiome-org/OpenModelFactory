@@ -7,14 +7,12 @@ import subprocess
 import sys
 from collections.abc import Iterator
 from contextlib import contextmanager
-from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
 import typer
 import uvicorn
 import yaml
-from rich.console import Console
 
 from omf import __version__
 from omf.agent import capability_catalog, initial_context
@@ -24,7 +22,6 @@ from omf.config import ProjectPaths, discover_project
 from omf.config import bootstrap as bootstrap_project
 from omf.errors import OMFError
 from omf.factory import Factory
-from omf.federation import CapacityOffer, FederatedEvent, FederationBroker, Lease
 from omf.schema_registry import default_registry
 
 app = typer.Typer(no_args_is_help=True, pretty_exceptions_show_locals=False)
@@ -41,10 +38,9 @@ api_app = typer.Typer(no_args_is_help=True)
 release_app = typer.Typer(no_args_is_help=True)
 experiment_app = typer.Typer(no_args_is_help=True)
 deployment_app = typer.Typer(no_args_is_help=True)
-federation_app = typer.Typer(no_args_is_help=True)
-capacity_app = typer.Typer(no_args_is_help=True)
 operation_app = typer.Typer(no_args_is_help=True)
 token_app = typer.Typer(no_args_is_help=True)
+admin_app = typer.Typer(no_args_is_help=True)
 agent_app = typer.Typer(no_args_is_help=True)
 goal_app = typer.Typer(no_args_is_help=True)
 knowledge_app = typer.Typer(no_args_is_help=True)
@@ -58,21 +54,18 @@ app.add_typer(resource_app, name="resource")
 app.add_typer(schema_app, name="schema")
 app.add_typer(runs_app, name="runs")
 app.add_typer(lineage_app, name="lineage")
-app.add_typer(secret_app, name="secret")
 app.add_typer(api_app, name="api")
 app.add_typer(release_app, name="release")
 app.add_typer(experiment_app, name="experiment")
 app.add_typer(deployment_app, name="deployment")
-app.add_typer(federation_app, name="federation")
-app.add_typer(capacity_app, name="capacity")
 app.add_typer(operation_app, name="operation")
-app.add_typer(token_app, name="token")
+app.add_typer(admin_app, name="admin")
+admin_app.add_typer(token_app, name="token")
+admin_app.add_typer(secret_app, name="secret")
 app.add_typer(agent_app, name="agent")
 app.add_typer(goal_app, name="goal")
 app.add_typer(knowledge_app, name="knowledge")
 app.add_typer(executor_app, name="executor")
-
-console = Console(stderr=False)
 
 
 class State:
@@ -117,16 +110,44 @@ def _factory() -> Iterator[Factory]:
         factory.close()
 
 
+def _row(item: dict[str, Any]) -> dict[str, Any]:
+    metadata = item.get("metadata")
+    if isinstance(metadata, dict) and "kind" in item:
+        return {
+            "kind": item["kind"],
+            "name": metadata.get("name"),
+            "revision": str(metadata.get("revision", ""))[:19],
+            "createdAt": metadata.get("createdAt"),
+        }
+    return {key: value for key, value in item.items() if not isinstance(value, dict)}
+
+
+def _table(rows: list[dict[str, Any]]) -> str:
+    columns = list(dict.fromkeys(key for row in rows for key in row))
+    cells = [[str(row.get(column, "")) for column in columns] for row in rows]
+    widths = [
+        max(len(column), *(len(line[index]) for line in cells))
+        for index, column in enumerate(columns)
+    ]
+    lines = [columns, *cells]
+    return "\n".join(
+        "  ".join(cell.ljust(width) for cell, width in zip(line, widths, strict=True)).rstrip()
+        for line in lines
+    )
+
+
 def _emit(value: Any) -> None:
     if state.output == "json":
         typer.echo(json.dumps(value, sort_keys=True, indent=2, default=str))
-    elif state.output == "yaml":
+    elif isinstance(value, list) and value and all(isinstance(item, dict) for item in value):
+        if state.output == "yaml":
+            typer.echo(yaml.safe_dump(value, sort_keys=True), nl=False)
+        else:
+            typer.echo(_table([_row(item) for item in value]))
+    elif isinstance(value, dict | list):
         typer.echo(yaml.safe_dump(value, sort_keys=True), nl=False)
-    elif isinstance(value, dict):
-        for key, item in value.items():
-            console.print(f"[bold]{key}[/bold]: {item}")
     else:
-        console.print(value)
+        typer.echo(value)
 
 
 def _load_value(path: Path) -> Any:
@@ -140,11 +161,11 @@ def _handle(function: Any) -> None:
         if state.output in {"json", "yaml"}:
             _emit(exc.as_dict())
         else:
-            console.print(f"[red]{exc.code}[/red]: {exc.message}")
+            typer.secho(f"{exc.code}: {exc.message}", fg="red", err=True)
             if exc.details:
-                console.print(exc.details)
+                typer.echo(yaml.safe_dump(exc.details, sort_keys=True), nl=False, err=True)
             for item in exc.remediation:
-                console.print(f"[bold]next[/bold]: {item.get('command', item['description'])}")
+                typer.echo(f"next: {item.get('command', item['description'])}", err=True)
         raise typer.Exit(code=1) from exc
 
 
@@ -583,6 +604,15 @@ def run_workload(
     _handle(run)
 
 
+@runs_app.command("list")
+def runs_list() -> None:
+    def run() -> list[dict[str, Any]]:
+        with _factory() as factory:
+            return factory.list_runs()
+
+    _handle(run)
+
+
 @runs_app.command("status")
 def runs_status(run_id: str) -> None:
     def run() -> dict[str, Any]:
@@ -632,6 +662,24 @@ def release_create(
     _handle(run)
 
 
+@release_app.command("list")
+def release_list() -> None:
+    def run() -> list[dict[str, Any]]:
+        with _factory() as factory:
+            return factory.list_releases()
+
+    _handle(run)
+
+
+@release_app.command("show")
+def release_show(name: str) -> None:
+    def run() -> dict[str, Any]:
+        with _factory() as factory:
+            return factory.show_release(name.removeprefix("release/"))
+
+    _handle(run)
+
+
 @experiment_app.command("create")
 def experiment_create(
     name: str,
@@ -664,6 +712,15 @@ def deploy(path: Path) -> None:
     _handle(run)
 
 
+@deployment_app.command("list")
+def deployment_list() -> None:
+    def run() -> list[dict[str, Any]]:
+        with _factory() as factory:
+            return factory.list_deployments()
+
+    _handle(run)
+
+
 @deployment_app.command("status")
 def deployment_status(name: str) -> None:
     def run() -> dict[str, Any]:
@@ -689,127 +746,6 @@ def deployment_rollback(
     def run() -> dict[str, Any]:
         with _factory() as factory:
             return factory.rollback_deployment(name, expected_version=expected_version)
-
-    _handle(run)
-
-
-@federation_app.command("identity")
-def federation_identity() -> None:
-    def run() -> dict[str, str]:
-        with _factory() as factory:
-            return factory.identity.export_trust_bundle()
-
-    _handle(run)
-
-
-@federation_app.command("trust")
-def federation_trust(peer_id: str, bundle: Path) -> None:
-    def run() -> dict[str, Any]:
-        value = _load_value(bundle)
-        if not isinstance(value, dict):
-            raise typer.BadParameter("trust bundle must be an object")
-        with _factory() as factory:
-            factory.federation.trust(peer_id, {str(key): str(item) for key, item in value.items()})
-        return {"peerId": peer_id, "trusted": True}
-
-    _handle(run)
-
-
-@federation_app.command("lease")
-def federation_lease(
-    peer_id: str,
-    lease_id: str = typer.Option(..., "--lease-id"),
-    expires_at: str = typer.Option(..., "--expires-at"),
-    policy_epoch: int = typer.Option(1, "--policy-epoch", min=1),
-) -> None:
-    def run() -> dict[str, Any]:
-        lease = Lease(lease_id, peer_id, expires_at, policy_epoch)
-        with _factory() as factory:
-            factory.federation.issue_lease(lease)
-        return asdict(lease)
-
-    _handle(run)
-
-
-@federation_app.command("emit")
-def federation_emit(
-    peer_id: str,
-    content: Path = typer.Option(..., "--content"),
-    lease_id: str = typer.Option(..., "--lease-id"),
-    kind: str = typer.Option(..., "--kind"),
-    resource: str = typer.Option(..., "--resource"),
-) -> None:
-    def run() -> dict[str, Any]:
-        with _factory() as factory:
-            return asdict(
-                factory.federation.emit(peer_id, lease_id, kind, resource, _load_value(content))
-            )
-
-    _handle(run)
-
-
-@federation_app.command("reconcile")
-def federation_reconcile(event: Path) -> None:
-    def run() -> dict[str, Any]:
-        value = _load_value(event)
-        if not isinstance(value, dict):
-            raise typer.BadParameter("federated event must be an object")
-        item = FederatedEvent(**value)
-        with _factory() as factory:
-            return {"eventId": item.event_id, "accepted": factory.federation.reconcile(item)}
-
-    _handle(run)
-
-
-@federation_app.command("outbox")
-def federation_outbox(peer_id: str | None = typer.Option(None, "--peer-id")) -> None:
-    def run() -> list[dict[str, Any]]:
-        with _factory() as factory:
-            return [asdict(event) for event in factory.federation.pending(peer_id)]
-
-    _handle(run)
-
-
-@federation_app.command("published")
-def federation_published(peer_id: str, event_id: str) -> None:
-    def run() -> dict[str, Any]:
-        with _factory() as factory:
-            factory.federation.mark_published(peer_id, event_id)
-        return {"peerId": peer_id, "eventId": event_id, "published": True}
-
-    _handle(run)
-
-
-@capacity_app.command("place")
-def capacity_place(
-    offers: Path,
-    residency: str = typer.Option(..., "--residency"),
-    resource: str = typer.Option(..., "--resource"),
-    amount: int = typer.Option(1, "--amount", min=1),
-    required_label: list[str] | None = typer.Option(None, "--required-label"),
-) -> None:
-    def run() -> dict[str, Any]:
-        values = _load_value(offers)
-        if not isinstance(values, list) or any(not isinstance(item, dict) for item in values):
-            raise typer.BadParameter("offers must be an array of objects")
-        candidates = [
-            CapacityOffer(
-                str(item["peer_id"]),
-                frozenset(str(label) for label in item.get("labels", [])),
-                {str(key): int(value) for key, value in item.get("capacity", {}).items()},
-                int(item.get("policy_epoch", 1)),
-            )
-            for item in values
-        ]
-        return asdict(
-            FederationBroker.place(
-                candidates,
-                required_labels=set(required_label or []),
-                residency=residency,
-                resource=resource,
-                amount=amount,
-            )
-        )
 
     _handle(run)
 
@@ -923,7 +859,7 @@ def secret_list() -> None:
     _handle(run)
 
 
-@app.command("backup")
+@admin_app.command("backup")
 def backup(destination: Path) -> None:
     """Archive and verify metadata, identity, secrets, and local artifacts."""
 
@@ -934,7 +870,7 @@ def backup(destination: Path) -> None:
     _handle(run)
 
 
-@app.command("restore")
+@admin_app.command("restore")
 def restore(
     source: Path,
     expected_key_id: str | None = typer.Option(None, "--expected-key-id"),

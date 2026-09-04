@@ -58,10 +58,6 @@ class ProjectPaths:
     def environments(self) -> Path:
         return self.state / "environments"
 
-    @property
-    def telemetry(self) -> Path:
-        return self.state / "telemetry" / "telemetry.jsonl"
-
 
 def discover_project(start: str | Path | None = None) -> ProjectPaths:
     """Find the nearest parent containing ``omf.yaml`` without crossing the filesystem root."""
@@ -101,7 +97,6 @@ def bootstrap(
         paths.runs,
         paths.packages,
         paths.environments,
-        paths.state / "telemetry",
         paths.state / "operations",
     ]
     actions = [

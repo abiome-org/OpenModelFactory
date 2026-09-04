@@ -10,6 +10,11 @@ Git holds model code and versioned project configuration. Artifact stores hold
 data, checkpoints, model payloads, and releases. `.omf/` holds local runtime
 state, identity, metadata, and logs; never edit or commit it.
 
+The project starts runnable: `workloads/example-from-scratch.yaml` trains and
+evaluates the affine example in `modules/examples/` against
+`data/fixtures/affine.jsonl`. Run it before changing anything to see one whole
+loop, then replace the example with the real model.
+
 This uppercase root file follows the [AGENTS.md standard](https://agents.md/).
 When a subtree has another `AGENTS.md`, its conflicting instructions take
 precedence there.
@@ -94,13 +99,11 @@ compatibility, evaluation, and policy paths used for release decisions.
   goals, findings, or agent context. Refer to governed identities and digests.
 - Do not bypass rights, budget, policy, approval, isolation, vulnerability,
   promotion, or compare-and-set checks. Stop on an unexplained blocker.
-- Back up metadata with `omf backup`, artifacts through store replication, and
+- Back up metadata with `omf admin backup`, artifacts through store replication, and
   `.omf/identity` through the authorized secret process. All three are needed
   to recover the same trust history.
 - Built-in local execution supports the module protocol only under its reported
-  dependency and isolation limits. Built-in Slurm requires an explicit shared
-  filesystem and does not enforce network denial. Built-in Kubernetes manages
-  scheduler lifecycle but does not transport module source, requests, results,
-  or artifacts. A provider name or accepted job does not prove support; require
-  direct tests of transport, cancellation, restart, recovery, and scale.
+  dependency and isolation limits. A plugin provider name or accepted job does
+  not prove support; require direct tests of transport, cancellation, restart,
+  recovery, and scale.
 <!-- END OMF OPERATOR GUIDE -->

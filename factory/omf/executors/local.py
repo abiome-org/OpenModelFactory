@@ -111,20 +111,26 @@ def _redact(text: str) -> str:
     return _CREDENTIAL_URL.sub("://***@", text)
 
 
+_LIMITS = {
+    "cpuSeconds": resource.RLIMIT_CPU,
+    "addressSpaceBytes": resource.RLIMIT_AS,
+    "processes": resource.RLIMIT_NPROC,
+    "fileSizeBytes": resource.RLIMIT_FSIZE,
+}
+
+
 class LocalExecutor(Executor):
     def __init__(
         self,
         *,
-        binding_resources: dict[str, Any] | None = None,
-        binding_spec: dict[str, Any] | None = None,
+        limits: dict[str, Any] | None = None,
         environment_root: Path | None = None,
         dependency_wheelhouse: Path | None = None,
         dependency_index: bool = True,
     ) -> None:
         self._processes: dict[str, subprocess.Popen[bytes]] = {}
         self._dirs: dict[str, Path] = {}
-        self.binding_resources = binding_resources or {}
-        self.binding_spec = binding_spec or {}
+        self.limits = limits or {}
         self.environment_root = environment_root
         self.dependency_wheelhouse = dependency_wheelhouse
         self.dependency_index = dependency_index
@@ -423,34 +429,8 @@ class LocalExecutor(Executor):
 
     def preflight(self) -> list[str]:
         issues = [] if os.name == "posix" else ["POSIX resource limits unavailable"]
-        supported = {"cpu", "memory", "accelerators"}
-        if unknown := sorted(set(self.binding_resources) - supported):
-            issues.append(f"unsupported local binding resources: {', '.join(unknown)}")
-        if self.binding_resources.get("cpu", "auto") != "auto":
-            issues.append("local executor cannot enforce an explicit CPU count")
-        if self.binding_resources.get("memory", "auto") != "auto":
-            issues.append("local executor cannot enforce an explicit memory quantity")
-        if self.binding_resources.get("accelerators", []):
-            issues.append("local executor cannot qualify accelerator placement")
-        for field in ("placement", "transport", "extensions"):
-            if self.binding_spec.get(field):
-                issues.append(f"local executor does not support Binding.spec.{field}")
-        config = self.binding_spec.get("config", {})
-        if not isinstance(config, dict):
-            issues.append("local Binding.spec.config must be an object")
-            return issues
-        supported_config = {"executor", "stores", "isolation", "recovery"}
-        if unknown := sorted(set(config) - supported_config):
-            issues.append(f"unsupported local Binding config: {', '.join(unknown)}")
-        stores = config.get("stores", {})
-        if stores and stores != {"artifacts": "local", "checkpoints": "local"}:
-            issues.append("local executor supports only local artifact and checkpoint stores")
-        isolation = config.get("isolation", {})
-        if isolation and isolation != {"driver": "subprocess", "network": "deny"}:
-            issues.append("local executor supports only subprocess isolation with network denial")
-        recovery = config.get("recovery", {})
-        if recovery and recovery != {"attempts": 1, "checkpointOnCancel": False}:
-            issues.append("local executor supports one attempt without checkpoint-on-cancel")
+        if unknown := sorted(set(self.limits) - set(_LIMITS) - {"timeoutSeconds"}):
+            issues.append(f"unsupported local resource limits: {', '.join(unknown)}")
         return issues
 
     def prepare_environment(
@@ -564,8 +544,12 @@ class LocalExecutor(Executor):
             run_dir,
             cwd,
             env or {},
-            {**self.binding_resources, **(resources or {})},
-            timeout,
+            {
+                key: value
+                for key, value in {**self.limits, **(resources or {})}.items()
+                if key in _LIMITS
+            },
+            timeout or self.limits.get("timeoutSeconds"),
             deny_network,
             {
                 "requiresResult": requires_result,
@@ -643,13 +627,7 @@ class LocalExecutor(Executor):
 
         def setup() -> None:
             os.setsid()
-            mapping = {
-                "cpu_seconds": resource.RLIMIT_CPU,
-                "address_space": resource.RLIMIT_AS,
-                "processes": resource.RLIMIT_NPROC,
-                "file_size": resource.RLIMIT_FSIZE,
-            }
-            for key, kind in mapping.items():
+            for key, kind in _LIMITS.items():
                 if key in limits:
                     resource.setrlimit(kind, (int(limits[key]), int(limits[key])))
 

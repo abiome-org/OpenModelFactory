@@ -180,8 +180,6 @@ def test_clean_clone_to_signed_release_and_edge_deployment(tmp_path):
             "metadata": {"name": "edge-demo", "namespace": "local/test-project"},
             "spec": {
                 "releaseRef": "release/release-one",
-                "runtime": "omf.module/v1",
-                "routing": {},
                 "extensions": {"form": "edge"},
             },
         }
@@ -263,14 +261,14 @@ def test_non_local_binding_is_not_silently_executed_locally(tmp_path):
     bootstrap(paths)
     binding = yaml.safe_load((paths.root / "bindings/local.yaml").read_text())
     binding["metadata"]["name"] = "cluster"
-    binding["spec"]["executor"] = "slurm"
+    binding["spec"]["executor"] = "cluster-provider"
     binding_path = paths.root / "bindings/cluster.yaml"
     binding_path.write_text(yaml.safe_dump(binding))
 
     with Factory(paths) as factory:
-        with pytest.raises(CapabilityError, match="not ready") as failure:
+        with pytest.raises(CapabilityError, match="unknown executor provider") as failure:
             factory.run(paths.root / "workloads/example-statistical.yaml", binding_path)
-        assert "protocol:omf.module/v1" in failure.value.details["missingCapabilities"]
+        assert failure.value.details["available"] == ["local"]
         assert factory.list_resources(kind="Run") == []
         assert factory.operations.list() == []
         assert list(paths.runs.iterdir()) == []
@@ -371,7 +369,7 @@ def test_stable_executor_plugin_acceptance(tmp_path, monkeypatch):
     stable_binding = yaml.safe_load((paths.root / "bindings/local.yaml").read_text())
     stable_binding["metadata"]["name"] = "stable-test"
     stable_binding["spec"]["executor"] = "stable-test"
-    stable_binding["spec"]["config"]["executor"] = {"interruptStatusOnce": True}
+    stable_binding["spec"]["config"] = {"interruptStatusOnce": True}
     stable_binding_path = paths.root / "bindings/stable-test.yaml"
     stable_binding_path.write_text(yaml.safe_dump(stable_binding))
     bootstrap(paths)
@@ -432,7 +430,7 @@ def test_stable_executor_plugin_acceptance(tmp_path, monkeypatch):
 
     recover_binding = deepcopy(stable_binding)
     recover_binding["metadata"]["name"] = "stable-test-recover"
-    recover_binding["spec"]["config"]["executor"] = {"interruptSubmitOnce": True}
+    recover_binding["spec"]["config"] = {"interruptSubmitOnce": True}
     recover_binding_path = paths.root / "bindings/stable-test-recover.yaml"
     recover_binding_path.write_text(yaml.safe_dump(recover_binding))
     with Factory(paths, executors=restarted_registry) as external:
@@ -694,7 +692,7 @@ def test_module_manifest_revision_changes_admitted_source_identity(tmp_path):
     with Factory(paths) as factory:
         first = factory.validate_module(manifest_path)
         manifest = yaml.safe_load(manifest_path.read_text())
-        manifest["spec"]["provenance"]["sourceRef"] = "repository:modules/examples/statistical-v2"
+        manifest["spec"]["extensions"] = {"sourceRef": "repository:modules/examples/statistical-v2"}
         manifest_path.write_text(yaml.safe_dump(manifest))
         second = factory.validate_module(manifest_path)
 
@@ -746,7 +744,7 @@ def test_run_realizes_module_dependency_lock_from_binding_wheelhouse(tmp_path):
     manifest["spec"]["environment"]["dependencyDigest"] = (
         "sha256:" + hashlib.sha256(lock).hexdigest()
     )
-    manifest["spec"]["provenance"]["sourceRef"] = "repository:modules/locked"
+    manifest["spec"]["extensions"] = {"sourceRef": "repository:modules/locked"}
     (module_dir / "module.yaml").write_text(yaml.safe_dump(manifest))
     (module_dir / "main.py").write_text(
         "import omftiny\n"
@@ -759,7 +757,7 @@ def test_run_realizes_module_dependency_lock_from_binding_wheelhouse(tmp_path):
         "    raise SystemExit(main({'validate': validate, 'run': run}))\n"
     )
     binding = yaml.safe_load((paths.root / "bindings/local.yaml").read_text())
-    binding["spec"]["config"]["executor"] = {
+    binding["spec"]["config"] = {
         "dependencyWheelhouse": "wheels",
         "dependencyIndex": False,
     }
@@ -773,8 +771,6 @@ def test_run_realizes_module_dependency_lock_from_binding_wheelhouse(tmp_path):
                 "kind": "WorkloadSpec",
                 "metadata": {"name": "locked", "namespace": "local/test-project"},
                 "spec": {
-                    "parameters": {},
-                    "reproducibility": "lineage",
                     "graph": {
                         "stages": [
                             {
@@ -983,7 +979,6 @@ def _affine_project(tmp_path: Path) -> tuple[ProjectPaths, Path]:
         for source in (
             "model-packages/example-affine.yaml",
             "evaluations/example-affine.yaml",
-            "mixes/example-affine.yaml",
         ):
             resource = yaml.safe_load(Path(source).read_text())
             resource["metadata"]["namespace"] = "local/test-project"
@@ -1030,8 +1025,6 @@ def test_service_deployment_serves_release_through_admitted_adapter(tmp_path):
                     "metadata": {"name": "affine-service", "namespace": "local/test-project"},
                     "spec": {
                         "releaseRef": "release/affine-v1",
-                        "runtime": "omf.module/v1",
-                        "routing": {},
                         "extensions": {"form": "service", "port": port},
                     },
                 }
@@ -1091,7 +1084,7 @@ def test_reference_inputs_pin_prior_release_checkpoint_and_artifact(tmp_path):
     shutil.copytree(paths.root / "modules/examples/statistical", probe)
     manifest = yaml.safe_load((probe / "module.yaml").read_text())
     manifest["metadata"]["name"] = "probe"
-    manifest["spec"]["provenance"]["sourceRef"] = "repository:modules/probe"
+    manifest["spec"]["extensions"] = {"sourceRef": "repository:modules/probe"}
     (probe / "module.yaml").write_text(yaml.safe_dump(manifest))
     (probe / "main.py").write_text(
         "import os\n"
@@ -1121,8 +1114,6 @@ def test_reference_inputs_pin_prior_release_checkpoint_and_artifact(tmp_path):
                     "kind": "WorkloadSpec",
                     "metadata": {"name": "refine", "namespace": "local/test-project"},
                     "spec": {
-                        "parameters": {},
-                        "reproducibility": "lineage",
                         "graph": {
                             "stages": [
                                 {
@@ -1255,16 +1246,6 @@ def test_workload_preflight_checks_environment_and_binding_semantics(tmp_path):
         report = factory.executor_preflight(binding_path, workload_path=workload_path)
     assert not report["ready"]
     assert any("unavailable" in issue for issue in report["issues"])
-
-    module["spec"]["entryPoint"]["command"][0] = "python3"
-    module_path.write_text(yaml.safe_dump(module))
-    binding = yaml.safe_load(binding_path.read_text())
-    binding["spec"]["placement"] = {"zone": "ignored"}
-    binding_path.write_text(yaml.safe_dump(binding))
-    with Factory(paths) as factory:
-        report = factory.executor_preflight(binding_path, workload_path=workload_path)
-    assert not report["ready"]
-    assert any("placement" in issue for issue in report["issues"])
 
 
 @pytest.mark.parametrize(
@@ -1567,8 +1548,6 @@ def test_model_neutral_from_scratch_golden_path(tmp_path, monkeypatch):
     model_package["metadata"]["namespace"] = "local/test-project"
     evaluation_spec = yaml.safe_load(Path("evaluations/example-affine.yaml").read_text())
     evaluation_spec["metadata"]["namespace"] = "local/test-project"
-    mix = yaml.safe_load(Path("mixes/example-affine.yaml").read_text())
-    mix["metadata"]["namespace"] = "local/test-project"
     bootstrap(paths)
     with Factory(paths) as factory:
         package_resource = factory.apply_resource(model_package)
@@ -1579,7 +1558,6 @@ def test_model_neutral_from_scratch_golden_path(tmp_path, monkeypatch):
             mode="copy",
             rights={"license": "CC0-1.0", "trainingAllowed": True},
         )
-        mix_resource = factory.apply_resource(mix)
         result = factory.run(workload_path, paths.root / "bindings/local.yaml")
         state = json.loads((paths.runs / result["runId"] / "state.json").read_text())
         state["digests"]["modules"]["train"] = "sha256:" + "0" * 64
@@ -1694,7 +1672,7 @@ def test_model_neutral_from_scratch_golden_path(tmp_path, monkeypatch):
         ]
         experiment = factory.create_experiment(
             name="affine-self-check",
-            baseline_ref=factory._resource_uri(evaluation),
+            baseline_ref=f"run/{result['runId']}",
             candidate_ref=factory._resource_uri(evaluation),
             metric="training-loss",
             direction="minimize",
@@ -1702,7 +1680,6 @@ def test_model_neutral_from_scratch_golden_path(tmp_path, monkeypatch):
         admitted_evaluation_refs = factory._run_resource(result["runId"])["spec"]["extensions"][
             "evaluationRefs"
         ]
-        admitted_mix_ref = factory._run_resource(result["runId"])["spec"]["extensions"]["mixRef"]
         checkpoints = factory.list_resources(kind="Checkpoint")
         model_manifest = factory.local_store.read_manifest(result["outputs"]["train.model"])
         restored = tmp_path / "restored-model"
@@ -1716,10 +1693,6 @@ def test_model_neutral_from_scratch_golden_path(tmp_path, monkeypatch):
     assert len(checkpoints) == 1
     assert checkpoints[0]["spec"]["artifactRef"] == result["outputs"]["train.checkpoint"]
     assert checkpoints[0]["spec"]["components"]["protocol-state"].startswith("sha256:")
-    assert checkpoints[0]["spec"]["replay"] == {
-        "status": "not-claimed",
-        "reason": "sampler-state-not-observed",
-    }
     assert json.loads((restored / "payload").read_text()) == result["outputs"]["train.modelState"]
     assert evaluation["spec"]["extensions"]["compatibilityPassed"] is True
     assert admission["inferenceAdapter"]["sourceDigest"] != admission["moduleDigests"]["train"]
@@ -1731,7 +1704,6 @@ def test_model_neutral_from_scratch_golden_path(tmp_path, monkeypatch):
     assert evaluation["spec"]["scores"]["training-loss"] < 1e-6
     assert experiment["spec"]["decision"] == "tie"
     assert factory._resource_uri(suite_resource) in admitted_evaluation_refs
-    assert admitted_mix_ref == factory._resource_uri(mix_resource)
     assert evaluation["spec"]["extensions"]["modelPackageRef"] == factory._resource_uri(
         package_resource
     )
@@ -1746,15 +1718,6 @@ def test_model_package_admission_rejects_unexecutable_contracts(tmp_path):
     base["metadata"]["namespace"] = "local/test-project"
 
     with Factory(paths) as factory:
-        optimized = deepcopy(base)
-        optimized["metadata"]["name"] = "optimized"
-        optimized["spec"]["adapters"]["optimized"] = [
-            deepcopy(optimized["spec"]["adapters"]["inferenceReference"])
-        ]
-        factory.apply_resource(optimized)
-        with pytest.raises(ValidationError, match="optimized model adapters"):
-            factory._pin_model_package("modelpackage/optimized", stages)
-
         tolerance = deepcopy(base)
         tolerance["metadata"]["name"] = "invalid-tolerance"
         tolerance["spec"]["compatibilityVectors"][0]["tolerances"]["prediction"]["absolute"] = -1
@@ -1861,37 +1824,6 @@ def test_model_package_admission_rejects_adapter_and_vector_drift(tmp_path):
         )
 
 
-def test_legacy_model_package_is_readable_but_requires_an_explicit_serving_migration(tmp_path):
-    paths = _project(tmp_path)
-    bootstrap(paths)
-    workload = yaml.safe_load((paths.root / "workloads/example-from-scratch.yaml").read_text())
-    stages = project_workload(workload).stages
-    current = yaml.safe_load(Path("model-packages/example-affine.yaml").read_text())
-    current["metadata"]["name"] = "legacy-affine"
-    current["metadata"]["namespace"] = "local/test-project"
-    legacy = deepcopy(current)
-    legacy["spec"]["adapters"]["inferenceReference"] = {
-        "stage": "train",
-        "operation": "run",
-        "stateOutput": "train.modelState",
-        "config": {"action": "infer"},
-    }
-
-    with Factory(paths) as factory:
-        legacy_resource = factory.apply_resource(legacy)
-        with pytest.raises(ValidationError, match="legacy stage-based inference adapter"):
-            factory._pin_model_package("modelpackage/legacy-affine", stages)
-
-        migrated = factory.apply_resource(current)
-        selected = factory._pin_model_package("modelpackage/legacy-affine", stages)
-        retained_legacy = factory.resources.get(
-            legacy_resource["metadata"]["uid"], legacy_resource["metadata"]["revision"]
-        )
-
-    assert selected == migrated
-    assert retained_legacy["spec"]["adapters"]["inferenceReference"]["stage"] == "train"
-
-
 def test_resource_pinning_and_resolution_fail_closed(tmp_path):
     paths = _project(tmp_path)
     bootstrap(paths)
@@ -1899,8 +1831,6 @@ def test_resource_pinning_and_resolution_fail_closed(tmp_path):
     stages = project_workload(workload).stages
     evaluation = yaml.safe_load(Path("evaluations/example-affine.yaml").read_text())
     evaluation["metadata"]["namespace"] = "local/test-project"
-    mix = yaml.safe_load(Path("mixes/example-affine.yaml").read_text())
-    mix["metadata"]["namespace"] = "local/test-project"
 
     with Factory(paths) as factory:
         dataset = factory.add_data(
@@ -1910,7 +1840,6 @@ def test_resource_pinning_and_resolution_fail_closed(tmp_path):
             rights={"license": "CC0-1.0", "trainingAllowed": True},
         )
         suite = factory.apply_resource(evaluation)
-        mix_resource = factory.apply_resource(mix)
 
         with pytest.raises(IntegrityError, match="dataset reference was not pinned"):
             factory._pin_stage_inputs(stages, {})
@@ -1928,18 +1857,6 @@ def test_resource_pinning_and_resolution_fail_closed(tmp_path):
             "EvaluationSpec",
             [factory._resource_uri(suite)],
         ) == [suite]
-        with pytest.raises(IntegrityError, match="MixSpec does not match"):
-            factory._pin_mix(None, {}, factory._resource_uri(mix_resource))
-        with pytest.raises(ValidationError, match="not an admitted workload dataset"):
-            factory._pin_mix("mixspec/example-affine", {})
-        assert (
-            factory._pin_mix(
-                "mixspec/example-affine",
-                {"dataset/example-affine": dataset},
-                factory._resource_uri(mix_resource),
-            )
-            == mix_resource
-        )
 
         assert factory._resolve_output_reference("literal", {}, stages) == "literal"
         with pytest.raises(IntegrityError, match="stage output reference is unavailable"):
@@ -2279,7 +2196,6 @@ def test_running_local_operation_reattaches_without_duplicate_stage_work(tmp_pat
         for source in (
             Path("model-packages/example-affine.yaml"),
             Path("evaluations/example-affine.yaml"),
-            Path("mixes/example-affine.yaml"),
         ):
             resource = yaml.safe_load(source.read_text())
             resource["metadata"]["namespace"] = "local/test-project"
@@ -2645,7 +2561,7 @@ def test_queued_run_pins_manifest_outside_code_root(tmp_path):
             paths.root / "workloads/example-statistical.yaml",
             paths.root / "bindings/local.yaml",
         )
-        manifest["spec"]["provenance"]["sourceRef"] = "repository:changed-after-queue"
+        manifest["spec"]["extensions"] = {"sourceRef": "repository:changed-after-queue"}
         manifest_path.write_text(yaml.safe_dump(manifest))
 
         with pytest.raises(IntegrityError, match="module source changed"):
@@ -2665,7 +2581,6 @@ def test_queued_run_rejects_inference_adapter_source_drift(tmp_path):
         for source in (
             Path("model-packages/example-affine.yaml"),
             Path("evaluations/example-affine.yaml"),
-            Path("mixes/example-affine.yaml"),
         ):
             resource = yaml.safe_load(source.read_text())
             resource["metadata"]["namespace"] = "local/test-project"
@@ -2800,7 +2715,6 @@ def test_checkpoint_publication_rejects_incomplete_stage_results(tmp_path, failu
     workload["metadata"]["namespace"] = "local/test-project"
     workload["spec"].pop("modelPackageRef")
     workload["spec"].pop("evaluationRefs")
-    workload["spec"].pop("mixRef")
     workload["spec"]["graph"]["stages"] = workload["spec"]["graph"]["stages"][:1]
     workload_path.write_text(yaml.safe_dump(workload))
 
@@ -2823,7 +2737,7 @@ def test_checkpoint_publication_rejects_incomplete_stage_results(tmp_path, failu
     else:
         manifest_path = module_root / "module.yaml"
         manifest = yaml.safe_load(manifest_path.read_text())
-        manifest["spec"]["lifecycle"]["checkpoint"] = False
+        manifest["spec"]["checkpoint"] = False
         manifest_path.write_text(yaml.safe_dump(manifest))
         expected = "without declaring support"
 

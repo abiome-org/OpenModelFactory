@@ -3,8 +3,7 @@
 **Status: Tested now**
 
 New dataset snapshots, module revisions, workload revisions, and runs are
-tested. Native `MixSpec` consumption and objective-specific training recipes are
-extension boundaries.
+tested. Objective-specific training recipes are an extension boundary.
 
 ## Declare one experiment change
 
@@ -13,7 +12,7 @@ Start from the committed baseline and state one primary intervention:
 | Intervention | New immutable input |
 | --- | --- |
 | Add pretraining data | dataset snapshot and workload input reference |
-| Change a data mixture | source snapshots plus sampler/module configuration |
+| Change a data mixture | source snapshots plus module configuration |
 | Change an objective | objective/trainer module package and workload revision |
 | Add post-training | new stage modules and dependencies |
 | Change only placement | binding revision; workload behavior remains unchanged |

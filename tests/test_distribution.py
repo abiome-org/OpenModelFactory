@@ -190,7 +190,7 @@ spec: {owners: [release-test], extensions: {}}
     backup = tmp_path / "candidate.omf-backup"
     backup_report = json.loads(
         _run(
-            [omf_command, "--project", project, "--output", "json", "backup", backup],
+            [omf_command, "--project", project, "--output", "json", "admin", "backup", backup],
             cwd=isolated,
             env=environment,
         ).stdout
@@ -206,6 +206,7 @@ spec: {owners: [release-test], extensions: {}}
                 restored,
                 "--output",
                 "json",
+                "admin",
                 "restore",
                 backup,
                 "--expected-key-id",

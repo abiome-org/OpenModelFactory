@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import os
 import secrets
+import shutil
 import stat
 import sys
 from contextlib import suppress
@@ -12,6 +13,30 @@ from pathlib import Path
 
 _NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
 _DIRECTORY = getattr(os, "O_DIRECTORY", 0)
+STARTER = (
+    "data/fixtures/affine.jsonl",
+    "data/fixtures/rights.yaml",
+    "evaluations/example-affine.yaml",
+    "model-packages/example-affine.yaml",
+    "modules/examples/affine-regression",
+    "modules/examples/affine-serving",
+    "workloads/example-from-scratch.yaml",
+)
+
+
+def copy_starter(source_root: Path, target: Path) -> list[str]:
+    copied = []
+    for relative in STARTER:
+        source, destination = source_root / relative, target / relative
+        if os.path.lexists(destination):
+            continue
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        if source.is_dir():
+            shutil.copytree(source, destination, ignore=shutil.ignore_patterns("__pycache__"))
+        else:
+            shutil.copy2(source, destination)
+        copied.append(relative)
+    return copied
 
 
 def _open_parent(path: Path) -> int:
@@ -203,6 +228,10 @@ def _parser() -> argparse.ArgumentParser:
     render.add_argument("destination", type=Path)
     render.add_argument("name")
     render.add_argument("namespace")
+
+    starter = commands.add_parser("starter")
+    starter.add_argument("source", type=Path)
+    starter.add_argument("target", type=Path)
     return parser
 
 
@@ -218,13 +247,15 @@ def main(argv: list[str] | None = None) -> int:
                 arguments.begin,
                 arguments.end,
             )
-        else:
+        elif arguments.command == "render":
             render_template(
                 arguments.source,
                 arguments.destination,
                 arguments.name,
                 arguments.namespace,
             )
+        else:
+            copy_starter(arguments.source, arguments.target)
     except (OSError, RuntimeError, UnicodeError, ValueError) as error:
         print(f"install support: {error}", file=sys.stderr)
         return 1

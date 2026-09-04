@@ -41,12 +41,12 @@ results.
 ```
 
 1. **Versioned configuration.** Resources describe what the model-building and
-   evaluation work does. `WorkloadSpec`, `ModelPackage`, `EvaluationSpec`, and
-   `MixSpec` do not contain scheduler, machine, or cloud configuration. A
+   evaluation work does. `WorkloadSpec`, `ModelPackage`, and `EvaluationSpec`
+   do not contain scheduler, machine, or cloud configuration. A
    `Binding` owns physical resources, placement, transport, and provider
    options.
 2. **Validation.** `Factory` validates semantics, records exact data, package,
-   evaluation, mix, training-module, inference-adapter, dependency-lock,
+   evaluation, training-module, inference-adapter, dependency-lock,
    observed executable, and binding revisions, then rejects unsupported
    capabilities before allocation.
 3. **Execution.** Modules communicate through `omf.module/v1`. Bindings select
@@ -93,7 +93,7 @@ results.
 
 Extend workload behavior with a Module or ModelPackage adapter. Extend physical
 placement with an `omf.executors` provider. Add modality or framework
-conveniences as optional starter packs. Do not add model assumptions to core or
+conveniences as modules. Do not add model assumptions to core or
 provider details to portable resources.
 
 ## Current executor boundary

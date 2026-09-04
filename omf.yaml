@@ -6,12 +6,3 @@ metadata:
 spec:
   owners:
     - local-user
-  extensions:
-    defaultBinding: bindings/local.yaml
-    localStore: .omf/store
-    policyDirectory: policies
-    moduleDirectories:
-      - modules
-    telemetry:
-      exporter: local
-      callHome: false

@@ -25,25 +25,13 @@ class ModuleManifest(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
     name: str
-    namespace: str
-    contract_version: str
-    kind: str
     code_root: str = "."
     argv: list[str]
     schemas: dict[str, Any] = Field(default_factory=dict)
     dependency_lock: str
     dependency_digest: str
     dependency_contents: bytes = Field(repr=False)
-    capabilities: set[str] = Field(default_factory=set)
-    platforms: set[str] = Field(default_factory=set)
-    resources: dict[str, Any] = Field(default_factory=dict)
-    determinism: str = "declared"
     checkpoint: bool = False
-    side_effects: list[str] = Field(default_factory=list)
-    concurrency: int = 1
-    secrets: list[str] = Field(default_factory=list)
-    network: list[str] = Field(default_factory=list)
-    provenance: dict[str, str]
     fixtures: list[dict[str, Any]] = Field(default_factory=list)
 
     @field_validator("argv")
@@ -64,31 +52,20 @@ def load_manifest(path: str | Path, project_root: str | Path) -> tuple[ModuleMan
     resource = default_registry.validate_as(raw, "Module")
     spec = resource["spec"]
     entry_point = spec["entryPoint"]
-    environment = spec["environment"]
-    lifecycle = spec["lifecycle"]
-    access = spec["access"]
+    contracts = spec.get("contracts", {})
     manifest = ModuleManifest.model_validate(
         {
             "name": resource["metadata"]["name"],
-            "namespace": resource["metadata"]["namespace"],
-            "contract_version": spec["contractVersion"],
-            "kind": spec["moduleKind"],
             "code_root": entry_point.get("codeRoot", "."),
             "argv": entry_point["command"],
-            "schemas": spec["contracts"],
-            "dependency_lock": environment.get("dependencyLock"),
-            "dependency_digest": environment.get("dependencyDigest"),
+            "schemas": {
+                name: contracts.get(name, {"type": "object"})
+                for name in ("input", "output", "config", "state")
+            },
+            "dependency_lock": spec["environment"]["dependencyLock"],
+            "dependency_digest": spec["environment"]["dependencyDigest"],
             "dependency_contents": b"",
-            "capabilities": spec.get("capabilities", []),
-            "platforms": spec.get("platforms", []),
-            "resources": spec.get("resources", {}),
-            "determinism": spec.get("determinism", "declared"),
-            "checkpoint": lifecycle["checkpoint"],
-            "side_effects": lifecycle["sideEffects"],
-            "concurrency": lifecycle["concurrency"],
-            "secrets": access["secrets"],
-            "network": access["network"],
-            "provenance": spec["provenance"],
+            "checkpoint": spec.get("checkpoint", False),
             "fixtures": spec.get("fixtures", []),
         }
     )
@@ -118,18 +95,6 @@ def load_manifest(path: str | Path, project_root: str | Path) -> tuple[ModuleMan
     manifest = manifest.model_copy(update={"dependency_contents": lock_contents})
     for name, contract in manifest.schemas.items():
         validate_contract_schema(contract, f"module {name}")
-    if manifest.resources:
-        raise ValidationError(
-            "module resource requirements are not executable; declare placement in Binding"
-        )
-    if manifest.network:
-        raise ValidationError(
-            "module network destinations require an executor with allowlist enforcement"
-        )
-    if manifest.capabilities or manifest.platforms or manifest.secrets:
-        raise ValidationError(
-            "module capability, platform, and secret requirements need provider negotiation"
-        )
     executable = manifest.argv[0]
     if executable.startswith("/"):
         raise ValidationError("module executable must not be an absolute path")
@@ -270,12 +235,6 @@ def git_source(root: str | Path, *, allow_dirty: bool = False) -> dict[str, Any]
         "untracked": state["untracked"],
         "digest": state["patchDigest"],
     }
-
-
-def validate_fixtures(manifest: ModuleManifest) -> None:
-    for fixture in manifest.fixtures:
-        if "request" not in fixture or "result" not in fixture:
-            raise ValidationError("fixtures require request and result")
 
 
 def validate_contract(contract: Any, value: Any, name: str) -> None:

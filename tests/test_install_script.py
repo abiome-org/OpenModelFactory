@@ -5,8 +5,15 @@ import sys
 from pathlib import Path
 
 import pytest
+from omf.install_support import (
+    STARTER,
+    copy_starter,
+    render_template,
+    upsert_managed_section,
+    validate_managed_file,
+)
 from omf.install_support import main as install_support_main
-from omf.install_support import render_template, upsert_managed_section, validate_managed_file
+from omf.modules import load_manifest
 from omf.schema_registry import SchemaRegistry
 
 AGENTS_BEGIN = "<!-- BEGIN OMF OPERATOR GUIDE -->"
@@ -254,6 +261,19 @@ def test_install_support_creates_and_preserves_templates_and_managed_files(tmp_p
     assert "template markers do not match" in capsys.readouterr().err
 
 
+def test_starter_copy_is_complete_and_never_overwrites(tmp_path):
+    target = tmp_path / "project"
+    assert copy_starter(Path.cwd(), target) == list(STARTER)
+    manifest_path = target / "modules/examples/affine-regression/module.yaml"
+    _manifest, code_root = load_manifest(manifest_path, target)
+    assert code_root == manifest_path.parent.resolve()
+    assert not list(target.rglob("__pycache__"))
+    workload = target / "workloads/example-from-scratch.yaml"
+    workload.write_text("edited\n", encoding="utf-8")
+    assert copy_starter(Path.cwd(), target) == []
+    assert workload.read_text(encoding="utf-8") == "edited\n"
+
+
 def test_install_support_writes_through_an_inherited_target_after_path_swap(tmp_path):
     target_path = tmp_path / "target"
     target_path.mkdir()
@@ -363,6 +383,16 @@ def test_directory_installer_is_idempotent_and_rebuilds_only_its_managed_venv(tm
     assert "`local/installed-factory`" in model_card
     assert (target / ".venv").is_symlink()
     assert (target / ".venv/.omf-managed").is_file()
+    assert (target / "modules/examples/affine-regression/module.yaml").is_file()
+    git = ["git", "-C", str(target)]
+    history = subprocess.run(
+        [*git, "log", "--format=%s"], check=True, capture_output=True, text=True
+    ).stdout
+    assert history.splitlines() == ["Initialize Open Model Factory project"]
+    status = subprocess.run(
+        [*git, "status", "--porcelain"], check=True, capture_output=True, text=True
+    ).stdout
+    assert status == ""
     entrypoint = (target / ".venv/bin/omf").read_text(encoding="utf-8").splitlines()[0]
     assert "/proc/self/fd/" not in entrypoint
     assert "/dev/fd/" not in entrypoint
@@ -492,8 +522,7 @@ def test_rendered_project_templates_match_resource_contracts():
         content = template.read_text(encoding="utf-8")
         for placeholder, value in replacements.items():
             content = content.replace(placeholder, value)
-        resource = registry.load(content)
-        assert resource["metadata"]["namespace"] == "local/installed-factory"
+        registry.load(content)
 
 
 def test_operator_guide_is_bounded_and_actionable():

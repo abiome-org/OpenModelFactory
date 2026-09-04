@@ -61,7 +61,8 @@ operation.
 
 ## Try the checked-in example
 
-From an initialized checkout:
+From this checkout or any installed project; the installer copies this starter
+into new projects and commits it:
 
 ```sh
 omf module validate modules/examples/affine-regression/module.yaml
@@ -70,7 +71,6 @@ omf data add data/fixtures/affine.jsonl --name example-affine --mode copy \
   --rights data/fixtures/rights.yaml
 omf resource apply model-packages/example-affine.yaml
 omf resource apply evaluations/example-affine.yaml
-omf resource apply mixes/example-affine.yaml
 omf executor preflight bindings/local.yaml \
   --workload workloads/example-from-scratch.yaml
 omf run workloads/example-from-scratch.yaml --binding bindings/local.yaml
@@ -89,7 +89,7 @@ including baseline/candidate comparisons and the conditional release path.
 | `model-packages/` | Model interfaces, adapters, compatibility vectors, and provenance |
 | `workloads/` | Portable stage graphs describing what runs |
 | `bindings/` | Executors, resources, placement, and provider configuration |
-| `evaluations/`, `mixes/` | Benchmark definitions and data-mixture intent |
+| `evaluations/` | Benchmark definitions |
 | `policies/`, `deployments/` | Promotion rules and serving intent |
 | `factory/omf/` | CLI, API, orchestration, storage, execution, and governance runtime |
 | `tests/` | Product guarantees and release evidence |

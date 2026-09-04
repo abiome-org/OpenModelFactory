@@ -166,7 +166,7 @@ class ProjectPolicy:
                 if not isinstance(value, dict):
                     raise ValidationError(f"policy document must be one object: {path.name}")
                 document = default_registry.validate_as(value, "Policy")
-                if document["metadata"].get("namespace") != namespace:
+                if document["metadata"].get("namespace", namespace) != namespace:
                     raise ValidationError(
                         f"policy namespace does not match the project: {path.name}"
                     )

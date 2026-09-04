@@ -95,6 +95,12 @@ CREATE TRIGGER IF NOT EXISTS resource_order_no_delete BEFORE DELETE ON resource_
  BEGIN SELECT RAISE(ABORT,'immutable resource order'); END;
 """
 
+_SCHEMA_V6 = """
+DROP TABLE IF EXISTS federation_inbox;
+DROP TABLE IF EXISTS federation_outbox;
+DROP TABLE IF EXISTS federation_peers;
+"""
+
 
 @dataclass(frozen=True)
 class _Migration:
@@ -134,6 +140,12 @@ _MIGRATIONS = (
         "resource-order",
         "b48b2309058ad6ce0a4f34dfdba3a14352092ed61493b7efe23db85607ba1eae",
         _SCHEMA_V5,
+    ),
+    _Migration(
+        6,
+        "drop-federation",
+        "7e9e81339aa73fea140e86b2ce9a958e9d0d5d917b7f6312a8b28ad0de1d3b2f",
+        _SCHEMA_V6,
     ),
 )
 
@@ -474,3 +486,17 @@ class AliasRepository:
         if row is None:
             raise NotFoundError("alias not found")
         return str(row[0]), str(row[1]), int(row[2])
+
+    def list(self) -> builtins.list[dict[str, Any]]:
+        rows = self.db.connection.execute(
+            "SELECT name,uid,revision,version FROM aliases ORDER BY name"
+        )
+        return [
+            {
+                "name": str(row[0]),
+                "uid": str(row[1]),
+                "revision": str(row[2]),
+                "version": int(row[3]),
+            }
+            for row in rows
+        ]

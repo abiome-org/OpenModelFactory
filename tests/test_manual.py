@@ -12,6 +12,7 @@ import yaml
 from omf.config import ProjectPaths, bootstrap
 from omf.errors import IntegrityError
 from omf.factory import Factory
+from omf.install_support import copy_starter
 
 MANUAL = Path("manual")
 CHAPTERS = {
@@ -64,21 +65,7 @@ def _manual_project(tmp_path: Path) -> Path:
     )
     (root / "bindings").mkdir()
     shutil.copy2("bindings/local.yaml", root / "bindings/local.yaml")
-    (root / "workloads").mkdir()
-    shutil.copy2(
-        "workloads/example-from-scratch.yaml", root / "workloads/example-from-scratch.yaml"
-    )
-    (root / "modules/examples").mkdir(parents=True)
-    shutil.copytree(
-        "modules/examples/affine-regression", root / "modules/examples/affine-regression"
-    )
-    shutil.copytree("modules/examples/affine-serving", root / "modules/examples/affine-serving")
-    (root / "data/fixtures").mkdir(parents=True)
-    shutil.copy2("data/fixtures/affine.jsonl", root / "data/fixtures/affine.jsonl")
-    shutil.copy2("data/fixtures/rights.yaml", root / "data/fixtures/rights.yaml")
-    for directory in ("model-packages", "evaluations", "mixes"):
-        (root / directory).mkdir()
-        shutil.copy2(f"{directory}/example-affine.yaml", root / directory / "example-affine.yaml")
+    copy_starter(Path.cwd(), root)
 
     subprocess.run(["git", "init", "-q"], cwd=root, check=True)
     subprocess.run(["git", "config", "user.name", "OMF manual test"], cwd=root, check=True)
@@ -109,7 +96,6 @@ def test_greenfield_model_card_to_compared_candidate(tmp_path):
         for resource in (
             root / "model-packages/example-affine.yaml",
             root / "evaluations/example-affine.yaml",
-            root / "mixes/example-affine.yaml",
         ):
             factory.apply_resource_file(resource)
         factory.add_data(
@@ -246,6 +232,5 @@ def test_source_distribution_contains_the_manual(tmp_path):
         "modules/examples/affine-regression/module.yaml",
         "model-packages/example-affine.yaml",
         "evaluations/example-affine.yaml",
-        "mixes/example-affine.yaml",
         "data/fixtures/affine.jsonl",
     } <= members

@@ -2,25 +2,42 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "x-omf-kind": "Module",
   "type": "object",
-  "required": ["apiVersion", "kind", "metadata", "spec"],
+  "required": [
+    "apiVersion",
+    "kind",
+    "metadata",
+    "spec"
+  ],
   "properties": {
-    "apiVersion": {"const": "omf.dev/v1alpha1"},
-    "kind": {"const": "Module"},
-    "metadata": {"$ref": "#/$defs/metadata"},
+    "apiVersion": {
+      "const": "omf.dev/v1alpha1"
+    },
+    "kind": {
+      "const": "Module"
+    },
+    "metadata": {
+      "$ref": "#/$defs/metadata"
+    },
     "spec": {
       "type": "object",
-      "required": ["contractVersion", "moduleKind", "entryPoint", "contracts", "environment", "lifecycle", "access", "provenance", "fixtures"],
+      "required": [
+        "entryPoint",
+        "environment"
+      ],
       "properties": {
-        "contractVersion": {"const": "omf.module/v1"},
-        "moduleKind": {"type": "string", "minLength": 1},
         "entryPoint": {
           "type": "object",
-          "required": ["command"],
+          "required": [
+            "command"
+          ],
           "properties": {
             "command": {
               "type": "array",
               "minItems": 1,
-              "items": {"type": "string", "minLength": 1}
+              "items": {
+                "type": "string",
+                "minLength": 1
+              }
             },
             "codeRoot": {
               "type": "string",
@@ -32,92 +49,72 @@
         },
         "contracts": {
           "type": "object",
-          "required": ["input", "output", "config", "state"],
           "properties": {
-            "input": {"type": "object", "minProperties": 1},
-            "output": {"type": "object", "minProperties": 1},
-            "config": {"type": "object", "minProperties": 1},
-            "state": {"type": "object", "minProperties": 1}
+            "input": {
+              "type": "object"
+            },
+            "output": {
+              "type": "object"
+            },
+            "config": {
+              "type": "object"
+            },
+            "state": {
+              "type": "object"
+            }
           },
           "additionalProperties": false
         },
         "environment": {
           "type": "object",
-          "required": ["dependencyLock", "dependencyDigest"],
+          "required": [
+            "dependencyLock",
+            "dependencyDigest"
+          ],
           "properties": {
             "dependencyLock": {
               "type": "string",
               "minLength": 1,
               "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.(?:/|$)).+$"
             },
-            "dependencyDigest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"}
+            "dependencyDigest": {
+              "type": "string",
+              "pattern": "^sha256:[0-9a-f]{64}$"
+            }
           },
           "additionalProperties": false
         },
-        "capabilities": {"type": "array", "items": {"type": "string"}, "uniqueItems": true},
-        "platforms": {"type": "array", "items": {"type": "string"}, "uniqueItems": true},
-        "resources": {
-          "type": "object",
-          "properties": {
-            "minimumCpu": {"type": "number", "exclusiveMinimum": 0},
-            "minimumMemoryBytes": {"type": "integer", "minimum": 1},
-            "acceleratorCapabilities": {
-              "type": "array",
-              "items": {"type": "string"},
-              "uniqueItems": true
-            },
-            "minimumStorageBytes": {"type": "integer", "minimum": 1}
-          },
-          "additionalProperties": false
-        },
-        "determinism": {"type": "string"},
-        "lifecycle": {
-          "type": "object",
-          "required": ["checkpoint", "sideEffects", "concurrency"],
-          "properties": {
-            "checkpoint": {"type": "boolean"},
-            "sideEffects": {"type": "array", "items": {"type": "string"}, "uniqueItems": true},
-            "concurrency": {"type": "integer", "minimum": 1}
-          },
-          "additionalProperties": false
-        },
-        "access": {
-          "type": "object",
-          "required": ["secrets", "network"],
-          "properties": {
-            "secrets": {"type": "array", "items": {"type": "string"}, "uniqueItems": true},
-            "network": {"type": "array", "items": {"type": "string"}, "uniqueItems": true}
-          },
-          "additionalProperties": false
-        },
-        "provenance": {
-          "type": "object",
-          "required": ["license"],
-          "properties": {
-            "license": {"type": "string", "minLength": 1},
-            "sourceRef": {"type": "string", "minLength": 1},
-            "buildRef": {"type": "string", "minLength": 1}
-          },
-          "additionalProperties": false
+        "checkpoint": {
+          "type": "boolean"
         },
         "fixtures": {
           "type": "array",
-          "minItems": 1,
           "items": {
             "type": "object",
-            "required": ["request", "result"],
+            "required": [
+              "request",
+              "result"
+            ],
             "properties": {
-              "request": {"type": "object"},
-              "result": {"type": "object"}
+              "request": {
+                "type": "object"
+              },
+              "result": {
+                "type": "object"
+              }
             },
             "additionalProperties": false
           }
         },
-        "extensions": {"$ref": "#/$defs/extension"}
+        "extensions": {
+          "$ref": "#/$defs/extension"
+        }
       },
       "additionalProperties": false
     },
-    "status": {"type": "object"}
+    "status": {
+      "type": "object"
+    }
   },
   "additionalProperties": false
 }

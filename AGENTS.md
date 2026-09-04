@@ -108,6 +108,40 @@ override.
   the example workflow in `manual/`, and release criteria in `ROADMAP.md`.
   Avoid copying detailed capability claims into overview documents.
 
+## Engineering rules
+
+These rules are not preferences. A change that violates one is not done.
+
+- **No toothless unit tests of any kind, ever.** Integration tests and stress
+  tests are permitted so long as they are realistic and never tautological. A
+  test that cannot fail when the behavior it names is broken is worthless.
+- **Never mock anything.** Always run the real full thing if possible. If the
+  real thing cannot run in the test environment, the test is skipped with the
+  reason recorded, not replaced by a fake.
+- **Tautological tests are considered actively harmful.** Asserting that code
+  returns what it was just handed, that a constant equals itself, or that a
+  fake behaves like its script is worse than no test, because it manufactures
+  confidence. This is stated twice on purpose.
+- **Never keep something ceremonially.** A schema no code produces or consumes,
+  a module nothing imports, a command that cannot complete its purpose, or a
+  required manifest field nothing enforces is deleted, not documented.
+- **Keep architecture maximally simple.** Prefer one obvious path over a
+  configurable one. Add abstraction only when a second real use exists.
+- **Deterministic linter rules that reduce cyclomatic complexity run as a hook
+  frequently.** Ruff's `C901`, `PLR0911`, `PLR0912`, and `PLR0915` are enabled
+  in `pyproject.toml`; `.claude/settings.json` runs them after every edit and
+  `make hooks` installs the same check as a Git pre-commit hook.
+- **No comments in the code.** The only documentation of code is
+  `docs/architecture.md`. Docstrings and `#` comments are rejected by
+  `make lint` (`tools/check_no_comments.py`); tool directives such as
+  `# noqa` and `# type: ignore` are the only exception.
+- **Before any PR, audit ruthlessly for cyclomatic complexity.** Run
+  `make lint` and treat every complexity finding as a defect to refactor, not
+  a threshold to raise.
+- **Before any PR, review the whole change with a subagent** when the harness
+  provides one, and ask it to ruthlessly reduce lines of code without losing
+  functionality. Apply what survives your own reading.
+
 ## Development and verification
 
 Use Python 3.11 or 3.12. Install the locked dependencies and editable package:

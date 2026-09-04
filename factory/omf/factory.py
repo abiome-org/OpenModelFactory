@@ -49,7 +49,6 @@ from omf.executors import (
     ResolvedExecutor,
     default_executor_registry,
 )
-from omf.federation import FederationBroker
 from omf.ids import uuid7
 from omf.lineage import LineageEdge, LineageStore
 from omf.modules import (
@@ -60,7 +59,6 @@ from omf.modules import (
     package_module,
     validate_contract,
     validate_contract_schema,
-    validate_fixtures,
     worktree_state,
 )
 from omf.operations import OperationStore
@@ -73,7 +71,6 @@ from omf.stores.base import ArtifactStore
 from omf.stores.filesystem import FilesystemStore
 from omf.stores.s3 import S3Store
 from omf.sync import SyncEngine
-from omf.telemetry import TelemetrySink
 from omf.workloads import (
     RunState,
     Stage,
@@ -136,6 +133,9 @@ def _execution_plan_digest(
     )
 
 
+MODULE_EXECUTION_CAPABILITIES = MODULE_PROTOCOL_CAPABILITIES | frozenset({"isolation:network-deny"})
+
+
 class Factory:
     """One authenticated application boundary shared by CLI and HTTP interfaces."""
 
@@ -174,12 +174,10 @@ class Factory:
         )
         self.local_token_id = local_principal.token_id
         self.events = EventStore(self.db, self.identity)
-        self.federation = FederationBroker(self.identity, database=self.db)
         self.resources = ResourceRepository(self.db)
         self.lineage = LineageStore(self.db)
         self.operations = OperationStore(self.db)
         self.local_store = FilesystemStore(paths.store)
-        self.telemetry = TelemetrySink(paths.telemetry)
         self.executors = executors or default_executor_registry()
         self._policy_cache: tuple[tuple[tuple[str, int, int], ...], ProjectPolicy] | None = None
         self.agent = AgentControl(self)
@@ -434,9 +432,25 @@ class Factory:
                 f"{self.namespace!r}"
             )
 
+    def _stamp_namespace(self, value: dict[str, Any]) -> dict[str, Any]:
+        metadata = value.get("metadata")
+        if isinstance(metadata, dict):
+            metadata.setdefault("namespace", self.namespace)
+        return value
+
+    def _load_resource(self, path: str | Path, *, kind: str | None = None) -> dict[str, Any]:
+        value = load_document(Path(path).read_bytes())
+        if not isinstance(value, dict):
+            raise ValidationError(f"{Path(path).name} must contain one resource object")
+        self._stamp_namespace(value)
+        if kind is not None:
+            default_registry.validate_as(value, kind)
+        return value
+
     def apply_resource(self, value: dict[str, Any], *, _system: bool = False) -> dict[str, Any]:
         if not _system:
             self._authorize("resource.apply")
+        value = self._stamp_namespace(deepcopy(value))
         metadata = value.get("metadata", {})
         existing = [
             resource
@@ -515,10 +529,7 @@ class Factory:
         )
 
     def apply_resource_file(self, path: str | Path) -> dict[str, Any]:
-        value = load_document(Path(path).read_bytes())
-        if not isinstance(value, dict):
-            raise ValidationError("resource file must contain one object")
-        return self.apply_resource(value)
+        return self.apply_resource(self._load_resource(path))
 
     def list_resources(self, *, kind: str | None = None) -> list[dict[str, Any]]:
         return self.resources.list(kind=kind)
@@ -799,7 +810,6 @@ class Factory:
         )
         return {
             "valid": True,
-            "kind": manifest.kind,
             "codeRoot": str(code_root.relative_to(self.paths.root)),
             "packageDigest": package_digest,
             "artifactManifest": artifact_digest,
@@ -809,7 +819,6 @@ class Factory:
                 "size": len(manifest.dependency_contents),
             },
             "fixtures": len(manifest.fixtures),
-            "capabilities": sorted(manifest.capabilities),
         }
 
     def _capture_module_source(
@@ -817,7 +826,6 @@ class Factory:
     ) -> tuple[ModuleManifest, Path, str, str]:
         manifest_path = Path(manifest_path).resolve()
         manifest, code_root = load_manifest(manifest_path, self.paths.root)
-        validate_fixtures(manifest)
         with tempfile.NamedTemporaryFile(
             dir=self.paths.packages, suffix=".tar", delete=False
         ) as temporary:
@@ -829,8 +837,7 @@ class Factory:
                 bundle_root = extract_module_package(package_path, extract_to)
                 manifest_resource_path = bundle_root / "module.yaml"
                 manifest, code_root = load_manifest(manifest_resource_path, bundle_root)
-                validate_fixtures(manifest)
-            module_resource = default_registry.load(manifest_resource_path)
+            module_resource = self._load_resource(manifest_resource_path, kind="Module")
             module_digest = sha256_digest(
                 {
                     "apiVersion": module_resource["apiVersion"],
@@ -862,7 +869,6 @@ class Factory:
         self, manifest_path: str | Path, *, binding_path: str | Path | None = None
     ) -> dict[str, Any]:
         manifest, code_root = load_manifest(manifest_path, self.paths.root)
-        validate_fixtures(manifest)
         if binding_path is None:
             resolved = self._resolve_executor(
                 "local",
@@ -870,22 +876,18 @@ class Factory:
                 {},
             )
         else:
-            binding_file = self._project_file(binding_path, kind="binding")
-            binding = load_document(binding_file.read_bytes())
-            if not isinstance(binding, dict):
-                raise ValidationError("binding must be an object")
-            default_registry.validate_as(binding, "Binding")
+            binding = self._load_resource(
+                self._project_file(binding_path, kind="binding"), kind="Binding"
+            )
             self._validate_namespace(binding)
             resolved = self._resolve_executor(
                 str(binding["spec"]["executor"]), binding, self._executor_config(binding)
             )
-        self._require_executor(
-            resolved,
-            MODULE_PROTOCOL_CAPABILITIES
-            | (frozenset({"isolation:network-deny"}) if not manifest.network else frozenset()),
-        )
+        self._require_executor(resolved, MODULE_EXECUTION_CAPABILITIES)
         environment = self._prepare_module_environment(resolved.executor, manifest, code_root)
-        fixtures = manifest.fixtures
+        fixtures = manifest.fixtures or [
+            {"request": {"operation": "validate"}, "result": {"status": "ok"}}
+        ]
         results = []
         for index, fixture in enumerate(fixtures):
             request = dict(fixture["request"])
@@ -937,9 +939,7 @@ class Factory:
             argv=argv,
             run_dir=run_dir,
             cwd=code_root,
-            resources=manifest.resources,
-            timeout=float(manifest.resources.get("timeout_seconds", 0)) or None,
-            deny_network=not manifest.network,
+            deny_network=True,
             requires_result=True,
             environment=environment,
             **executor_config,
@@ -1024,10 +1024,7 @@ class Factory:
         config = spec.get("config", {}) if isinstance(spec, dict) else {}
         if not isinstance(config, dict):
             raise ValidationError("declaration spec.config must be an object")
-        options = config.get("executor", {})
-        if not isinstance(options, dict):
-            raise ValidationError("spec.config.executor must be an object")
-        return dict(options)
+        return dict(config)
 
     @staticmethod
     def _prepare_module_environment(
@@ -1037,7 +1034,7 @@ class Factory:
             argv=manifest.argv,
             cwd=code_root,
             dependency=dependency_lock(manifest),
-            deny_network=not manifest.network,
+            deny_network=True,
         )
         if not isinstance(environment, dict):
             raise IntegrityError("executor environment descriptor must be an object")
@@ -1089,24 +1086,6 @@ class Factory:
             ],
         )
 
-    def _module_requirements(self, stages: list[Stage]) -> frozenset[str]:
-        manifests: list[ModuleManifest] = []
-        for stage in stages:
-            module_path = Path(stage.module)
-            if not module_path.is_absolute():
-                module_path = self.paths.root / module_path
-            manifest, _code_root = load_manifest(module_path, self.paths.root)
-            validate_fixtures(manifest)
-            manifests.append(manifest)
-        return self._manifest_requirements(manifests)
-
-    @staticmethod
-    def _manifest_requirements(manifests: list[ModuleManifest]) -> frozenset[str]:
-        required = set(MODULE_PROTOCOL_CAPABILITIES)
-        if any(not manifest.network for manifest in manifests):
-            required.add("isolation:network-deny")
-        return frozenset(required)
-
     def _admit_module_environments(
         self, stages: list[Stage], resolved: ResolvedExecutor
     ) -> dict[str, tuple[ModuleManifest, Path, dict[str, Any]]]:
@@ -1116,7 +1095,6 @@ class Factory:
             if not module_path.is_absolute():
                 module_path = self.paths.root / module_path
             manifest, code_root = load_manifest(module_path, self.paths.root)
-            validate_fixtures(manifest)
             environment = self._prepare_module_environment(resolved.executor, manifest, code_root)
             admitted[stage.name] = (manifest, code_root, environment)
         return admitted
@@ -1143,18 +1121,13 @@ class Factory:
         *,
         workload_path: str | Path | None = None,
     ) -> dict[str, Any]:
-        binding_file = self._project_file(binding_path, kind="binding")
-        binding = load_document(binding_file.read_bytes())
-        if not isinstance(binding, dict):
-            raise ValidationError("binding must be an object")
-        default_registry.validate_as(binding, "Binding")
+        binding = self._load_resource(
+            self._project_file(binding_path, kind="binding"), kind="Binding"
+        )
         self._validate_namespace(binding)
         required = MODULE_PROTOCOL_CAPABILITIES
         if workload_path is not None:
-            workload_file = self._project_file(workload_path, kind="workload")
-            workload = load_document(workload_file.read_bytes())
-            if not isinstance(workload, dict):
-                raise ValidationError("workload must be an object")
+            workload = self._load_resource(self._project_file(workload_path, kind="workload"))
             admitted = project_workload(workload)
             self._validate_namespace(workload)
             execution_stages = [*admitted.stages]
@@ -1162,7 +1135,7 @@ class Factory:
                 model_package = self._pin_model_package(admitted.model_package_ref, admitted.stages)
                 assert model_package is not None
                 execution_stages.append(self._inference_adapter_stage(model_package))
-            required = self._module_requirements(execution_stages)
+            required = MODULE_EXECUTION_CAPABILITIES
         name = str(binding["spec"]["executor"])
         resolved = self._resolve_executor(name, binding, self._executor_config(binding))
         report = self.executors.preflight(resolved, required_capabilities=required)
@@ -1180,13 +1153,10 @@ class Factory:
         self._authorize("workload.run")
         workload = self._project_file(workload_path, kind="workload")
         binding = self._project_file(binding_path, kind="binding")
-        workload_raw = load_document(workload.read_bytes())
-        binding_raw = load_document(binding.read_bytes())
-        if not isinstance(workload_raw, dict) or not isinstance(binding_raw, dict):
-            raise ValidationError("workload and binding must be objects")
+        workload_raw = self._load_resource(workload)
+        binding_raw = self._load_resource(binding, kind="Binding")
         admitted = project_workload(workload_raw)
         stages = admitted.stages
-        default_registry.validate_as(binding_raw, "Binding")
         self._validate_namespace(workload_raw)
         self._validate_namespace(binding_raw)
         model_package = self._pin_model_package(admitted.model_package_ref, stages)
@@ -1198,19 +1168,17 @@ class Factory:
             binding_raw,
             self._executor_config(binding_raw),
         )
-        self._require_executor(resolved, self._module_requirements(execution_stages))
+        self._require_executor(resolved, MODULE_EXECUTION_CAPABILITIES)
         self._admit_module_environments(execution_stages, resolved)
         pinned_inputs = self._pin_stage_inputs(stages)
         pinned_references = self._pin_reference_inputs(stages)
         evaluation_specs = self._pin_named_resources(
             admitted.evaluation_refs, "evaluationspec/", "EvaluationSpec"
         )
-        mix = self._pin_mix(admitted.mix_ref, pinned_inputs)
         module_packages: dict[str, str] = {}
         for stage in stages:
             module_path = self._project_file(stage.module, kind="module")
-            manifest, _code_root = load_manifest(module_path, self.paths.root)
-            validate_fixtures(manifest)
+            load_manifest(module_path, self.paths.root)
             with tempfile.NamedTemporaryFile(dir=self.paths.packages, suffix=".tar") as package:
                 module_packages[stage.name] = package_module(module_path.parent, package.name)
         adapter_packages: dict[str, str] = {}
@@ -1245,7 +1213,6 @@ class Factory:
                     "evaluationSpecs": [
                         self._resource_uri(resource) for resource in evaluation_specs
                     ],
-                    "mix": self._resource_uri(mix) if mix is not None else None,
                 },
             },
             operation_id=operation_id,
@@ -1254,19 +1221,16 @@ class Factory:
     def _verify_run_request(self, request: dict[str, Any]) -> None:
         workload_path = self.paths.root / request["workload"]
         binding_path = self.paths.root / request["binding"]
-        workload_raw = load_document(workload_path.read_bytes())
-        binding_raw = load_document(binding_path.read_bytes())
+        workload_raw = self._load_resource(workload_path)
+        binding_raw = self._load_resource(binding_path)
         if (
             sha256_digest(workload_raw) != request["workloadDigest"]
             or sha256_digest(binding_raw) != request["bindingDigest"]
         ):
             raise IntegrityError("queued run desired state changed before admission")
-        if not isinstance(workload_raw, dict):
-            raise ValidationError("queued workload must be an object")
         for stage in project_workload(workload_raw).stages:
             module_path = self._project_file(stage.module, kind="module")
-            manifest, _code_root = load_manifest(module_path, self.paths.root)
-            validate_fixtures(manifest)
+            load_manifest(module_path, self.paths.root)
             with tempfile.NamedTemporaryFile(dir=self.paths.packages, suffix=".tar") as package:
                 digest = package_module(module_path.parent, package.name)
             if digest != request["modulePackages"].get(stage.name):
@@ -1482,7 +1446,6 @@ class Factory:
             "workloadDigest": admission["workloadDigest"],
             "bindingDigest": extensions["bindingDigest"],
             "resultRef": self._resource_uri(run_result),
-            "reproducibility": extensions["reproducibility"],
         }
         self.lineage.add(
             LineageEdge(
@@ -1550,10 +1513,8 @@ class Factory:
         else:
             workload_file = self._project_file(workload_path, kind="workload")
             binding_file = self._project_file(binding_path, kind="binding")
-            workload_raw = load_document(workload_file.read_bytes())
-            binding_raw = load_document(binding_file.read_bytes())
-            if not isinstance(workload_raw, dict) or not isinstance(binding_raw, dict):
-                raise ValidationError("workload and binding must be objects")
+            workload_raw = self._load_resource(workload_file)
+            binding_raw = self._load_resource(binding_file)
             if (
                 sha256_digest(workload_raw) != expected_workload_digest
                 or sha256_digest(binding_raw) != expected_binding_digest
@@ -1593,7 +1554,7 @@ class Factory:
         )
         initial_admission = None
         if not recovering:
-            self._require_executor(resolved_executor, self._module_requirements(execution_stages))
+            self._require_executor(resolved_executor, MODULE_EXECUTION_CAPABILITIES)
             initial_admission = self._admit_module_environments(execution_stages, resolved_executor)
         evaluation_specs = self._pin_named_resources(
             admitted.evaluation_refs,
@@ -1609,7 +1570,6 @@ class Factory:
             metric_names
         ):
             raise ValidationError("evaluation metric names must be unique and not reserved")
-        mix = self._pin_mix(admitted.mix_ref, pinned_inputs, expected_resources["mix"])
         if not recovering:
             workload_resource = self.apply_resource(workload_raw)
             binding_resource = self.apply_resource(binding_raw)
@@ -1684,10 +1644,7 @@ class Factory:
                 )
             )
         if recovering:
-            self._require_executor(
-                resolved_executor,
-                self._manifest_requirements([source[2] for source in captured_sources]),
-            )
+            self._require_executor(resolved_executor, MODULE_EXECUTION_CAPABILITIES)
         for (
             stage,
             is_inference,
@@ -1733,7 +1690,6 @@ class Factory:
                     self._resource_uri(model_package) if model_package is not None else None
                 ),
                 "evaluation_refs": [self._resource_uri(item) for item in evaluation_specs],
-                "mix_ref": self._resource_uri(mix) if mix is not None else None,
             },
         )
         state_store = StateStore(run_dir / "state.json")
@@ -1789,11 +1745,9 @@ class Factory:
                                 "worktree": worktree,
                                 "modelPackageRef": spec.model_package_ref,
                                 "evaluationRefs": spec.evaluation_refs,
-                                "mixRef": spec.mix_ref,
                                 "moduleDigests": spec.module_digests,
                                 "environments": spec.environments,
                                 "inferenceAdapter": inference_evidence,
-                                "reproducibility": spec.reproducibility,
                             },
                         },
                     },
@@ -1921,10 +1875,6 @@ class Factory:
                         "module-state": artifact,
                         "protocol-state": state_artifact,
                     }
-                    checkpoint_replay = {
-                        "status": "not-claimed",
-                        "reason": "sampler-state-not-observed",
-                    }
                     checkpoint_manifest = AtomicCheckpointPublisher(self.local_store).publish(
                         checkpoint_components,
                         {
@@ -1933,7 +1883,6 @@ class Factory:
                             "module": module_digest,
                             "environment": environment["digest"],
                         },
-                        checkpoint_replay,
                     )
                     artifact_digest = checkpoint_manifest.manifest_digest
                     checkpoint = self.apply_resource(
@@ -1951,7 +1900,6 @@ class Factory:
                                     role: component.manifest_digest
                                     for role, component in checkpoint_components.items()
                                 },
-                                "replay": checkpoint_replay,
                                 "extensions": {"stage": stage.name},
                             },
                         },
@@ -2065,7 +2013,6 @@ class Factory:
             "workloadDigest": spec.digest,
             "bindingDigest": spec.binding_digest,
             "resultRef": self._resource_uri(run_result),
-            "reproducibility": spec.reproducibility,
         }
 
     def _pin_stage_inputs(
@@ -2153,9 +2100,6 @@ class Factory:
                 raise ValidationError(
                     f"model package {name} contract must describe an object for omf.module/v1"
                 )
-        validate_contract_schema(package_spec["architecture"]["parameterSchema"], "parameters")
-        if package_spec["adapters"].get("optimized"):
-            raise ValidationError("optimized model adapters are not executable by this factory")
         for vector in package_spec["compatibilityVectors"]:
             validate_contract(signatures["input"], vector["inputs"], "model package input")
             validate_contract(signatures["output"], vector["expected"], "model package output")
@@ -2186,25 +2130,14 @@ class Factory:
                 "ModelPackage trainingReference does not match the workload stage"
             )
         inference = adapters["inferenceReference"]
-        if "module" not in inference:
-            raise ValidationError(
-                "legacy stage-based inference adapter is ineligible; apply a ModelPackage "
-                "revision with inferenceReference.module"
-            )
         inference_module = portable_relative_path(inference["module"], "inference adapter")
         training_module = portable_relative_path(training_stage.module, "training adapter")
         if inference_module == training_module:
             raise ValidationError("ModelPackage inferenceReference must use an independent module")
         if validate_source:
             inference_path = self._project_file(str(inference_module), kind="inference adapter")
-            inference_manifest, _code_root = load_manifest(inference_path, self.paths.root)
-            validate_fixtures(inference_manifest)
-        state_output = inference.get("stateOutput")
-        if not state_output or "." not in state_output:
-            raise ValidationError(
-                "ModelPackage inferenceReference requires stage.output stateOutput"
-            )
-        stage_name, output_name = state_output.split(".", 1)
+            load_manifest(inference_path, self.paths.root)
+        stage_name, _, output_name = inference["stateOutput"].partition(".")
         if stage_name not in stage_outputs or output_name not in stage_outputs[stage_name]:
             raise ValidationError("ModelPackage stateOutput is not declared by the workload")
         return resource
@@ -2238,29 +2171,6 @@ class Factory:
                 else self.find_resource(kind, reference.removeprefix(prefix))
             )
         return resources
-
-    def _pin_mix(
-        self,
-        reference: str | None,
-        pinned_inputs: dict[str, dict[str, Any]],
-        expected_revision: str | None = None,
-    ) -> dict[str, Any] | None:
-        if reference is None:
-            if expected_revision is not None:
-                raise IntegrityError("queued MixSpec does not match the workload")
-            return None
-        resources = self._pin_named_resources(
-            [reference],
-            "mixspec/",
-            "MixSpec",
-            [expected_revision] if expected_revision is not None else None,
-        )
-        mix = resources[0]
-        for source in mix["spec"]["sources"]:
-            dataset_ref = source.get("datasetRef")
-            if dataset_ref not in pinned_inputs:
-                raise ValidationError("MixSpec source is not an admitted workload dataset input")
-        return mix
 
     @staticmethod
     def _resolve_output_reference(
@@ -2527,6 +2437,61 @@ class Factory:
             dedupe_revision=True,
         )
 
+    def _status_state(self, uid: str) -> str | None:
+        try:
+            return str(self.resources.get_status(uid)[0].get("state"))
+        except NotFoundError:
+            return None
+
+    def list_runs(self) -> list[dict[str, Any]]:
+        return [
+            {
+                "runId": resource["spec"]["runId"],
+                "state": self._status_state(resource["metadata"]["uid"]),
+                "workload": resource["spec"]["workloadRef"],
+                "createdAt": resource["metadata"]["createdAt"],
+            }
+            for resource in self.resources.latest(kind="Run")
+        ]
+
+    def _release_aliases(self, release: dict[str, Any]) -> list[str]:
+        metadata = release["metadata"]
+        return [
+            alias["name"]
+            for alias in AliasRepository(self.db).list()
+            if alias["uid"] == metadata["uid"] and alias["revision"] == metadata["revision"]
+        ]
+
+    def list_releases(self) -> list[dict[str, Any]]:
+        return [
+            {
+                "name": release["metadata"]["name"],
+                "revision": release["metadata"]["revision"],
+                "promotion": release["spec"]
+                .get("extensions", {})
+                .get("promotionDecision", {})
+                .get("outcome"),
+                "aliases": self._release_aliases(release),
+                "createdAt": release["metadata"]["createdAt"],
+            }
+            for release in self.resources.latest(kind="Release")
+        ]
+
+    def show_release(self, name: str) -> dict[str, Any]:
+        release = self.find_resource("Release", name)
+        return {"release": release, "aliases": self._release_aliases(release)}
+
+    def list_deployments(self) -> list[dict[str, Any]]:
+        return [
+            {
+                "name": resource["metadata"]["name"],
+                "release": resource["spec"]["releaseRef"],
+                "state": self._status_state(resource["metadata"]["uid"]),
+                "revision": resource["metadata"]["revision"],
+            }
+            for resource in self.resources.latest(kind="DeploymentSpec")
+        ]
+
     def run_status(self, run_id: str) -> dict[str, Any]:
         status, version = self.resources.get_status(run_id)
         state_path = self.paths.runs / run_id / "state.json"
@@ -2631,11 +2596,7 @@ class Factory:
             ArtifactBuilder(self.local_store).restore(source_manifest, archive)
             code_root = extract_module_package(archive / "payload", temporary / "source")
             manifest, code_root = load_manifest(code_root / "module.yaml", code_root)
-            self._require_executor(
-                resolved,
-                MODULE_PROTOCOL_CAPABILITIES
-                | (frozenset({"isolation:network-deny"}) if not manifest.network else frozenset()),
-            )
+            self._require_executor(resolved, MODULE_EXECUTION_CAPABILITIES)
             environment = self._prepare_module_environment(resolved.executor, manifest, code_root)
             if environment["digest"] != adapter_admission["environment"]["digest"]:
                 raise IntegrityError("compatibility adapter environment differs from run admission")
@@ -3080,8 +3041,8 @@ class Factory:
     ) -> dict[str, Any]:
         if direction not in {"maximize", "minimize"}:
             raise ValidationError("experiment direction must be maximize or minimize")
-        baseline = self._resource_by_uri("EvaluationResult", baseline_ref)
-        candidate = self._resource_by_uri("EvaluationResult", candidate_ref)
+        baseline = self._evaluation_result(baseline_ref)
+        candidate = self._evaluation_result(candidate_ref)
         baseline_evaluations = baseline["spec"].get("extensions", {}).get("evaluationRefs", [])
         candidate_evaluations = candidate["spec"].get("extensions", {}).get("evaluationRefs", [])
         if baseline_evaluations != candidate_evaluations:
@@ -3116,8 +3077,8 @@ class Factory:
                 "kind": "Experiment",
                 "metadata": {"name": name, "namespace": self.namespace},
                 "spec": {
-                    "baselineRef": baseline_ref,
-                    "candidateRef": candidate_ref,
+                    "baselineRef": self._resource_uri(baseline),
+                    "candidateRef": self._resource_uri(candidate),
                     "evaluationRefs": baseline_evaluations,
                     "metric": metric,
                     "direction": direction,
@@ -3128,6 +3089,13 @@ class Factory:
             },
             _system=True,
         )
+
+    def _evaluation_result(self, reference: str) -> dict[str, Any]:
+        if reference.startswith("omf://"):
+            return self._resource_by_uri("EvaluationResult", reference)
+        if reference.startswith("run/"):
+            return self.find_resource("EvaluationResult", f"evaluation-{reference[4:]}")
+        return self.find_resource("EvaluationResult", reference)
 
     def _load_vulnerability_report(
         self, report_path: str | Path | None, required_subjects: set[str]
@@ -3252,10 +3220,7 @@ class Factory:
     def deploy(self, deployment_path: str | Path) -> dict[str, Any]:
         """Apply a deployment resource through its explicitly selected executor provider."""
         self._authorize("deployment.apply")
-        raw = load_document(Path(deployment_path).read_bytes())
-        if not isinstance(raw, dict):
-            raise ValidationError("deployment file must contain one resource")
-        default_registry.validate(raw)
+        raw = self._load_resource(deployment_path, kind="DeploymentSpec")
         release_name = str(raw["spec"]["releaseRef"]).removeprefix("release/")
         release = self.find_resource("Release", release_name)
         release_extensions = release["spec"].get("extensions", {})
@@ -3395,15 +3360,7 @@ class Factory:
         code_root = extract_module_package(archive / "payload", run_dir / "adapter")
         adapter_manifest, code_root = load_manifest(code_root / "module.yaml", code_root)
         resolved = self._deployment_executor(resource)
-        self._require_executor(
-            resolved,
-            MODULE_PROTOCOL_CAPABILITIES
-            | (
-                frozenset({"isolation:network-deny"})
-                if not adapter_manifest.network
-                else frozenset()
-            ),
-        )
+        self._require_executor(resolved, MODULE_EXECUTION_CAPABILITIES)
         environment = self._prepare_module_environment(
             resolved.executor, adapter_manifest, code_root
         )

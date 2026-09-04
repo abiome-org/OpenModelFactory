@@ -52,8 +52,8 @@ built-in server does not provide TLS or mutual workload authentication. The
 initial operator credential is an all-scope local token; obtain it through an
 authorized operator workflow, not logs or Git. Create expiring least-privilege
 credentials tied to a named actor with
-`omf token create --actor <identity> --scope read`. Revoke them with
-`omf token revoke <token-id>`. Token values are stored only as hashes and are
+`omf admin token create --actor <identity> --scope read`. Revoke them with
+`omf admin token revoke <token-id>`. Token values are stored only as hashes and are
 returned once at creation.
 
 For direct service operation:
@@ -97,7 +97,7 @@ Create one verified archive containing metadata, signing and encryption keys,
 encrypted secrets, and every local content-addressed artifact:
 
 ```sh
-omf backup /secure-backups/factory-$(date +%Y%m%d).omf-backup
+omf admin backup /secure-backups/factory-$(date +%Y%m%d).omf-backup
 ```
 
 The archive contains sensitive key material and is created with mode `0600`.
@@ -107,14 +107,14 @@ separate trusted location.
 Restore into a checkout with the same `omf.yaml` and no `.omf` directory:
 
 ```sh
-omf restore /secure-backups/factory-20260903.omf-backup \
+omf admin restore /secure-backups/factory-20260903.omf-backup \
   --expected-key-id sha256:<recorded-key-id>
 omf doctor
 ```
 
 1. stop writers;
 2. retain the failed `.omf` directory for forensics;
-3. run `omf restore` with the separately recorded key ID;
+3. run `omf admin restore` with the separately recorded key ID;
 4. reconnect any external artifact stores;
 5. run `omf doctor`, verify dataset snapshots, list active goals/knowledge, and
    inspect signed event tails;
@@ -132,7 +132,7 @@ Store credentials as an encrypted JSON secret with purpose
 `verify`.
 
 ```sh
-omf secret set primary \
+omf admin secret set primary \
   --purpose artifact-store-credentials \
   --value '{"aws_access_key_id":"…","aws_secret_access_key":"…"}'
 omf store add primary --driver s3 --endpoint s3://bucket/prefix --secret-ref primary

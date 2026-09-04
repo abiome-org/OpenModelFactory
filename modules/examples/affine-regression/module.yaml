@@ -2,45 +2,10 @@ apiVersion: omf.dev/v1alpha1
 kind: Module
 metadata:
   name: affine-regression
-  namespace: omf/examples
 spec:
-  contractVersion: omf.module/v1
-  moduleKind: trainer
   entryPoint:
     command: [python3, main.py]
-    codeRoot: .
-  contracts:
-    input:
-      type: object
-      additionalProperties: true
-    output:
-      type: object
-      additionalProperties: true
-    config:
-      type: object
-      additionalProperties: true
-    state:
-      type: object
-      additionalProperties: true
   environment:
     dependencyLock: requirements.lock
     dependencyDigest: sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
-  capabilities: []
-  platforms: []
-  resources: {}
-  determinism: numerical
-  lifecycle:
-    checkpoint: true
-    sideEffects: [declared-artifact-write]
-    concurrency: 1
-  access:
-    secrets: []
-    network: []
-  provenance:
-    license: Apache-2.0
-    sourceRef: repository:modules/examples/affine-regression
-  fixtures:
-    - request:
-        operation: validate
-      result:
-        status: ok
+  checkpoint: true

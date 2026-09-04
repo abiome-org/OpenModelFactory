@@ -1,7 +1,6 @@
 import hashlib
 import json
 import os
-import shutil
 import subprocess
 import sys
 import time
@@ -13,36 +12,14 @@ import pytest
 from omf.errors import CapabilityError, ConfigurationError, IntegrityError, ValidationError
 from omf.executors import EXECUTOR_API_VERSION, ExecutorContext, ExecutorProvider, ExecutorRegistry
 from omf.executors.base import DependencyLock
-from omf.executors.kubernetes import KubernetesExecutor
 from omf.executors.local import LocalExecutor
 from omf.executors.registry import default_executor_registry
-from omf.executors.slurm import SlurmExecutor
-
-
-def test_deterministic_plans_and_preflight(tmp_path, monkeypatch):
-    slurm = SlurmExecutor()
-    args = {
-        "argv": ["echo", "a b"],
-        "run_dir": tmp_path,
-        "cwd": tmp_path,
-        "resources": {"nodes": 2},
-    }
-    assert slurm.plan(**args).metadata == slurm.plan(**args).metadata
-    monkeypatch.setattr(shutil, "which", lambda _: None)
-    assert len(slurm.preflight()) == 3
-    kube = KubernetesExecutor()
-    with pytest.raises(ValueError, match="immutable"):
-        kube.plan(argv=["x"], run_dir=tmp_path, cwd=tmp_path, image="latest")
 
 
 def test_executor_registry_catalog_duplicates_unknown_and_discovery(tmp_path, monkeypatch):
     registry = default_executor_registry(discover=False)
     catalog = registry.catalog()
-    assert [item["name"] for item in catalog["providers"]] == [
-        "kubernetes",
-        "local",
-        "slurm",
-    ]
+    assert [item["name"] for item in catalog["providers"]] == ["local"]
     with pytest.raises(ConfigurationError, match="duplicate"):
         registry.register(
             ExecutorProvider("local", EXECUTOR_API_VERSION, lambda _context: LocalExecutor()),
@@ -122,7 +99,7 @@ def test_executor_registry_rejects_invalid_plugins_and_controller_fields(tmp_pat
 
     builtins = default_executor_registry(discover=False)
     with pytest.raises(ValidationError, match="provider contract"):
-        builtins.resolve("kubernetes", config={"typo": True}, **resolve)
+        builtins.resolve("local", config={"typo": True}, **resolve)
 
     invalid_executor = ExecutorRegistry()
     invalid_executor.register(
@@ -339,13 +316,12 @@ def test_local_executor_recovers_a_completed_launch_before_pid_persistence(tmp_p
 
 
 def test_local_executor_enforces_timeout_without_controller_and_records_plain_command(tmp_path):
-    executor = LocalExecutor()
+    executor = LocalExecutor(limits={"timeoutSeconds": 0.1})
     timed = executor.submit(
         executor.plan(
             argv=["python3", "-c", "import time; time.sleep(30)"],
             run_dir=tmp_path / "timed",
             cwd=tmp_path,
-            timeout=0.1,
             requires_result=False,
         )
     )
@@ -631,117 +607,29 @@ def test_local_executor_bounds_log_files_without_limiting_artifacts(tmp_path):
     )
 
 
-def test_builtin_preflight_rejects_unconsumed_binding_values():
-    local = LocalExecutor(
-        binding_resources={"cpu": 2, "memory": "1Gi", "accelerators": ["gpu"], "typo": 1},
-        binding_spec={
-            "placement": {"zone": "x"},
-            "transport": {"kind": "x"},
-            "extensions": {"x": True},
-            "config": {
-                "executor": {},
-                "stores": {"artifacts": "remote"},
-                "isolation": {"driver": "none"},
-                "recovery": {"attempts": 2},
-                "typo": True,
-            },
-        },
-    )
-    issues = local.preflight()
-    assert len(issues) >= 8
-
-    slurm = SlurmExecutor(
-        shared_filesystem=True,
-        binding_resources={"nodes": 0, "gpus": True, "unknown": 1},
-        placement={"partition": "", "unknown": "x"},
-        binding_spec={"transport": {"x": True}, "extensions": {"x": True}, "config": "bad"},
-    )
-    issues = slurm.preflight()
-    assert any("positive integer" in issue for issue in issues)
-    assert any("non-empty string" in issue for issue in issues)
-
-
-def test_slurm_and_kubernetes_adapter_lifecycle(tmp_path, monkeypatch):
-    calls = []
-
-    def run(argv, **kwargs):
-        calls.append(argv)
-        if argv[0] == "sbatch":
-            return SimpleNamespace(stdout="42;cluster\n", returncode=0, stderr=b"")
-        if argv[0] == "sacct":
-            return SimpleNamespace(stdout="COMPLETED\n", returncode=0, stderr=b"")
-        if "cluster-info" in argv:
-            return SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
-        if "get" in argv:
-            return SimpleNamespace(stdout='{"status":{"succeeded":1}}', returncode=0, stderr=b"")
-        if "logs" in argv:
-            return SimpleNamespace(returncode=0, stdout=b"out", stderr=b"err")
-        return SimpleNamespace(returncode=0, stdout="", stderr=b"")
-
-    monkeypatch.setattr("omf.executors.slurm.subprocess.run", run)
-    monkeypatch.setattr("omf.executors.kubernetes.subprocess.run", run)
-    monkeypatch.setattr(shutil, "which", lambda _name: "/usr/bin/tool")
-    slurm = SlurmExecutor()
-    slurm_plan = slurm.plan(
-        argv=["python3", "train.py"],
-        run_dir=tmp_path / "slurm",
-        cwd=tmp_path,
-        resources={"nodes": 2, "tasks": 8, "gpus": 8},
-    )
-    assert slurm.submit(slurm_plan) == "42"
-    assert slurm.status("42").state == "succeeded"
-    slurm.cancel("42")
-    assert slurm.logs("42")[0].name == "slurm-42.out"
-
-    image = "registry/model@sha256:" + "a" * 64
-    kube = KubernetesExecutor(context="site")
-    assert kube.preflight() == []
-    plan = kube.plan(
-        argv=["python3", "train.py"],
-        run_dir=tmp_path / "kube",
-        cwd=tmp_path,
-        image=image,
-        name="training",
-    )
-    assert kube.submit(plan) == "training"
-    assert kube.status("training").state == "succeeded"
-    assert kube.logs("training")[0].read_bytes() == b"out"
-    kube.cancel("training")
-    jobset = kube.plan(
-        argv=["ignored"],
-        run_dir=tmp_path / "jobset",
-        cwd=tmp_path,
-        image=image,
-        roles=[{"name": "trainer"}],
-    )
-    assert jobset.metadata["resource"]["kind"] == "JobSet"
-
-
-def test_slurm_module_transport_plan_is_explicit(tmp_path):
-    executor = SlurmExecutor(
-        shared_filesystem=True,
-        binding_resources={"gpus": 4},
-        placement={"partition": "gpu"},
-    )
-    plan = executor.plan(
-        argv=["python3", "train.py"],
-        run_dir=tmp_path / "run",
-        cwd=tmp_path,
-        timeout=61,
-        requires_result=True,
-    )
-    script = plan.metadata["script"]
-    assert script.index("#SBATCH --gpus=4") < script.index("set -eu")
-    assert "#SBATCH --partition='gpu'" in script
-    assert "#SBATCH --time=2" in script
-    assert "OMF_REQUEST_FILE" in script
-    assert "OMF_RESULT_FILE" in script
-    assert "protocol:omf.module/v1" in executor.capabilities
-    executor.attach("42", tmp_path / "run")
-
-    with pytest.raises(RuntimeError, match="shared filesystem"):
-        SlurmExecutor().plan(
-            argv=["x"], run_dir=tmp_path / "missing", cwd=tmp_path, requires_result=True
+def test_local_executor_applies_binding_resource_limits(tmp_path):
+    assert LocalExecutor(limits={"gpus": 1}).preflight() == [
+        "unsupported local resource limits: gpus"
+    ]
+    executor = LocalExecutor(limits={"addressSpaceBytes": 64 * 1024 * 1024})
+    assert executor.preflight() == []
+    hungry = executor.submit(
+        executor.plan(
+            argv=["python3", "-c", "x = bytearray(256 * 1024 * 1024)"],
+            run_dir=tmp_path / "hungry",
+            cwd=tmp_path,
+            requires_result=False,
         )
-    with pytest.raises(RuntimeError, match="network denial"):
-        executor.plan(argv=["x"], run_dir=tmp_path / "denied", cwd=tmp_path, deny_network=True)
+    )
+    executor._processes[hungry].wait(timeout=30)
+    assert executor.status(hungry).state == "failed"
+    modest = executor.submit(
+        executor.plan(
+            argv=["python3", "-c", "x = bytearray(1024)"],
+            run_dir=tmp_path / "modest",
+            cwd=tmp_path,
+            requires_result=False,
+        )
+    )
+    executor._processes[modest].wait(timeout=30)
+    assert executor.status(modest).state == "succeeded"

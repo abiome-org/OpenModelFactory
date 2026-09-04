@@ -2,9 +2,7 @@ apiVersion: omf.dev/v1alpha1
 kind: EvaluationSpec
 metadata:
   name: example-affine
-  namespace: local/open-model-factory
 spec:
-  protocol: omf.evaluation/v1
   metrics:
     - name: training-loss
       output: train.loss
@@ -12,6 +10,3 @@ spec:
     - name: parameter-check
       output: evaluate.passed
       minimum: 1.0
-  data: []
-  inferencePolicy:
-    compatibility: model-package

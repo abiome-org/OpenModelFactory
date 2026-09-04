@@ -2,13 +2,9 @@ apiVersion: omf.dev/v1alpha1
 kind: WorkloadSpec
 metadata:
   name: example-from-scratch
-  namespace: local/open-model-factory
 spec:
-  parameters: {}
-  reproducibility: lineage
   modelPackageRef: modelpackage/example-affine
   evaluationRefs: [evaluationspec/example-affine]
-  mixRef: mixspec/example-affine
   graph:
     stages:
       - name: train

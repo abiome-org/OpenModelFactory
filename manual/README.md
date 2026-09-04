@@ -23,11 +23,11 @@ Every chapter declares one of these statuses:
   commands.
 
 The example is intentionally a tiny from-scratch affine model implemented with
-the Python standard library. It exercises model-package and MixSpec admission,
-training, checkpoint publication, evaluation, and experiment mechanics—not mix
-delivery/replay, model quality, benchmark coverage, RLVR readiness, or scale.
-Framework- and modality-specific conveniences belong in optional starter packs,
-not factory core.
+the Python standard library. It exercises model-package admission,
+training, checkpoint publication, evaluation, and experiment mechanics—not
+model quality, benchmark coverage, RLVR readiness, or scale.
+Framework- and modality-specific conveniences belong in modules, not factory
+core.
 
 ## Learning path
 
@@ -91,8 +91,6 @@ omf --actor "$ACTOR" --output json resource apply \
   model-packages/example-affine.yaml
 omf --actor "$ACTOR" --output json resource apply \
   evaluations/example-affine.yaml
-omf --actor "$ACTOR" --output json resource apply \
-  mixes/example-affine.yaml
 
 omf --actor "$ACTOR" --output json store add secondary \
   --driver filesystem \
