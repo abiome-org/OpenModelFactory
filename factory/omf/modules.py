@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import io
 import os
+import shutil
 import stat
 import subprocess
 import tarfile
@@ -225,8 +226,6 @@ def extract_module_package(package: str | Path, destination: str | Path) -> Path
                     raise ValidationError(f"unsupported module package entry: {member.name}")
                 os.chmod(output, member.mode & 0o777)
     except Exception:
-        import shutil
-
         shutil.rmtree(target, ignore_errors=True)
         raise
     return target

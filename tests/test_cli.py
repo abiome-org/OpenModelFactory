@@ -50,13 +50,8 @@ spec: {owners: [local-user], extensions: {}}
     )
     shutil.copytree("modules", root / "modules")
     shutil.copytree("workloads", root / "workloads")
-    workload = yaml.safe_load((root / "workloads/example-statistical.yaml").read_text())
-    workload["metadata"]["namespace"] = "local/cli-full"
-    (root / "workloads/example-statistical.yaml").write_text(yaml.safe_dump(workload))
     (root / "bindings").mkdir()
-    binding = yaml.safe_load(Path("bindings/local.yaml").read_text())
-    binding["metadata"]["namespace"] = "local/cli-full"
-    (root / "bindings/local.yaml").write_text(yaml.safe_dump(binding))
+    shutil.copy("bindings/local.yaml", root / "bindings/local.yaml")
     (root / "numbers.jsonl").write_text(Path("data/fixtures/numbers.jsonl").read_text())
     (root / "rights.yaml").write_text("license: CC0-1.0\ntrainingAllowed: true\n")
     return root

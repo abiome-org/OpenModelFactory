@@ -78,7 +78,6 @@ def _validate_markers(content: str, begin: str, end: str) -> None:
 
 
 def validate_managed_file(destination: Path, begin: str, end: str) -> None:
-
     if not os.path.lexists(destination):
         return
     directory = _open_parent(destination)
@@ -96,7 +95,6 @@ def _temporary_name(destination_name: str) -> str:
 
 
 def upsert_managed_section(source: Path, destination: Path, begin: str, end: str) -> bool:
-
     section = source.read_text(encoding="utf-8").rstrip("\n")
     section_lines = section.splitlines()
     if not section_lines or section_lines[0] != begin or section_lines[-1] != end:
@@ -159,7 +157,6 @@ def upsert_managed_section(source: Path, destination: Path, begin: str, end: str
 
 
 def render_template(source: Path, destination: Path, name: str, namespace: str) -> bool:
-
     content = source.read_text(encoding="utf-8")
     content = content.replace("__OMF_PROJECT_NAME__", name)
     content = content.replace("__OMF_PROJECT_NAMESPACE__", namespace)

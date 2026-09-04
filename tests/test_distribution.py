@@ -242,7 +242,7 @@ spec: {owners: [release-test], extensions: {}}
         cwd=isolated,
         env=environment,
     )
-    assert upgraded.stdout.strip() == "5"
+    assert upgraded.stdout.strip() == "6"
 
     sdist = distribution / "open_model_factory-1.0.0.tar.gz"
     with tarfile.open(sdist, "r:gz") as archive:

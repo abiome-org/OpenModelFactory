@@ -561,18 +561,16 @@ class LocalExecutor(Executor):
         execution_id = str(uuid.uuid4())
         plan.run_dir.mkdir(parents=True, exist_ok=True)
         execution_path = plan.run_dir / "execution.json"
-        self._write_execution(
-            execution_path,
-            {
-                "id": execution_id,
-                "state": "launching",
-                "started": time.time(),
-                "timeout": plan.timeout,
-                "requiresResult": bool(plan.metadata.get("requiresResult", True)),
-                "environmentDigest": plan.metadata.get("environmentDigest"),
-                "argvDigest": plan.metadata["argvDigest"],
-            },
-        )
+        record = {
+            "id": execution_id,
+            "state": "launching",
+            "started": time.time(),
+            "timeout": plan.timeout,
+            "requiresResult": bool(plan.metadata.get("requiresResult", True)),
+            "environmentDigest": plan.metadata.get("environmentDigest"),
+            "argvDigest": plan.metadata["argvDigest"],
+        }
+        self._write_execution(execution_path, record)
         request, result = plan.run_dir / "request.json", plan.run_dir / "result.json"
         if not request.exists():
             request.write_text("{}")
@@ -635,19 +633,14 @@ class LocalExecutor(Executor):
             )
         finally:
             stdout.close()
-        identity = self._identity(process.pid)
         self._write_execution(
             execution_path,
             {
-                "id": execution_id,
+                **record,
                 "state": "submitted",
                 "pid": process.pid,
-                "identity": identity,
+                "identity": self._identity(process.pid),
                 "started": time.time(),
-                "timeout": plan.timeout,
-                "requiresResult": bool(plan.metadata.get("requiresResult", True)),
-                "environmentDigest": plan.metadata.get("environmentDigest"),
-                "argvDigest": plan.metadata["argvDigest"],
             },
         )
         self._processes[execution_id] = process

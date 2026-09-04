@@ -21,14 +21,22 @@ class _ObjectStore(BaseHTTPRequestHandler):
     def log_message(self, *_arguments):
         return
 
-    def _error(self, status, code):
-        body = f"<?xml version='1.0'?><Error><Code>{code}</Code><Message>{code}</Message></Error>"
+    def _respond(self, status, body=b"", headers=None):
         self.send_response(status)
-        self.send_header("Content-Type", "application/xml")
+        for name, value in (headers or {}).items():
+            self.send_header(name, value)
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         if self.command != "HEAD":
-            self.wfile.write(body.encode())
+            self.wfile.write(body)
+
+    def _xml(self, status, body):
+        self._respond(
+            status, f"<?xml version='1.0'?>{body}".encode(), {"Content-Type": "application/xml"}
+        )
+
+    def _error(self, status, code):
+        self._xml(status, f"<Error><Code>{code}</Code><Message>{code}</Message></Error>")
 
     def _key(self):
         parts = urlsplit(self.path)
@@ -38,9 +46,7 @@ class _ObjectStore(BaseHTTPRequestHandler):
         key, _parts = self._key()
         if key not in self.objects:
             return self._error(404, "NotFound")
-        self.send_response(200)
-        self.send_header("Content-Length", str(len(self.objects[key])))
-        self.end_headers()
+        self._respond(200, self.objects[key])
 
     def do_GET(self):
         key, parts = self._key()
@@ -51,28 +57,15 @@ class _ObjectStore(BaseHTTPRequestHandler):
                 for item in sorted(self.objects)
                 if item.startswith(prefix)
             )
-            body = (
-                "<?xml version='1.0'?><ListBucketResult><IsTruncated>false</IsTruncated>"
-                f"{keys}</ListBucketResult>"
-            ).encode()
-            self.send_response(200)
-            self.send_header("Content-Type", "application/xml")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
-            return
+            listing = f"<ListBucketResult><IsTruncated>false</IsTruncated>{keys}</ListBucketResult>"
+            return self._xml(200, listing)
         if key not in self.objects:
             return self._error(404, "NoSuchKey")
         body = self.objects[key]
-        status = 200
-        if "Range" in self.headers:
-            start, _, end = self.headers["Range"].removeprefix("bytes=").partition("-")
-            body = body[int(start) : int(end) + 1 if end else None]
-            status = 206
-        self.send_response(status)
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
+        if "Range" not in self.headers:
+            return self._respond(200, body)
+        start, _, end = self.headers["Range"].removeprefix("bytes=").partition("-")
+        self._respond(206, body[int(start) : int(end) + 1 if end else None])
 
     def do_PUT(self):
         key, _parts = self._key()
@@ -80,10 +73,7 @@ class _ObjectStore(BaseHTTPRequestHandler):
         if self.headers.get("If-None-Match") == "*" and key in self.objects:
             return self._error(412, "PreconditionFailed")
         self.objects[key] = body
-        self.send_response(200)
-        self.send_header("ETag", '"' + hashlib.md5(body).hexdigest() + '"')
-        self.send_header("Content-Length", "0")
-        self.end_headers()
+        self._respond(200, headers={"ETag": '"' + hashlib.md5(body).hexdigest() + '"'})
 
 
 @pytest.fixture

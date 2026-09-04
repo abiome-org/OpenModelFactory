@@ -569,16 +569,9 @@ def _admin_routes(app: FastAPI, authorized: Authorized) -> None:
     def token_create(
         request: ApiTokenRequest, service: Factory = Depends(authorized)
     ) -> dict[str, Any]:
-        token, principal = service.api_tokens.create(
+        return service.create_api_token(
             actor=request.actor, scopes=request.scopes, expires_at=request.expires_at
         )
-        return {
-            "token": token,
-            "tokenId": principal.token_id,
-            "actor": principal.actor,
-            "scopes": sorted(principal.scopes),
-            "expiresAt": principal.expires_at,
-        }
 
     @app.get("/v1/tokens")
     def token_list(service: Factory = Depends(authorized)) -> list[dict[str, Any]]:
@@ -586,8 +579,7 @@ def _admin_routes(app: FastAPI, authorized: Authorized) -> None:
 
     @app.delete("/v1/tokens/{token_id}")
     def token_revoke(token_id: str, service: Factory = Depends(authorized)) -> dict[str, Any]:
-        service.revoke_api_token(token_id)
-        return {"tokenId": token_id, "revoked": True}
+        return service.revoke_api_token(token_id)
 
     @app.get("/v1/operations")
     def operations(

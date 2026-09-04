@@ -24,6 +24,14 @@ def _install_plugin(site: Path, dist: str, entry: str, target: str, source: str)
     (site / f"{target.partition(':')[0]}.py").write_text(source)
 
 
+def _finish(executor: LocalExecutor, run_dir: Path, argv: list[str]) -> str:
+    execution_id = executor.submit(
+        executor.plan(argv=argv, run_dir=run_dir, cwd=run_dir.parent, requires_result=False)
+    )
+    executor._processes[execution_id].wait(timeout=30)
+    return execution_id
+
+
 def test_executor_registry_catalog_duplicates_unknown_and_discovery(tmp_path, monkeypatch):
     registry = default_executor_registry(discover=False)
     catalog = registry.catalog()
@@ -336,30 +344,14 @@ def test_local_executor_recovers_a_completed_launch_before_pid_persistence(tmp_p
 
 def test_local_executor_enforces_timeout_without_controller_and_records_plain_command(tmp_path):
     executor = LocalExecutor(limits={"timeoutSeconds": 0.1})
-    timed = executor.submit(
-        executor.plan(
-            argv=["python3", "-c", "import time; time.sleep(30)"],
-            run_dir=tmp_path / "timed",
-            cwd=tmp_path,
-            requires_result=False,
-        )
-    )
-    executor._processes[timed].wait(timeout=10)
+    timed = _finish(executor, tmp_path / "timed", ["python3", "-c", "import time; time.sleep(30)"])
     recovered = LocalExecutor()
     recovered.reconcile(tmp_path / "timed")
     status = recovered.status(timed)
     assert status.state == "failed"
     assert status.reason == "timeout"
 
-    plain = executor.submit(
-        executor.plan(
-            argv=["python3", "-c", "pass"],
-            run_dir=tmp_path / "plain",
-            cwd=tmp_path,
-            requires_result=False,
-        )
-    )
-    executor._processes[plain].wait(timeout=5)
+    plain = _finish(executor, tmp_path / "plain", ["python3", "-c", "pass"])
     assert executor.status(plain).state == "succeeded"
 
 
@@ -557,19 +549,11 @@ def test_local_environment_captures_python_runtime_and_distribution_inventory(tm
 def test_executor_log_reads_are_tail_bounded(tmp_path):
     executor = LocalExecutor()
     run_dir = tmp_path / "logs"
-    execution_id = executor.submit(
-        executor.plan(
-            argv=[
-                "python3",
-                "-c",
-                "print('0123456789'); import sys; print('abcdefghij', file=sys.stderr)",
-            ],
-            run_dir=run_dir,
-            cwd=tmp_path,
-            requires_result=False,
-        )
+    execution_id = _finish(
+        executor,
+        run_dir,
+        ["python3", "-c", "print('0123456789'); import sys; print('abcdefghij', file=sys.stderr)"],
     )
-    executor._processes[execution_id].wait(timeout=5)
 
     stdout, stderr = executor.read_logs(execution_id, tail_bytes=5)
     assert stdout == "6789\n"
@@ -579,15 +563,11 @@ def test_executor_log_reads_are_tail_bounded(tmp_path):
 def test_executor_log_error_replacement_remains_byte_bounded(tmp_path):
     executor = LocalExecutor()
     run_dir = tmp_path / "binary-logs"
-    execution_id = executor.submit(
-        executor.plan(
-            argv=["python3", "-c", "import sys; sys.stdout.buffer.write(b'\\xff' * 10000)"],
-            run_dir=run_dir,
-            cwd=tmp_path,
-            requires_result=False,
-        )
+    execution_id = _finish(
+        executor,
+        run_dir,
+        ["python3", "-c", "import sys; sys.stdout.buffer.write(b'\\xff' * 10000)"],
     )
-    executor._processes[execution_id].wait(timeout=5)
 
     stdout, _stderr = executor.read_logs(execution_id, tail_bytes=4096)
     assert stdout
@@ -598,24 +578,20 @@ def test_local_executor_bounds_log_files_without_limiting_artifacts(tmp_path):
     executor = LocalExecutor()
     run_dir = tmp_path / "bounded-logs"
     artifact = run_dir / "model.bin"
-    execution_id = executor.submit(
-        executor.plan(
-            argv=[
-                "python3",
-                "-c",
-                (
-                    "from pathlib import Path; import sys; "
-                    "Path(sys.argv[1]).write_bytes(b'a' * 1500000); "
-                    "print('x' * 1500000); print('y' * 1500000, file=sys.stderr)"
-                ),
-                str(artifact),
-            ],
-            run_dir=run_dir,
-            cwd=tmp_path,
-            requires_result=False,
-        )
+    execution_id = _finish(
+        executor,
+        run_dir,
+        [
+            "python3",
+            "-c",
+            (
+                "from pathlib import Path; import sys; "
+                "Path(sys.argv[1]).write_bytes(b'a' * 1500000); "
+                "print('x' * 1500000); print('y' * 1500000, file=sys.stderr)"
+            ),
+            str(artifact),
+        ],
     )
-    executor._processes[execution_id].wait(timeout=10)
 
     assert executor.status(execution_id).state == "succeeded"
     assert (run_dir / "stdout.log").stat().st_size == 1024 * 1024
@@ -631,25 +607,9 @@ def test_local_executor_applies_binding_resource_limits(tmp_path):
     assert LocalExecutor(limits={"gpus": 1}).preflight() == [
         "unsupported local resource limits: gpus"
     ]
-    executor = LocalExecutor(limits={"addressSpaceBytes": 64 * 1024 * 1024})
+    executor = LocalExecutor(limits={"addressSpaceBytes": 1024**3})
     assert executor.preflight() == []
-    hungry = executor.submit(
-        executor.plan(
-            argv=["python3", "-c", "x = bytearray(256 * 1024 * 1024)"],
-            run_dir=tmp_path / "hungry",
-            cwd=tmp_path,
-            requires_result=False,
-        )
-    )
-    executor._processes[hungry].wait(timeout=30)
+    hungry = _finish(executor, tmp_path / "hungry", ["python3", "-c", "x = bytearray(4 * 1024**3)"])
     assert executor.status(hungry).state == "failed"
-    modest = executor.submit(
-        executor.plan(
-            argv=["python3", "-c", "x = bytearray(1024)"],
-            run_dir=tmp_path / "modest",
-            cwd=tmp_path,
-            requires_result=False,
-        )
-    )
-    executor._processes[modest].wait(timeout=30)
+    modest = _finish(executor, tmp_path / "modest", ["python3", "-c", "x = bytearray(1024)"])
     assert executor.status(modest).state == "succeeded"

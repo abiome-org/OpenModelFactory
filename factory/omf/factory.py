@@ -465,10 +465,23 @@ class Factory:
     def authenticate_principal(self, token: str) -> ApiPrincipal | None:
         return self.api_tokens.authenticate(token)
 
-    def revoke_api_token(self, token_id: str) -> None:
+    def create_api_token(
+        self, *, actor: str, scopes: set[str], expires_at: str | None
+    ) -> dict[str, Any]:
+        token, principal = self.api_tokens.create(actor=actor, scopes=scopes, expires_at=expires_at)
+        return {
+            "token": token,
+            "tokenId": principal.token_id,
+            "actor": principal.actor,
+            "scopes": sorted(principal.scopes),
+            "expiresAt": principal.expires_at,
+        }
+
+    def revoke_api_token(self, token_id: str) -> dict[str, Any]:
         if token_id == self.local_token_id:
             raise ValidationError("the bootstrap operator token cannot be revoked")
         self.api_tokens.revoke(token_id)
+        return {"tokenId": token_id, "revoked": True}
 
     def doctor(self) -> dict[str, Any]:
         checks: list[dict[str, Any]] = []
@@ -714,10 +727,7 @@ class Factory:
         driver = spec["storeType"]
         location = str(spec["location"])
         if driver == "filesystem":
-            path = Path(location)
-            if not path.is_absolute():
-                path = self.paths.root / path
-            return FilesystemStore(path)
+            return FilesystemStore(self.paths.root / location)
         if driver == "s3":
             config = spec.get("config", {})
             endpoint = config.get("endpointUrl")
@@ -988,10 +998,7 @@ class Factory:
                 package_path,
                 logical_kind="module-source",
                 provenance={
-                    "manifest": Path(manifest_path)
-                    .resolve()
-                    .relative_to(self.paths.root.resolve())
-                    .as_posix(),
+                    "manifest": manifest_path.relative_to(self.paths.root.resolve()).as_posix(),
                     "moduleDigest": module_digest,
                     "packageDigest": package_digest,
                 },
@@ -1175,10 +1182,7 @@ class Factory:
     ) -> dict[str, tuple[ModuleManifest, Path, dict[str, Any]]]:
         admitted: dict[str, tuple[ModuleManifest, Path, dict[str, Any]]] = {}
         for stage in stages:
-            module_path = Path(stage.module)
-            if not module_path.is_absolute():
-                module_path = self.paths.root / module_path
-            manifest, code_root = load_manifest(module_path, self.paths.root)
+            manifest, code_root = load_manifest(self.paths.root / stage.module, self.paths.root)
             environment = self._prepare_module_environment(resolved.executor, manifest, code_root)
             admitted[stage.name] = (manifest, code_root, environment)
         return admitted
@@ -1187,10 +1191,7 @@ class Factory:
         return self.executors.catalog()
 
     def _project_file(self, value: str | Path, *, kind: str) -> Path:
-        candidate = Path(value)
-        if not candidate.is_absolute():
-            candidate = self.paths.root / candidate
-        resolved = candidate.resolve()
+        resolved = (self.paths.root / value).resolve()
         try:
             resolved.relative_to(self.paths.root.resolve())
         except ValueError as exc:
@@ -1214,10 +1215,9 @@ class Factory:
             workload = self._load_resource(self._project_file(workload_path, kind="workload"))
             admitted = project_workload(workload)
             self._validate_namespace(workload)
+            model_package = self._pin_model_package(admitted.model_package_ref, admitted.stages)
             execution_stages = [*admitted.stages]
-            if admitted.model_package_ref is not None:
-                model_package = self._pin_model_package(admitted.model_package_ref, admitted.stages)
-                assert model_package is not None
+            if model_package is not None:
                 execution_stages.append(self._inference_adapter_stage(model_package))
             required = MODULE_EXECUTION_CAPABILITIES
         name = str(binding["spec"]["executor"])
@@ -1369,7 +1369,7 @@ class Factory:
                 {"state": "Failed", "reason": message, "outputs": {}},
                 expected_version=None,
             )
-        self._fail_operation(operation, "indeterminate_execution", message, False)
+        self._fail_operation(operation, "indeterminate_execution", message)
         raise IntegrityError(message)
 
     def _admit_run_operation(self, operation: dict[str, Any]) -> None:
@@ -1380,11 +1380,11 @@ class Factory:
             self._fail_operation(operation, error["code"], error["message"], error["retryable"])
             raise
         except Exception:
-            self._fail_operation(operation, "run_admission_error", "run admission failed", False)
+            self._fail_operation(operation, "run_admission_error", "run admission failed")
             raise
 
     def _fail_operation(
-        self, operation: dict[str, Any], code: str, message: str, retryable: bool
+        self, operation: dict[str, Any], code: str, message: str, retryable: bool = False
     ) -> None:
         self.operations.update(
             str(operation["id"]),
@@ -1423,30 +1423,12 @@ class Factory:
             error = exc.as_dict()["error"]
             if recovering:
                 self._fail_recovered_run(operation_id, error["message"])
-            self.operations.update(
-                operation_id,
-                expected_version=active["version"],
-                state="failed",
-                error={
-                    "code": error["code"],
-                    "message": error["message"],
-                    "retryable": error["retryable"],
-                },
-            )
+            self._fail_operation(active, error["code"], error["message"], error["retryable"])
             raise
         except Exception:
             if recovering:
                 self._fail_recovered_run(operation_id, "run worker failed during recovery")
-            self.operations.update(
-                operation_id,
-                expected_version=active["version"],
-                state="failed",
-                error={
-                    "code": "run_worker_error",
-                    "message": "run worker failed",
-                    "retryable": False,
-                },
-            )
+            self._fail_operation(active, "run_worker_error", "run worker failed")
             raise
         return self.operations.update(
             operation_id,
@@ -1459,26 +1441,26 @@ class Factory:
         run_resource = self._run_resource(run_id)
         state_store = StateStore(self.paths.runs / run_id / "state.json")
         state = state_store.read()["state"]
-        if state == RunState.RUNNING.value:
-            state_store.transition(RunState.RUNNING, RunState.FAILED, reason)
-        elif state == RunState.RECOVERING.value:
-            state_store.transition(RunState.RECOVERING, RunState.FAILED, reason)
+        if state in {RunState.RUNNING.value, RunState.RECOVERING.value}:
+            state_store.transition(RunState(state), RunState.FAILED, reason)
+        desired = {"state": "Failed", "reason": reason, "outputs": {}}
+        if self._status_state(run_id) == "Failed":
+            desired = self.resources.get_status(run_id)[0]
+            reason = str(desired.get("reason", reason))
+        self._settle_run(run_resource, run_id, desired, reason)
+
+    def _settle_run(
+        self, run_resource: dict[str, Any], run_id: str, desired: dict[str, Any], reason: str
+    ) -> None:
         try:
             status, version = self.resources.get_status(run_id)
         except NotFoundError:
             status, version = {}, None
-        if status.get("state") == "Failed":
-            reason = str(status.get("reason", reason))
-            desired_status = status
-        else:
-            desired_status = {"state": "Failed", "reason": reason, "outputs": {}}
-        if status != desired_status:
-            self.resources.set_status(run_id, desired_status, expected_version=version)
-        terminal_events = self.events.query(
-            run_id=run_id, resource_uid=run_id, type="RunStateChanged"
-        )
-        if not any(event.data.get("state") == "Failed" for event in terminal_events):
-            self._run_state_event(run_resource, run_id, "Failed", reason)
+        if status != desired:
+            self.resources.set_status(run_id, desired, expected_version=version)
+        events = self.events.query(run_id=run_id, resource_uid=run_id, type="RunStateChanged")
+        if not any(event.data.get("state") == desired["state"] for event in events):
+            self._run_state_event(run_resource, run_id, desired["state"], reason)
 
     def _reconcile_completed_run(self, operation_id: str) -> dict[str, Any] | None:
         runs = [
@@ -1524,23 +1506,17 @@ class Factory:
                 run_id=operation_id,
             )
         )
-        try:
-            status, status_version = self.resources.get_status(operation_id)
-        except NotFoundError:
-            status, status_version = {}, None
-        desired_status = {
-            "state": "Succeeded",
-            "reason": "completed",
-            "outputs": result["outputs"],
-            "resultRef": result["resultRef"],
-        }
-        if status != desired_status:
-            self.resources.set_status(operation_id, desired_status, expected_version=status_version)
-        terminal_events = self.events.query(
-            run_id=operation_id, resource_uid=operation_id, type="RunStateChanged"
+        self._settle_run(
+            run_resource,
+            operation_id,
+            {
+                "state": "Succeeded",
+                "reason": "completed",
+                "outputs": result["outputs"],
+                "resultRef": result["resultRef"],
+            },
+            "completed",
         )
-        if not any(event.data.get("state") == "Succeeded" for event in terminal_events):
-            self._run_state_event(run_resource, operation_id, "Succeeded", "completed")
         return result
 
     def run(self, workload_path: str | Path, binding_path: str | Path) -> dict[str, Any]:
@@ -1591,8 +1567,7 @@ class Factory:
         inference_stage = (
             self._inference_adapter_stage(model_package) if model_package is not None else None
         )
-        expected_adapter_names = {"inference"} if inference_stage is not None else set()
-        if set(expected_adapter_packages) != expected_adapter_names:
+        if set(expected_adapter_packages) != ({"inference"} if inference_stage else set()):
             raise IntegrityError("queued model adapter sources do not match the workload")
         execution_stages = [*stages, *([inference_stage] if inference_stage is not None else [])]
         resolved_executor = self._resolve_executor(
@@ -1739,11 +1714,8 @@ class Factory:
             if run_resource is not None:
                 source = self._recovered_source(run_dir, stage, is_inference, run_resource)
             else:
-                module_path = Path(stage.module)
-                if not module_path.is_absolute():
-                    module_path = self.paths.root / module_path
                 manifest, code_root, package_digest, artifact_digest = self._capture_module_source(
-                    module_path, extract_to=run_dir / "sources" / stage.name
+                    self.paths.root / stage.module, extract_to=run_dir / "sources" / stage.name
                 )
                 source = _CapturedSource(
                     stage, is_inference, manifest, code_root, package_digest, artifact_digest, None
@@ -2002,10 +1974,7 @@ class Factory:
         environment: dict[str, Any],
     ) -> str:
         stage_dir = context.run_dir / "stages" / stage.name
-        artifact_path = Path(str(value["path"]))
-        if not artifact_path.is_absolute():
-            artifact_path = stage_dir / artifact_path
-        artifact_path = artifact_path.resolve()
+        artifact_path = (stage_dir / str(value["path"])).resolve()
         allowed_root = stage_dir.resolve()
         if artifact_path != allowed_root and allowed_root not in artifact_path.parents:
             raise ValidationError("module artifact path escapes the stage run directory")
@@ -2187,29 +2156,26 @@ class Factory:
         pinned: dict[str, dict[str, Any]] = {}
         for stage in stages:
             for reference in stage.inputs.values():
-                if reference.startswith("dataset/") and reference not in pinned:
-                    if expected_revisions is not None and reference not in expected_revisions:
-                        raise IntegrityError("queued dataset reference was not pinned")
-                    resource = (
-                        self._resource_by_uri("DatasetSnapshot", expected_revisions[reference])
-                        if expected_revisions is not None
-                        else self.find_resource(
-                            "DatasetSnapshot", reference.removeprefix("dataset/")
-                        )
+                if reference in pinned or not reference.startswith("dataset/"):
+                    continue
+                if expected_revisions is not None and reference not in expected_revisions:
+                    raise IntegrityError("queued dataset reference was not pinned")
+                resource = (
+                    self._resource_by_uri("DatasetSnapshot", expected_revisions[reference])
+                    if expected_revisions is not None
+                    else self.find_resource("DatasetSnapshot", reference.removeprefix("dataset/"))
+                )
+                self._require_training_rights(resource)
+                snapshot = self._snapshot_from_resource(resource)
+                if snapshot.mode != "copy":
+                    raise CapabilityError(
+                        "only copied dataset snapshots can be executed reproducibly"
                     )
-                    self._require_training_rights(resource)
-                    if self._snapshot_from_resource(resource).mode != "copy":
-                        raise CapabilityError(
-                            "only copied dataset snapshots can be executed reproducibly"
-                        )
-                    snapshot = self._snapshot_from_resource(resource)
-                    if snapshot.artifact is None or not ArtifactBuilder(self.local_store).verify(
-                        snapshot.artifact
-                    ):
-                        raise IntegrityError(
-                            "admitted dataset artifact failed integrity verification"
-                        )
-                    pinned[reference] = resource
+                if snapshot.artifact is None or not ArtifactBuilder(self.local_store).verify(
+                    snapshot.artifact
+                ):
+                    raise IntegrityError("admitted dataset artifact failed integrity verification")
+                pinned[reference] = resource
         return pinned
 
     @staticmethod
@@ -2690,7 +2656,7 @@ class Factory:
         resolved = self._resolve_executor(
             str(binding["spec"]["executor"]), binding, self._executor_config(binding)
         )
-        self._require_executor(resolved, MODULE_PROTOCOL_CAPABILITIES)
+        self._require_executor(resolved, MODULE_EXECUTION_CAPABILITIES)
         source_manifest = self.local_store.read_manifest(source_digest)
         if not ArtifactBuilder(self.local_store).verify(source_manifest):
             raise IntegrityError("admitted compatibility adapter source failed verification")
@@ -2714,7 +2680,6 @@ class Factory:
             ArtifactBuilder(self.local_store).restore(source_manifest, archive)
             code_root = extract_module_package(archive / "payload", temporary / "source")
             manifest, code_root = load_manifest(code_root / "module.yaml", code_root)
-            self._require_executor(resolved, MODULE_EXECUTION_CAPABILITIES)
             environment = self._prepare_module_environment(resolved.executor, manifest, code_root)
             if environment["digest"] != adapter_admission["environment"]["digest"]:
                 raise IntegrityError("compatibility adapter environment differs from run admission")
@@ -3238,7 +3203,7 @@ class Factory:
         return {
             "scanner": {"name": "", "version": ""},
             "databaseRevision": "",
-            "generatedAt": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+            "generatedAt": _utc_now(),
             "subjects": sorted({model_digest, *sources.values()}),
             "findings": [],
             "waivers": [],
@@ -3463,6 +3428,16 @@ class Factory:
         )
         return {"deployment": resource, "state": state, "executionId": execution_id}
 
+    def _attach_deployment(
+        self, resource: dict[str, Any], status: dict[str, Any], execution_id: str
+    ) -> Executor:
+        resolved = self._deployment_executor(resource)
+        if str(status.get("executor", resolved.provider.name)) != resolved.provider.name:
+            raise IntegrityError("deployment executor does not match its immutable revision")
+        default_dir = self.paths.runs / "deployments" / resource["metadata"]["uid"]
+        resolved.executor.attach(execution_id, Path(str(status.get("runDirectory") or default_dir)))
+        return resolved.executor
+
     def _deployment_executor(self, resource: dict[str, Any]) -> ResolvedExecutor:
         extension = resource["spec"].get("extensions", {})
         name = str(extension.get("executor", "local"))
@@ -3588,13 +3563,8 @@ class Factory:
             resource = self.resources.get(uid, str(desired_revision))
         execution_id = status.get("executionId")
         if status.get("state") == "running" and execution_id:
-            resolved = self._deployment_executor(resource)
-            status_executor = str(status.get("executor", resolved.provider.name))
-            if status_executor != resolved.provider.name:
-                raise IntegrityError("deployment executor does not match its immutable revision")
-            run_dir = Path(str(status.get("runDirectory") or self.paths.runs / "deployments" / uid))
-            resolved.executor.attach(str(execution_id), run_dir)
-            observed = resolved.executor.status(str(execution_id))
+            executor = self._attach_deployment(resource, status, str(execution_id))
+            observed = executor.status(str(execution_id))
             if observed.state != "running":
                 updated = {
                     **status,
@@ -3621,19 +3591,9 @@ class Factory:
         execution_id = status.get("executionId")
         if not execution_id:
             raise IntegrityError("running deployment has no execution identity")
-        resolved = self._deployment_executor(resource)
-        status_executor = str(status.get("executor", resolved.provider.name))
-        if status_executor != resolved.provider.name:
-            raise IntegrityError("deployment executor does not match its immutable revision")
-        run_dir = Path(
-            str(
-                status.get("runDirectory")
-                or self.paths.runs / "deployments" / resource["metadata"]["uid"]
-            )
-        )
-        resolved.executor.attach(str(execution_id), run_dir)
-        resolved.executor.cancel(str(execution_id))
-        observed = resolved.executor.status(str(execution_id))
+        executor = self._attach_deployment(resource, status, str(execution_id))
+        executor.cancel(str(execution_id))
+        observed = executor.status(str(execution_id))
         updated = {
             **status,
             "state": observed.state,
