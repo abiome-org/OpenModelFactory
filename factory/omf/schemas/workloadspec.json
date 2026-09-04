@@ -2,47 +2,88 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "x-omf-kind": "WorkloadSpec",
   "type": "object",
-  "required": ["apiVersion", "kind", "metadata", "spec"],
+  "required": [
+    "apiVersion",
+    "kind",
+    "metadata",
+    "spec"
+  ],
   "properties": {
-    "apiVersion": {"const": "omf.dev/v1alpha1"},
-    "kind": {"const": "WorkloadSpec"},
-    "metadata": {"$ref": "#/$defs/metadata"},
+    "apiVersion": {
+      "const": "omf.dev/v1alpha1"
+    },
+    "kind": {
+      "const": "WorkloadSpec"
+    },
+    "metadata": {
+      "$ref": "#/$defs/metadata"
+    },
     "spec": {
       "type": "object",
-      "required": ["graph", "parameters", "reproducibility"],
+      "required": [
+        "graph"
+      ],
       "properties": {
         "graph": {
           "type": "object",
-          "required": ["stages"],
+          "required": [
+            "stages"
+          ],
           "properties": {
             "stages": {
               "type": "array",
               "minItems": 1,
               "items": {
                 "type": "object",
-                "required": ["name", "module"],
+                "required": [
+                  "name",
+                  "module"
+                ],
                 "properties": {
-                  "name": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]*$"},
-                  "needs": {"type": "array", "items": {"type": "string"}, "uniqueItems": true},
+                  "name": {
+                    "type": "string",
+                    "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]*$"
+                  },
+                  "needs": {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    },
+                    "uniqueItems": true
+                  },
                   "module": {
                     "type": "string",
                     "minLength": 1,
                     "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.(?:/|$)).+$"
                   },
                   "operation": {
-                    "enum": ["validate", "prepare", "run", "quiesce", "checkpoint", "restore", "stop"]
+                    "enum": [
+                      "validate",
+                      "prepare",
+                      "run",
+                      "quiesce",
+                      "checkpoint",
+                      "restore",
+                      "stop"
+                    ]
                   },
-                  "config": {"type": "object"},
-                  "inputs": {"type": "object", "additionalProperties": {"type": "string"}},
+                  "config": {
+                    "type": "object"
+                  },
+                  "inputs": {
+                    "type": "object",
+                    "additionalProperties": {
+                      "type": "string"
+                    }
+                  },
                   "outputs": {
                     "type": "array",
-                    "items": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]*$"},
+                    "items": {
+                      "type": "string",
+                      "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]*$"
+                    },
                     "uniqueItems": true
-                  },
-                  "checkpointTrigger": {"type": "object"},
-                  "evaluationTrigger": {"type": "object"},
-                  "idempotent": {"type": "boolean"},
-                  "retries": {"type": "integer", "minimum": 0}
+                  }
                 },
                 "additionalProperties": false
               }
@@ -50,19 +91,25 @@
           },
           "additionalProperties": false
         },
-        "parameters": {"type": "object"},
-        "modelPackageRef": {"type": "string"},
-        "mixRef": {"type": "string"},
-        "evaluationRefs": {"type": "array", "items": {"type": "string"}, "uniqueItems": true},
-        "reproducibility": {"enum": ["lineage", "operational", "numerical", "bitwise"]},
-        "budget": {"type": "object"},
-        "policies": {"type": "array", "items": {"type": "string"}, "uniqueItems": true},
-        "childWork": {"type": "object"},
-        "extensions": {"$ref": "#/$defs/extension"}
+        "modelPackageRef": {
+          "type": "string"
+        },
+        "evaluationRefs": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "uniqueItems": true
+        },
+        "extensions": {
+          "$ref": "#/$defs/extension"
+        }
       },
       "additionalProperties": false
     },
-    "status": {"type": "object"}
+    "status": {
+      "type": "object"
+    }
   },
   "additionalProperties": false
 }

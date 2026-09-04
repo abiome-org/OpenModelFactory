@@ -1,5 +1,3 @@
-"""Independent executor used to acceptance-test OMF's public plugin API."""
-
 from __future__ import annotations
 
 import hashlib
@@ -72,8 +70,6 @@ _CAPABILITIES = MODULE_PROTOCOL_CAPABILITIES | frozenset(
 
 
 class StableTestExecutor(Executor):
-    """Small POSIX process provider implemented without OMF's built-in adapters."""
-
     def __init__(self, context: ExecutorContext) -> None:
         self.context = context
         self._directories: dict[str, Path] = {}

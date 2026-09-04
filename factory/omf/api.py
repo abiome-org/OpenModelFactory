@@ -1,10 +1,7 @@
-"""Authenticated FastAPI surface for the Open Model Factory service."""
-
 from __future__ import annotations
 
-from collections.abc import AsyncIterator, Iterator
+from collections.abc import AsyncIterator, Callable, Iterator
 from contextlib import asynccontextmanager
-from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
@@ -18,7 +15,6 @@ from omf.config import ProjectPaths
 from omf.errors import AuthorizationError, OMFError
 from omf.executors import ExecutorRegistry
 from omf.factory import Factory
-from omf.federation import CapacityOffer, FederatedEvent, FederationBroker, Lease
 from omf.schema_registry import default_registry
 
 
@@ -59,6 +55,7 @@ class SyncRequest(BaseModel):
 class ModuleRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     manifest: str
+    binding: str | None = None
 
 
 class RunRequest(BaseModel):
@@ -114,66 +111,6 @@ class DeploymentRequest(BaseModel):
 class DeploymentRollbackRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     expected_version: int = Field(ge=1)
-
-
-class FederationTrustRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-    peer_id: str
-    trust_bundle: dict[str, str]
-
-
-class FederationLeaseRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-    lease_id: str
-    peer_id: str
-    expires_at: str
-    policy_epoch: int = Field(ge=1)
-
-
-class FederationEventRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-    peer_id: str
-    event_id: str
-    sequence: int = Field(ge=1)
-    policy_epoch: int = Field(ge=1)
-    lease_id: str
-    kind: str
-    resource: str
-    content_digest: str
-    key_id: str
-    signature: str
-
-
-class FederationEmitRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-    peer_id: str
-    lease_id: str
-    kind: str
-    resource: str
-    content: Any
-
-
-class FederationPublishRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-    peer_id: str
-    event_id: str
-
-
-class CapacityOfferRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-    peer_id: str
-    labels: set[str]
-    capacity: dict[str, int]
-    policy_epoch: int = Field(ge=1)
-
-
-class PlacementRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-    offers: list[CapacityOfferRequest]
-    required_labels: set[str] = Field(default_factory=set)
-    residency: str
-    resource: str
-    amount: int = Field(default=1, ge=1)
 
 
 class ApiTokenRequest(BaseModel):
@@ -234,27 +171,10 @@ class KnowledgeRequest(BaseModel):
     expires_at: str | None = None
 
 
-def create_app(paths: ProjectPaths, *, executors: ExecutorRegistry | None = None) -> FastAPI:
-    """Create one API application bound to an already bootstrapped project."""
-    factory = Factory(paths, executors=executors)
+Authorized = Callable[..., Iterator[Factory]]
 
-    @asynccontextmanager
-    async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
-        try:
-            yield
-        finally:
-            factory.close()
 
-    app = FastAPI(
-        title="Open Model Factory API",
-        version=__version__,
-        docs_url="/docs",
-        redoc_url="/redoc",
-        openapi_url="/openapi.json",
-        lifespan=lifespan,
-    )
-    app.state.factory = factory
-
+def _error_handlers(app: FastAPI) -> None:
     @app.exception_handler(OMFError)
     async def omf_error(_request: Request, exc: OMFError) -> JSONResponse:
         return JSONResponse(status_code=exc.status_code, content=exc.as_dict())
@@ -293,16 +213,14 @@ def create_app(paths: ProjectPaths, *, executors: ExecutorRegistry | None = None
             },
         )
 
+
+def _authorizer(paths: ProjectPaths, factory: Factory) -> Authorized:
     def authorized(request: Request, authorization: str = Header(default="")) -> Iterator[Factory]:
         scheme, _, token = authorization.partition(" ")
         principal = factory.authenticate_principal(token) if scheme.lower() == "bearer" else None
         if principal is None:
             raise AuthorizationError("valid Bearer authentication is required")
-        admin_paths = {
-            "/v1/backups",
-            "/v1/federation/trust",
-            "/v1/federation/leases",
-        }
+        admin_paths = {"/v1/backups"}
         read_post_paths = {"/v1/executors/preflight"}
         required_scope = (
             "admin"
@@ -319,6 +237,12 @@ def create_app(paths: ProjectPaths, *, executors: ExecutorRegistry | None = None
         finally:
             service.close()
 
+    return authorized
+
+
+def _core_routes(
+    app: FastAPI, factory: Factory, paths: ProjectPaths, authorized: Authorized
+) -> None:
     @app.get("/healthz")
     def health() -> dict[str, Any]:
         return {"status": "ok", "project": factory.project["metadata"]["name"]}
@@ -340,19 +264,32 @@ def create_app(paths: ProjectPaths, *, executors: ExecutorRegistry | None = None
             workload_path=paths.root / request.workload if request.workload else None,
         )
 
+    @app.get("/v1/schemas")
+    def schemas(_service: Factory = Depends(authorized)) -> dict[str, Any]:
+        return {"apiVersion": "omf.dev/v1alpha1", "kinds": default_registry.kinds}
+
+    @app.get("/v1/schemas/{kind}")
+    def schema(kind: str, _service: Factory = Depends(authorized)) -> dict[str, Any]:
+        return default_registry.schema_for(kind)
+
+
+def _cached(response: Response, value: dict[str, Any], key: str, if_none_match: str | None) -> Any:
+    etag = f'"{value[key]}"'
+    if if_none_match in {etag, value[key]}:
+        return Response(status_code=304, headers={"ETag": etag, "Cache-Control": "no-cache"})
+    response.headers["ETag"] = etag
+    response.headers["Cache-Control"] = "no-cache"
+    return value
+
+
+def _agent_routes(app: FastAPI, authorized: Authorized) -> None:
     @app.get("/v1/agent/capabilities")
     def agent_capabilities(
         response: Response,
         if_none_match: str | None = Header(default=None),
         service: Factory = Depends(authorized),
     ) -> Any:
-        value = service.agent.capabilities()
-        etag = f'"{value["catalogDigest"]}"'
-        if if_none_match in {etag, value["catalogDigest"]}:
-            return Response(status_code=304, headers={"ETag": etag, "Cache-Control": "no-cache"})
-        response.headers["ETag"] = etag
-        response.headers["Cache-Control"] = "no-cache"
-        return value
+        return _cached(response, service.agent.capabilities(), "catalogDigest", if_none_match)
 
     @app.get("/v1/agent/context")
     def agent_context(
@@ -365,12 +302,7 @@ def create_app(paths: ProjectPaths, *, executors: ExecutorRegistry | None = None
         service: Factory = Depends(authorized),
     ) -> Any:
         value = service.agent.context(focus=focus, limit=limit, since=since, max_bytes=max_bytes)
-        etag = f'"{value["viewDigest"]}"'
-        if if_none_match in {etag, value["viewDigest"]}:
-            return Response(status_code=304, headers={"ETag": etag, "Cache-Control": "no-cache"})
-        response.headers["ETag"] = etag
-        response.headers["Cache-Control"] = "no-cache"
-        return value
+        return _cached(response, value, "viewDigest", if_none_match)
 
     @app.post("/v1/goals")
     def goal_create(request: GoalRequest, service: Factory = Depends(authorized)) -> dict[str, Any]:
@@ -439,14 +371,8 @@ def create_app(paths: ProjectPaths, *, executors: ExecutorRegistry | None = None
     ) -> dict[str, Any]:
         return service.agent.list_knowledge(active_only=active_only, focus=focus, limit=limit)
 
-    @app.get("/v1/schemas")
-    def schemas(_service: Factory = Depends(authorized)) -> dict[str, Any]:
-        return {"apiVersion": "omf.dev/v1alpha1", "kinds": default_registry.kinds}
 
-    @app.get("/v1/schemas/{kind}")
-    def schema(kind: str, _service: Factory = Depends(authorized)) -> dict[str, Any]:
-        return default_registry.schema_for(kind)
-
+def _data_routes(app: FastAPI, authorized: Authorized) -> None:
     @app.get("/v1/resources")
     def resources(
         kind: str | None = Query(default=None),
@@ -523,6 +449,10 @@ def create_app(paths: ProjectPaths, *, executors: ExecutorRegistry | None = None
             plan=request.plan,
         )
 
+
+def _run_routes(
+    app: FastAPI, factory: Factory, paths: ProjectPaths, authorized: Authorized
+) -> None:
     @app.post("/v1/modules/validate")
     def validate_module(
         request: ModuleRequest, service: Factory = Depends(authorized)
@@ -533,7 +463,10 @@ def create_app(paths: ProjectPaths, *, executors: ExecutorRegistry | None = None
     def test_module(
         request: ModuleRequest, service: Factory = Depends(authorized)
     ) -> dict[str, Any]:
-        return service.test_module(paths.root / request.manifest)
+        return service.test_module(
+            paths.root / request.manifest,
+            binding_path=paths.root / request.binding if request.binding else None,
+        )
 
     def execute_run_operation(operation_id: str) -> None:
         with Factory(paths, executors=factory.executors) as reader:
@@ -565,6 +498,8 @@ def create_app(paths: ProjectPaths, *, executors: ExecutorRegistry | None = None
     ) -> dict[str, Any]:
         return service.evaluate(request.subject)
 
+
+def _release_routes(app: FastAPI, paths: ProjectPaths, authorized: Authorized) -> None:
     @app.post("/v1/releases")
     def release(request: ReleaseRequest, service: Factory = Depends(authorized)) -> dict[str, Any]:
         return service.create_release(
@@ -624,6 +559,8 @@ def create_app(paths: ProjectPaths, *, executors: ExecutorRegistry | None = None
     ) -> list[dict[str, Any]]:
         return service.lineage_query(subject, direction=direction, max_depth=max_depth)
 
+
+def _admin_routes(app: FastAPI, authorized: Authorized) -> None:
     @app.post("/v1/backups")
     def backup(request: BackupRequest, service: Factory = Depends(authorized)) -> dict[str, Any]:
         return service.backup(request.destination)
@@ -632,16 +569,9 @@ def create_app(paths: ProjectPaths, *, executors: ExecutorRegistry | None = None
     def token_create(
         request: ApiTokenRequest, service: Factory = Depends(authorized)
     ) -> dict[str, Any]:
-        token, principal = service.api_tokens.create(
+        return service.create_api_token(
             actor=request.actor, scopes=request.scopes, expires_at=request.expires_at
         )
-        return {
-            "token": token,
-            "tokenId": principal.token_id,
-            "actor": principal.actor,
-            "scopes": sorted(principal.scopes),
-            "expiresAt": principal.expires_at,
-        }
 
     @app.get("/v1/tokens")
     def token_list(service: Factory = Depends(authorized)) -> list[dict[str, Any]]:
@@ -649,8 +579,7 @@ def create_app(paths: ProjectPaths, *, executors: ExecutorRegistry | None = None
 
     @app.delete("/v1/tokens/{token_id}")
     def token_revoke(token_id: str, service: Factory = Depends(authorized)) -> dict[str, Any]:
-        service.revoke_api_token(token_id)
-        return {"tokenId": token_id, "revoked": True}
+        return service.revoke_api_token(token_id)
 
     @app.get("/v1/operations")
     def operations(
@@ -671,85 +600,34 @@ def create_app(paths: ProjectPaths, *, executors: ExecutorRegistry | None = None
     ) -> dict[str, Any]:
         return service.execute_run_operation(operation_id)
 
-    @app.post("/v1/federation/trust")
-    def federation_trust(
-        request: FederationTrustRequest, service: Factory = Depends(authorized)
-    ) -> dict[str, Any]:
-        service.federation.trust(request.peer_id, request.trust_bundle)
-        return {"peerId": request.peer_id, "trusted": True}
 
-    @app.get("/v1/federation/identity")
-    def federation_identity(service: Factory = Depends(authorized)) -> dict[str, str]:
-        return service.identity.export_trust_bundle()
+def create_app(paths: ProjectPaths, *, executors: ExecutorRegistry | None = None) -> FastAPI:
+    factory = Factory(paths, executors=executors)
 
-    @app.post("/v1/federation/leases")
-    def federation_lease(
-        request: FederationLeaseRequest, service: Factory = Depends(authorized)
-    ) -> dict[str, Any]:
-        lease = Lease(
-            request.lease_id,
-            request.peer_id,
-            request.expires_at,
-            request.policy_epoch,
-        )
-        service.federation.issue_lease(lease)
-        return asdict(lease)
+    @asynccontextmanager
+    async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
+        try:
+            yield
+        finally:
+            factory.close()
 
-    @app.post("/v1/federation/reconcile")
-    def federation_reconcile(
-        request: FederationEventRequest, service: Factory = Depends(authorized)
-    ) -> dict[str, Any]:
-        accepted = service.federation.reconcile(FederatedEvent(**request.model_dump()))
-        return {"accepted": accepted, "eventId": request.event_id}
-
-    @app.post("/v1/federation/events")
-    def federation_emit(
-        request: FederationEmitRequest, service: Factory = Depends(authorized)
-    ) -> dict[str, Any]:
-        return asdict(
-            service.federation.emit(
-                request.peer_id,
-                request.lease_id,
-                request.kind,
-                request.resource,
-                request.content,
-            )
-        )
-
-    @app.get("/v1/federation/outbox")
-    def federation_outbox(
-        peer_id: str | None = None, service: Factory = Depends(authorized)
-    ) -> list[dict[str, Any]]:
-        return [asdict(event) for event in service.federation.pending(peer_id)]
-
-    @app.post("/v1/federation/outbox/published")
-    def federation_published(
-        request: FederationPublishRequest, service: Factory = Depends(authorized)
-    ) -> dict[str, Any]:
-        service.federation.mark_published(request.peer_id, request.event_id)
-        return {"peerId": request.peer_id, "eventId": request.event_id, "published": True}
-
-    @app.post("/v1/capacity/place")
-    def capacity_place(
-        request: PlacementRequest, _service: Factory = Depends(authorized)
-    ) -> dict[str, Any]:
-        offer = FederationBroker.place(
-            [
-                CapacityOffer(
-                    item.peer_id,
-                    frozenset(item.labels),
-                    item.capacity,
-                    item.policy_epoch,
-                )
-                for item in request.offers
-            ],
-            required_labels=request.required_labels,
-            residency=request.residency,
-            resource=request.resource,
-            amount=request.amount,
-        )
-        return asdict(offer)
-
+    app = FastAPI(
+        title="Open Model Factory API",
+        version=__version__,
+        docs_url="/docs",
+        redoc_url="/redoc",
+        openapi_url="/openapi.json",
+        lifespan=lifespan,
+    )
+    app.state.factory = factory
+    _error_handlers(app)
+    authorized = _authorizer(paths, factory)
+    _core_routes(app, factory, paths, authorized)
+    _agent_routes(app, authorized)
+    _data_routes(app, authorized)
+    _run_routes(app, factory, paths, authorized)
+    _release_routes(app, paths, authorized)
+    _admin_routes(app, authorized)
     return app
 
 

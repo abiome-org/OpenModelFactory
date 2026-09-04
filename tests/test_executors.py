@@ -1,48 +1,41 @@
 import hashlib
+import importlib
 import json
 import os
-import shutil
 import subprocess
 import sys
 import time
 import venv
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 from omf.errors import CapabilityError, ConfigurationError, IntegrityError, ValidationError
-from omf.executors import EXECUTOR_API_VERSION, ExecutorContext, ExecutorProvider, ExecutorRegistry
+from omf.executors import EXECUTOR_API_VERSION, ExecutorProvider, ExecutorRegistry
 from omf.executors.base import DependencyLock
-from omf.executors.kubernetes import KubernetesExecutor
 from omf.executors.local import LocalExecutor
 from omf.executors.registry import default_executor_registry
-from omf.executors.slurm import SlurmExecutor
 
 
-def test_deterministic_plans_and_preflight(tmp_path, monkeypatch):
-    slurm = SlurmExecutor()
-    args = {
-        "argv": ["echo", "a b"],
-        "run_dir": tmp_path,
-        "cwd": tmp_path,
-        "resources": {"nodes": 2},
-    }
-    assert slurm.plan(**args).metadata == slurm.plan(**args).metadata
-    monkeypatch.setattr(shutil, "which", lambda _: None)
-    assert len(slurm.preflight()) == 3
-    kube = KubernetesExecutor()
-    with pytest.raises(ValueError, match="immutable"):
-        kube.plan(argv=["x"], run_dir=tmp_path, cwd=tmp_path, image="latest")
+def _install_plugin(site: Path, dist: str, entry: str, target: str, source: str) -> None:
+    info = site / f"{dist}.dist-info"
+    info.mkdir(parents=True)
+    (info / "METADATA").write_text(f"Metadata-Version: 2.1\nName: {dist}\nVersion: 1.0\n")
+    (info / "entry_points.txt").write_text(f"[omf.executors]\n{entry} = {target}\n")
+    (site / f"{target.partition(':')[0]}.py").write_text(source)
+
+
+def _finish(executor: LocalExecutor, run_dir: Path, argv: list[str]) -> str:
+    execution_id = executor.submit(
+        executor.plan(argv=argv, run_dir=run_dir, cwd=run_dir.parent, requires_result=False)
+    )
+    executor._processes[execution_id].wait(timeout=30)
+    return execution_id
 
 
 def test_executor_registry_catalog_duplicates_unknown_and_discovery(tmp_path, monkeypatch):
     registry = default_executor_registry(discover=False)
     catalog = registry.catalog()
-    assert [item["name"] for item in catalog["providers"]] == [
-        "kubernetes",
-        "local",
-        "slurm",
-    ]
+    assert [item["name"] for item in catalog["providers"]] == ["local"]
     with pytest.raises(ConfigurationError, match="duplicate"):
         registry.register(
             ExecutorProvider("local", EXECUTOR_API_VERSION, lambda _context: LocalExecutor()),
@@ -57,22 +50,25 @@ def test_executor_registry_catalog_duplicates_unknown_and_discovery(tmp_path, mo
             declaration={},
         )
 
-    custom = ExecutorRegistry()
-    provider = ExecutorProvider(
+    site = tmp_path / "site"
+    _install_plugin(
+        site,
+        "example-provider",
         "custom",
-        EXECUTOR_API_VERSION,
-        lambda context: LocalExecutor() if isinstance(context, ExecutorContext) else None,
-        config_contract={"type": "object", "additionalProperties": False},
+        "example_provider:provider",
+        "from omf.executors import EXECUTOR_API_VERSION, ExecutorContext, ExecutorProvider\n"
+        "from omf.executors.local import LocalExecutor\n\n"
+        "provider = ExecutorProvider(\n"
+        '    "custom",\n'
+        "    EXECUTOR_API_VERSION,\n"
+        "    lambda context: LocalExecutor() if isinstance(context, ExecutorContext) else None,\n"
+        '    config_contract={"type": "object", "additionalProperties": False},\n'
+        ")\n",
     )
-    entry_point = SimpleNamespace(
-        name="custom",
-        value="example.provider:provider",
-        dist=SimpleNamespace(name="example-provider"),
-        load=lambda: provider,
-    )
-    entry_points = SimpleNamespace(select=lambda **_kwargs: [entry_point])
-    monkeypatch.setattr("omf.executors.registry.metadata.entry_points", lambda: entry_points)
+    monkeypatch.syspath_prepend(str(site))
+    custom = ExecutorRegistry()
     custom.discover()
+    provider = importlib.import_module("example_provider").provider
     assert custom.catalog()["providers"][0]["source"].startswith("entry-point:example-provider")
 
     with pytest.raises(ValidationError, match="provider contract") as invalid:
@@ -122,7 +118,7 @@ def test_executor_registry_rejects_invalid_plugins_and_controller_fields(tmp_pat
 
     builtins = default_executor_registry(discover=False)
     with pytest.raises(ValidationError, match="provider contract"):
-        builtins.resolve("kubernetes", config={"typo": True}, **resolve)
+        builtins.resolve("local", config={"typo": True}, **resolve)
 
     invalid_executor = ExecutorRegistry()
     invalid_executor.register(
@@ -131,26 +127,34 @@ def test_executor_registry_rejects_invalid_plugins_and_controller_fields(tmp_pat
     with pytest.raises(ConfigurationError, match="invalid adapter"):
         invalid_executor.resolve("invalid", **resolve)
 
-    bad_entry_point = SimpleNamespace(
-        name="broken",
-        value="broken:provider",
-        load=lambda: (_ for _ in ()).throw(ImportError("unavailable")),
+    broken_site = tmp_path / "broken-site"
+    _install_plugin(
+        broken_site,
+        "broken-provider",
+        "broken",
+        "broken_provider:provider",
+        'raise ImportError("unavailable")\n',
     )
-    entry_points = SimpleNamespace(select=lambda **_kwargs: [bad_entry_point])
-    monkeypatch.setattr("omf.executors.registry.metadata.entry_points", lambda: entry_points)
-    with pytest.raises(ConfigurationError, match="could not be loaded"):
-        ExecutorRegistry().discover()
+    with monkeypatch.context() as patch:
+        patch.syspath_prepend(str(broken_site))
+        with pytest.raises(ConfigurationError, match="could not be loaded"):
+            ExecutorRegistry().discover()
 
-    wrong_entry_point = SimpleNamespace(
-        name="declared-name",
-        value="wrong:provider",
-        load=lambda: ExecutorProvider(
-            "different-name", EXECUTOR_API_VERSION, lambda _context: LocalExecutor()
-        ),
+    wrong_site = tmp_path / "wrong-site"
+    _install_plugin(
+        wrong_site,
+        "wrong-provider",
+        "declared-name",
+        "wrong_provider:provider",
+        "from omf.executors import EXECUTOR_API_VERSION, ExecutorProvider\n"
+        "from omf.executors.local import LocalExecutor\n\n"
+        'provider = ExecutorProvider("different-name", EXECUTOR_API_VERSION, '
+        "lambda _context: LocalExecutor())\n",
     )
-    entry_points = SimpleNamespace(select=lambda **_kwargs: [wrong_entry_point])
-    with pytest.raises(ConfigurationError, match="does not match"):
-        ExecutorRegistry().discover()
+    with monkeypatch.context() as patch:
+        patch.syspath_prepend(str(wrong_site))
+        with pytest.raises(ConfigurationError, match="does not match"):
+            ExecutorRegistry().discover()
 
 
 def test_executor_plugin_wheel_is_discovered_in_an_isolated_environment(tmp_path):
@@ -339,38 +343,22 @@ def test_local_executor_recovers_a_completed_launch_before_pid_persistence(tmp_p
 
 
 def test_local_executor_enforces_timeout_without_controller_and_records_plain_command(tmp_path):
-    executor = LocalExecutor()
-    timed = executor.submit(
-        executor.plan(
-            argv=["python3", "-c", "import time; time.sleep(30)"],
-            run_dir=tmp_path / "timed",
-            cwd=tmp_path,
-            timeout=0.1,
-            requires_result=False,
-        )
-    )
-    executor._processes[timed].wait(timeout=10)
+    executor = LocalExecutor(limits={"timeoutSeconds": 0.1})
+    timed = _finish(executor, tmp_path / "timed", ["python3", "-c", "import time; time.sleep(30)"])
     recovered = LocalExecutor()
     recovered.reconcile(tmp_path / "timed")
     status = recovered.status(timed)
     assert status.state == "failed"
     assert status.reason == "timeout"
 
-    plain = executor.submit(
-        executor.plan(
-            argv=["python3", "-c", "pass"],
-            run_dir=tmp_path / "plain",
-            cwd=tmp_path,
-            requires_result=False,
-        )
-    )
-    executor._processes[plain].wait(timeout=5)
+    plain = _finish(executor, tmp_path / "plain", ["python3", "-c", "pass"])
     assert executor.status(plain).state == "succeeded"
 
 
-def test_local_executor_attests_executable_under_network_wrapper(tmp_path, monkeypatch):
+def test_local_executor_attests_executable_under_network_wrapper(tmp_path):
+    if not LocalExecutor._network_namespace_available():
+        pytest.skip("unprivileged user namespaces are unavailable on this host")
     executor = LocalExecutor()
-    monkeypatch.setattr(executor, "_network_namespace_available", lambda _path=None: True)
     environment = executor.prepare_environment(
         argv=["python3", "-c", "pass"],
         cwd=tmp_path,
@@ -417,8 +405,8 @@ def test_local_environment_resolves_relative_path_entries(tmp_path, monkeypatch)
     assert environment["executables"][0]["path"] == str(executable.resolve())
 
 
-def test_local_environment_rejects_nonempty_opaque_dependency_lock(tmp_path):
-    with pytest.raises(CapabilityError, match="cannot realize a non-empty dependency lock"):
+def test_local_environment_rejects_nonempty_lock_without_environment_root(tmp_path):
+    with pytest.raises(CapabilityError, match="no environment cache root"):
         LocalExecutor().prepare_environment(
             argv=["python3", "-c", "pass"],
             cwd=tmp_path,
@@ -426,6 +414,120 @@ def test_local_environment_rejects_nonempty_opaque_dependency_lock(tmp_path):
                 "environment.lock", "sha256:" + "1" * 64, b"\x00provider-specific\xff"
             ),
         )
+
+
+def test_local_environment_rejects_nonempty_lock_for_non_python_entry_point(tmp_path):
+    binary = tmp_path / "tool"
+    binary.write_bytes(b"binary")
+    binary.chmod(0o755)
+    with pytest.raises(CapabilityError, match="requires a Python interpreter entry point"):
+        LocalExecutor(environment_root=tmp_path / "environments").prepare_environment(
+            argv=["./tool"],
+            cwd=tmp_path,
+            dependency=DependencyLock("environment.lock", "sha256:" + "1" * 64, b"opaque\n"),
+        )
+
+
+def _wait(executor: LocalExecutor, execution_id: str, timeout: float = 60.0) -> None:
+    deadline = time.monotonic() + timeout
+    while executor.status(execution_id).state in {"pending", "running"}:
+        assert time.monotonic() < deadline, "execution did not finish"
+        time.sleep(0.05)
+
+
+def test_local_environment_keeps_virtual_environment_symlink_interpreter(tmp_path, monkeypatch):
+    environment_path = tmp_path / "venv"
+    venv.EnvBuilder(symlinks=True, with_pip=False, system_site_packages=True).create(
+        environment_path
+    )
+    python = environment_path / "bin" / "python3"
+    if not python.is_symlink():
+        pytest.skip("this platform does not create symlink interpreters")
+    monkeypatch.setenv("PATH", f"{environment_path / 'bin'}{os.pathsep}{os.environ['PATH']}")
+    executor = LocalExecutor()
+
+    environment = executor.prepare_environment(
+        argv=["python3", "-c", "import sys; print(sys.prefix)"],
+        cwd=tmp_path,
+        dependency=DependencyLock("requirements.lock", "sha256:test", b""),
+    )
+
+    assert environment["command"][0] == str(python)
+    assert environment["executables"][0]["path"] == str(python)
+    assert environment["executables"][0]["target"] == str(python.resolve())
+    assert environment["runtime"]["python"]["version"]
+    run_dir = tmp_path / "run"
+    execution_id = executor.submit(
+        executor.plan(
+            argv=environment["command"],
+            run_dir=run_dir,
+            cwd=tmp_path,
+            requires_result=False,
+            environment=environment,
+        )
+    )
+    _wait(executor, execution_id)
+    assert executor.status(execution_id).state == "succeeded"
+    assert (run_dir / "stdout.log").read_text().strip() == str(environment_path)
+
+
+def test_local_executor_realizes_dependency_lock_from_wheelhouse(tmp_path):
+    from _wheels import build_wheel, lock_for
+
+    wheelhouse = tmp_path / "wheels"
+    _wheel, wheel_digest = build_wheel(wheelhouse)
+    lock = lock_for("omftiny", "1.0", wheel_digest)
+    dependency = DependencyLock(
+        "requirements.lock", "sha256:" + hashlib.sha256(lock).hexdigest(), lock
+    )
+    executor = LocalExecutor(
+        environment_root=tmp_path / "environments",
+        dependency_wheelhouse=wheelhouse,
+        dependency_index=False,
+    )
+    argv = ["python3", "-c", "import omf.sdk, omftiny; print(omftiny.VERSION)"]
+
+    environment = executor.prepare_environment(argv=argv, cwd=tmp_path, dependency=dependency)
+
+    realization = environment["realization"]
+    assert realization["strategy"] == "venv"
+    assert realization["lockDigest"] == dependency.digest
+    assert environment["command"][0].startswith(str(tmp_path / "environments"))
+    assert Path(environment["command"][0]).is_symlink()
+    names = {item["name"] for item in environment["runtime"]["python"]["distributions"]}
+    assert {"omftiny", "open-model-factory"} <= names
+    again = executor.prepare_environment(argv=argv, cwd=tmp_path, dependency=dependency)
+    assert again["digest"] == environment["digest"]
+    assert len(list((tmp_path / "environments").glob("*/omf-environment.json"))) == 1
+
+    run_dir = tmp_path / "run"
+    execution_id = executor.submit(
+        executor.plan(
+            argv=environment["command"],
+            run_dir=run_dir,
+            cwd=tmp_path,
+            requires_result=False,
+            environment=environment,
+        )
+    )
+    _wait(executor, execution_id)
+    assert executor.status(execution_id).state == "succeeded", (run_dir / "stderr.log").read_text()
+    assert (run_dir / "stdout.log").read_text().strip() == "1.0"
+
+
+def test_local_executor_reports_unsatisfiable_lock_without_index(tmp_path):
+    lock = b"omfmissing==9.9 --hash=sha256:" + b"0" * 64 + b"\n"
+    executor = LocalExecutor(environment_root=tmp_path / "environments", dependency_index=False)
+    with pytest.raises(CapabilityError, match="dependency installation failed") as excinfo:
+        executor.prepare_environment(
+            argv=["python3", "-c", "pass"],
+            cwd=tmp_path,
+            dependency=DependencyLock(
+                "requirements.lock", "sha256:" + hashlib.sha256(lock).hexdigest(), lock
+            ),
+        )
+    assert "output" in excinfo.value.details
+    assert not list((tmp_path / "environments").glob("*/omf-environment.json"))
 
 
 def test_local_environment_captures_python_runtime_and_distribution_inventory(tmp_path):
@@ -447,19 +549,11 @@ def test_local_environment_captures_python_runtime_and_distribution_inventory(tm
 def test_executor_log_reads_are_tail_bounded(tmp_path):
     executor = LocalExecutor()
     run_dir = tmp_path / "logs"
-    execution_id = executor.submit(
-        executor.plan(
-            argv=[
-                "python3",
-                "-c",
-                "print('0123456789'); import sys; print('abcdefghij', file=sys.stderr)",
-            ],
-            run_dir=run_dir,
-            cwd=tmp_path,
-            requires_result=False,
-        )
+    execution_id = _finish(
+        executor,
+        run_dir,
+        ["python3", "-c", "print('0123456789'); import sys; print('abcdefghij', file=sys.stderr)"],
     )
-    executor._processes[execution_id].wait(timeout=5)
 
     stdout, stderr = executor.read_logs(execution_id, tail_bytes=5)
     assert stdout == "6789\n"
@@ -469,15 +563,11 @@ def test_executor_log_reads_are_tail_bounded(tmp_path):
 def test_executor_log_error_replacement_remains_byte_bounded(tmp_path):
     executor = LocalExecutor()
     run_dir = tmp_path / "binary-logs"
-    execution_id = executor.submit(
-        executor.plan(
-            argv=["python3", "-c", "import sys; sys.stdout.buffer.write(b'\\xff' * 10000)"],
-            run_dir=run_dir,
-            cwd=tmp_path,
-            requires_result=False,
-        )
+    execution_id = _finish(
+        executor,
+        run_dir,
+        ["python3", "-c", "import sys; sys.stdout.buffer.write(b'\\xff' * 10000)"],
     )
-    executor._processes[execution_id].wait(timeout=5)
 
     stdout, _stderr = executor.read_logs(execution_id, tail_bytes=4096)
     assert stdout
@@ -488,24 +578,20 @@ def test_local_executor_bounds_log_files_without_limiting_artifacts(tmp_path):
     executor = LocalExecutor()
     run_dir = tmp_path / "bounded-logs"
     artifact = run_dir / "model.bin"
-    execution_id = executor.submit(
-        executor.plan(
-            argv=[
-                "python3",
-                "-c",
-                (
-                    "from pathlib import Path; import sys; "
-                    "Path(sys.argv[1]).write_bytes(b'a' * 1500000); "
-                    "print('x' * 1500000); print('y' * 1500000, file=sys.stderr)"
-                ),
-                str(artifact),
-            ],
-            run_dir=run_dir,
-            cwd=tmp_path,
-            requires_result=False,
-        )
+    execution_id = _finish(
+        executor,
+        run_dir,
+        [
+            "python3",
+            "-c",
+            (
+                "from pathlib import Path; import sys; "
+                "Path(sys.argv[1]).write_bytes(b'a' * 1500000); "
+                "print('x' * 1500000); print('y' * 1500000, file=sys.stderr)"
+            ),
+            str(artifact),
+        ],
     )
-    executor._processes[execution_id].wait(timeout=10)
 
     assert executor.status(execution_id).state == "succeeded"
     assert (run_dir / "stdout.log").stat().st_size == 1024 * 1024
@@ -517,117 +603,13 @@ def test_local_executor_bounds_log_files_without_limiting_artifacts(tmp_path):
     )
 
 
-def test_builtin_preflight_rejects_unconsumed_binding_values():
-    local = LocalExecutor(
-        binding_resources={"cpu": 2, "memory": "1Gi", "accelerators": ["gpu"], "typo": 1},
-        binding_spec={
-            "placement": {"zone": "x"},
-            "transport": {"kind": "x"},
-            "extensions": {"x": True},
-            "config": {
-                "executor": {},
-                "stores": {"artifacts": "remote"},
-                "isolation": {"driver": "none"},
-                "recovery": {"attempts": 2},
-                "typo": True,
-            },
-        },
-    )
-    issues = local.preflight()
-    assert len(issues) >= 8
-
-    slurm = SlurmExecutor(
-        shared_filesystem=True,
-        binding_resources={"nodes": 0, "gpus": True, "unknown": 1},
-        placement={"partition": "", "unknown": "x"},
-        binding_spec={"transport": {"x": True}, "extensions": {"x": True}, "config": "bad"},
-    )
-    issues = slurm.preflight()
-    assert any("positive integer" in issue for issue in issues)
-    assert any("non-empty string" in issue for issue in issues)
-
-
-def test_slurm_and_kubernetes_adapter_lifecycle(tmp_path, monkeypatch):
-    calls = []
-
-    def run(argv, **kwargs):
-        calls.append(argv)
-        if argv[0] == "sbatch":
-            return SimpleNamespace(stdout="42;cluster\n", returncode=0, stderr=b"")
-        if argv[0] == "sacct":
-            return SimpleNamespace(stdout="COMPLETED\n", returncode=0, stderr=b"")
-        if "cluster-info" in argv:
-            return SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
-        if "get" in argv:
-            return SimpleNamespace(stdout='{"status":{"succeeded":1}}', returncode=0, stderr=b"")
-        if "logs" in argv:
-            return SimpleNamespace(returncode=0, stdout=b"out", stderr=b"err")
-        return SimpleNamespace(returncode=0, stdout="", stderr=b"")
-
-    monkeypatch.setattr("omf.executors.slurm.subprocess.run", run)
-    monkeypatch.setattr("omf.executors.kubernetes.subprocess.run", run)
-    monkeypatch.setattr(shutil, "which", lambda _name: "/usr/bin/tool")
-    slurm = SlurmExecutor()
-    slurm_plan = slurm.plan(
-        argv=["python3", "train.py"],
-        run_dir=tmp_path / "slurm",
-        cwd=tmp_path,
-        resources={"nodes": 2, "tasks": 8, "gpus": 8},
-    )
-    assert slurm.submit(slurm_plan) == "42"
-    assert slurm.status("42").state == "succeeded"
-    slurm.cancel("42")
-    assert slurm.logs("42")[0].name == "slurm-42.out"
-
-    image = "registry/model@sha256:" + "a" * 64
-    kube = KubernetesExecutor(context="site")
-    assert kube.preflight() == []
-    plan = kube.plan(
-        argv=["python3", "train.py"],
-        run_dir=tmp_path / "kube",
-        cwd=tmp_path,
-        image=image,
-        name="training",
-    )
-    assert kube.submit(plan) == "training"
-    assert kube.status("training").state == "succeeded"
-    assert kube.logs("training")[0].read_bytes() == b"out"
-    kube.cancel("training")
-    jobset = kube.plan(
-        argv=["ignored"],
-        run_dir=tmp_path / "jobset",
-        cwd=tmp_path,
-        image=image,
-        roles=[{"name": "trainer"}],
-    )
-    assert jobset.metadata["resource"]["kind"] == "JobSet"
-
-
-def test_slurm_module_transport_plan_is_explicit(tmp_path):
-    executor = SlurmExecutor(
-        shared_filesystem=True,
-        binding_resources={"gpus": 4},
-        placement={"partition": "gpu"},
-    )
-    plan = executor.plan(
-        argv=["python3", "train.py"],
-        run_dir=tmp_path / "run",
-        cwd=tmp_path,
-        timeout=61,
-        requires_result=True,
-    )
-    script = plan.metadata["script"]
-    assert script.index("#SBATCH --gpus=4") < script.index("set -eu")
-    assert "#SBATCH --partition='gpu'" in script
-    assert "#SBATCH --time=2" in script
-    assert "OMF_REQUEST_FILE" in script
-    assert "OMF_RESULT_FILE" in script
-    assert "protocol:omf.module/v1" in executor.capabilities
-    executor.attach("42", tmp_path / "run")
-
-    with pytest.raises(RuntimeError, match="shared filesystem"):
-        SlurmExecutor().plan(
-            argv=["x"], run_dir=tmp_path / "missing", cwd=tmp_path, requires_result=True
-        )
-    with pytest.raises(RuntimeError, match="network denial"):
-        executor.plan(argv=["x"], run_dir=tmp_path / "denied", cwd=tmp_path, deny_network=True)
+def test_local_executor_applies_binding_resource_limits(tmp_path):
+    assert LocalExecutor(limits={"gpus": 1}).preflight() == [
+        "unsupported local resource limits: gpus"
+    ]
+    executor = LocalExecutor(limits={"addressSpaceBytes": 1024**3})
+    assert executor.preflight() == []
+    hungry = _finish(executor, tmp_path / "hungry", ["python3", "-c", "x = bytearray(4 * 1024**3)"])
+    assert executor.status(hungry).state == "failed"
+    modest = _finish(executor, tmp_path / "modest", ["python3", "-c", "x = bytearray(1024)"])
+    assert executor.status(modest).state == "succeeded"

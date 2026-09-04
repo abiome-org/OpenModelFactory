@@ -1,5 +1,3 @@
-"""Safe content-addressed filesystem store."""
-
 from __future__ import annotations
 
 import hashlib

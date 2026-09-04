@@ -1,20 +1,16 @@
-"""Command-line interface for the Open Model Factory."""
-
 from __future__ import annotations
 
 import json
 import subprocess
 import sys
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
-from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
 import typer
 import uvicorn
 import yaml
-from rich.console import Console
 
 from omf import __version__
 from omf.agent import capability_catalog, initial_context
@@ -24,7 +20,7 @@ from omf.config import ProjectPaths, discover_project
 from omf.config import bootstrap as bootstrap_project
 from omf.errors import OMFError
 from omf.factory import Factory
-from omf.federation import CapacityOffer, FederatedEvent, FederationBroker, Lease
+from omf.modules import scaffold_module
 from omf.schema_registry import default_registry
 
 app = typer.Typer(no_args_is_help=True, pretty_exceptions_show_locals=False)
@@ -41,10 +37,9 @@ api_app = typer.Typer(no_args_is_help=True)
 release_app = typer.Typer(no_args_is_help=True)
 experiment_app = typer.Typer(no_args_is_help=True)
 deployment_app = typer.Typer(no_args_is_help=True)
-federation_app = typer.Typer(no_args_is_help=True)
-capacity_app = typer.Typer(no_args_is_help=True)
 operation_app = typer.Typer(no_args_is_help=True)
 token_app = typer.Typer(no_args_is_help=True)
+admin_app = typer.Typer(no_args_is_help=True)
 agent_app = typer.Typer(no_args_is_help=True)
 goal_app = typer.Typer(no_args_is_help=True)
 knowledge_app = typer.Typer(no_args_is_help=True)
@@ -58,21 +53,18 @@ app.add_typer(resource_app, name="resource")
 app.add_typer(schema_app, name="schema")
 app.add_typer(runs_app, name="runs")
 app.add_typer(lineage_app, name="lineage")
-app.add_typer(secret_app, name="secret")
 app.add_typer(api_app, name="api")
 app.add_typer(release_app, name="release")
 app.add_typer(experiment_app, name="experiment")
 app.add_typer(deployment_app, name="deployment")
-app.add_typer(federation_app, name="federation")
-app.add_typer(capacity_app, name="capacity")
 app.add_typer(operation_app, name="operation")
-app.add_typer(token_app, name="token")
+app.add_typer(admin_app, name="admin")
+admin_app.add_typer(token_app, name="token")
+admin_app.add_typer(secret_app, name="secret")
 app.add_typer(agent_app, name="agent")
 app.add_typer(goal_app, name="goal")
 app.add_typer(knowledge_app, name="knowledge")
 app.add_typer(executor_app, name="executor")
-
-console = Console(stderr=False)
 
 
 class State:
@@ -97,7 +89,6 @@ def main(
     actor: str = typer.Option("local-user", "--actor", help="Attributable local actor"),
     version: bool = typer.Option(False, "--version", callback=_version, is_eager=True),
 ) -> None:
-    """Repository-centered, model-neutral development and release system."""
     del version
     if output not in {"table", "json", "yaml"}:
         raise typer.BadParameter("output must be table, json, or yaml")
@@ -117,16 +108,50 @@ def _factory() -> Iterator[Factory]:
         factory.close()
 
 
+def _run(function: Callable[[Factory], Any]) -> None:
+    def call() -> Any:
+        with _factory() as factory:
+            return function(factory)
+
+    _handle(call)
+
+
+def _row(item: dict[str, Any]) -> dict[str, Any]:
+    metadata = item.get("metadata")
+    if isinstance(metadata, dict) and "kind" in item:
+        return {
+            "kind": item["kind"],
+            "name": metadata.get("name"),
+            "revision": str(metadata.get("revision", ""))[:19],
+            "createdAt": metadata.get("createdAt"),
+        }
+    return {key: value for key, value in item.items() if not isinstance(value, dict)}
+
+
+def _table(rows: list[dict[str, Any]]) -> str:
+    columns = list(dict.fromkeys(key for row in rows for key in row))
+    cells = [[str(row.get(column, "")) for column in columns] for row in rows]
+    widths = [
+        max(len(column), *(len(line[index]) for line in cells))
+        for index, column in enumerate(columns)
+    ]
+    lines = [columns, *cells]
+    return "\n".join(
+        "  ".join(cell.ljust(width) for cell, width in zip(line, widths, strict=True)).rstrip()
+        for line in lines
+    )
+
+
 def _emit(value: Any) -> None:
+    tabular = isinstance(value, list) and value and all(isinstance(item, dict) for item in value)
     if state.output == "json":
         typer.echo(json.dumps(value, sort_keys=True, indent=2, default=str))
-    elif state.output == "yaml":
+    elif tabular and state.output == "table":
+        typer.echo(_table([_row(item) for item in value]))
+    elif isinstance(value, dict | list):
         typer.echo(yaml.safe_dump(value, sort_keys=True), nl=False)
-    elif isinstance(value, dict):
-        for key, item in value.items():
-            console.print(f"[bold]{key}[/bold]: {item}")
     else:
-        console.print(value)
+        typer.echo(value)
 
 
 def _load_value(path: Path) -> Any:
@@ -140,11 +165,11 @@ def _handle(function: Any) -> None:
         if state.output in {"json", "yaml"}:
             _emit(exc.as_dict())
         else:
-            console.print(f"[red]{exc.code}[/red]: {exc.message}")
+            typer.secho(f"{exc.code}: {exc.message}", fg="red", err=True)
             if exc.details:
-                console.print(exc.details)
+                typer.echo(yaml.safe_dump(exc.details, sort_keys=True), nl=False, err=True)
             for item in exc.remediation:
-                console.print(f"[bold]next[/bold]: {item.get('command', item['description'])}")
+                typer.echo(f"next: {item.get('command', item['description'])}", err=True)
         raise typer.Exit(code=1) from exc
 
 
@@ -153,30 +178,17 @@ def bootstrap(
     profile: str = typer.Option("local", help="Bootstrap profile"),
     plan: bool = typer.Option(False, "--plan", "--dry-run", help="Show changes only"),
 ) -> None:
-    """Create or reconcile a complete repository-scoped factory profile."""
     _handle(lambda: bootstrap_project(_paths(), profile=profile, plan=plan))
 
 
 @app.command()
 def doctor() -> None:
-    """Validate the host, project, storage, identity, and recovery prerequisites."""
-
-    def run() -> dict[str, Any]:
-        with _factory() as factory:
-            return factory.doctor()
-
-    _handle(run)
+    _run(lambda factory: factory.doctor())
 
 
 @executor_app.command("list")
 def executor_list() -> None:
-    """List built-in and trusted plugin providers with their configuration contracts."""
-
-    def run() -> dict[str, Any]:
-        with _factory() as factory:
-            return factory.executor_catalog()
-
-    _handle(run)
+    _run(lambda factory: factory.executor_catalog())
 
 
 @executor_app.command("preflight")
@@ -184,18 +196,11 @@ def executor_preflight(
     binding: Path,
     workload: Path | None = typer.Option(None, "--workload"),
 ) -> None:
-    """Check provider transport capabilities and prerequisites without allocating a run."""
-
-    def run() -> dict[str, Any]:
-        with _factory() as factory:
-            return factory.executor_preflight(binding, workload_path=workload)
-
-    _handle(run)
+    _run(lambda factory: factory.executor_preflight(binding, workload_path=workload))
 
 
 @agent_app.command("capabilities")
 def agent_capabilities() -> None:
-    """List stable action contracts, preconditions, effects, risk, and cost class."""
     _handle(capability_catalog)
 
 
@@ -206,8 +211,6 @@ def agent_context(
     since: str | None = typer.Option(None, "--since", help="Increment from an event cursor"),
     max_bytes: int = typer.Option(65_536, "--max-bytes", min=16_384, max=1_048_576),
 ) -> None:
-    """Return a bounded, digestible situation and deterministic next actions."""
-
     def run() -> dict[str, Any]:
         paths = _paths()
         if not paths.database.exists():
@@ -248,22 +251,18 @@ def goal_create(
     resource_ref: list[str] | None = typer.Option(None, "--resource-ref"),
     run_id: list[str] | None = typer.Option(None, "--run-id"),
 ) -> None:
-    """Persist measurable intent and initialize its guarded lifecycle status."""
-
-    def run() -> dict[str, Any]:
-        with _factory() as factory:
-            return factory.agent.create_goal(
-                name,
-                objective=objective,
-                success_criteria=success or [],
-                constraints=constraint,
-                budget=_budget_values(budget),
-                priority=priority,
-                parent_ref=parent_ref,
-                scope={"resourceRefs": resource_ref or [], "runIds": run_id or []},
-            )
-
-    _handle(run)
+    _run(
+        lambda factory: factory.agent.create_goal(
+            name,
+            objective=objective,
+            success_criteria=success or [],
+            constraints=constraint,
+            budget=_budget_values(budget),
+            priority=priority,
+            parent_ref=parent_ref,
+            scope={"resourceRefs": resource_ref or [], "runIds": run_id or []},
+        )
+    )
 
 
 @goal_app.command("list")
@@ -272,11 +271,7 @@ def goal_list(
     focus: str | None = typer.Option(None, "--focus"),
     limit: int = typer.Option(20, "--limit", min=1, max=100),
 ) -> None:
-    def run() -> dict[str, Any]:
-        with _factory() as factory:
-            return factory.agent.list_goals(state=state_filter, focus=focus, limit=limit)
-
-    _handle(run)
+    _run(lambda factory: factory.agent.list_goals(state=state_filter, focus=focus, limit=limit))
 
 
 @goal_app.command("status")
@@ -286,18 +281,14 @@ def goal_status(
     expected_version: int = typer.Option(..., "--expected-version", min=0),
     reason: str = typer.Option(..., "--reason"),
 ) -> None:
-    """Compare-and-set a goal status without losing concurrent decisions."""
-
-    def run() -> dict[str, Any]:
-        with _factory() as factory:
-            return factory.agent.set_goal_status(
-                name,
-                state=status_state,
-                expected_version=expected_version,
-                reason=reason,
-            )
-
-    _handle(run)
+    _run(
+        lambda factory: factory.agent.set_goal_status(
+            name,
+            state=status_state,
+            expected_version=expected_version,
+            reason=reason,
+        )
+    )
 
 
 @knowledge_app.command("record")
@@ -314,27 +305,23 @@ def knowledge_record(
     supersedes: list[str] | None = typer.Option(None, "--supersedes"),
     expires_at: str | None = typer.Option(None, "--expires-at"),
 ) -> None:
-    """Commit evidence-backed durable knowledge; never put secrets in claims."""
-
-    def run() -> dict[str, Any]:
-        with _factory() as factory:
-            return factory.agent.record_knowledge(
-                name,
-                category=category,
-                claim=claim,
-                confidence=confidence,
-                evidence=[{"ref": item} for item in evidence or []],
-                scope={
-                    "goalRefs": goal_ref or [],
-                    "resourceRefs": resource_ref or [],
-                    "runIds": run_id or [],
-                    "tags": tag or [],
-                },
-                supersedes=supersedes,
-                expires_at=expires_at,
-            )
-
-    _handle(run)
+    _run(
+        lambda factory: factory.agent.record_knowledge(
+            name,
+            category=category,
+            claim=claim,
+            confidence=confidence,
+            evidence=[{"ref": item} for item in evidence or []],
+            scope={
+                "goalRefs": goal_ref or [],
+                "resourceRefs": resource_ref or [],
+                "runIds": run_id or [],
+                "tags": tag or [],
+            },
+            supersedes=supersedes,
+            expires_at=expires_at,
+        )
+    )
 
 
 @knowledge_app.command("list")
@@ -343,13 +330,11 @@ def knowledge_list(
     focus: str | None = typer.Option(None, "--focus"),
     limit: int = typer.Option(20, "--limit", min=1, max=100),
 ) -> None:
-    def run() -> dict[str, Any]:
-        with _factory() as factory:
-            return factory.agent.list_knowledge(
-                active_only=not include_inactive, focus=focus, limit=limit
-            )
-
-    _handle(run)
+    _run(
+        lambda factory: factory.agent.list_knowledge(
+            active_only=not include_inactive, focus=focus, limit=limit
+        )
+    )
 
 
 @schema_app.command("list")
@@ -369,20 +354,12 @@ def schema_validate(path: Path) -> None:
 
 @resource_app.command("apply")
 def resource_apply(path: Path) -> None:
-    def run() -> dict[str, Any]:
-        with _factory() as factory:
-            return factory.apply_resource_file(path)
-
-    _handle(run)
+    _run(lambda factory: factory.apply_resource_file(path))
 
 
 @resource_app.command("list")
 def resource_list(kind: str | None = typer.Option(None)) -> None:
-    def run() -> list[dict[str, Any]]:
-        with _factory() as factory:
-            return factory.list_resources(kind=kind)
-
-    _handle(run)
+    _run(lambda factory: factory.list_resources(kind=kind))
 
 
 def _module_paths(path: Path | None) -> list[Path]:
@@ -394,22 +371,30 @@ def _module_paths(path: Path | None) -> list[Path]:
     return paths
 
 
+@module_app.command("init")
+def module_init(directory: Path, name: str | None = typer.Option(None, "--name")) -> None:
+    _run(lambda factory: factory.validate_module(scaffold_module(directory, name)))
+
+
 @module_app.command("validate")
 def module_validate(path: Path | None = typer.Argument(None)) -> None:
-    def run() -> list[dict[str, Any]]:
-        with _factory() as factory:
-            return [factory.validate_module(item) for item in _module_paths(path)]
-
-    _handle(run)
+    _run(lambda factory: [factory.validate_module(item) for item in _module_paths(path)])
 
 
 @module_app.command("test")
-def module_test(path: Path | None = typer.Argument(None)) -> None:
-    def run() -> list[dict[str, Any]]:
-        with _factory() as factory:
-            return [factory.test_module(item) for item in _module_paths(path)]
-
-    _handle(run)
+def module_test(
+    path: Path | None = typer.Argument(None),
+    binding: Path | None = typer.Option(
+        None,
+        "--binding",
+        help="Binding whose executor and dependency options run the fixtures (default: local).",
+    ),
+) -> None:
+    _run(
+        lambda factory: [
+            factory.test_module(item, binding_path=binding) for item in _module_paths(path)
+        ]
+    )
 
 
 @data_app.command("add")
@@ -443,20 +428,12 @@ def data_add(
 
 @data_app.command("list")
 def data_list() -> None:
-    def run() -> list[dict[str, Any]]:
-        with _factory() as factory:
-            return factory.list_resources(kind="DatasetSnapshot")
-
-    _handle(run)
+    _run(lambda factory: factory.list_resources(kind="DatasetSnapshot"))
 
 
 @data_app.command("verify")
 def data_verify(name: str) -> None:
-    def run() -> dict[str, Any]:
-        with _factory() as factory:
-            return {"name": name, "valid": factory.verify_data(name)}
-
-    _handle(run)
+    _run(lambda factory: {"name": name, "valid": factory.verify_data(name)})
 
 
 @data_app.command("revoke")
@@ -464,11 +441,7 @@ def data_revoke(
     name: str,
     reason: str = typer.Option(..., "--reason", help="Non-sensitive revocation reason"),
 ) -> None:
-    def run() -> dict[str, Any]:
-        with _factory() as factory:
-            return factory.revoke_data(name, reason=reason)
-
-    _handle(run)
+    _run(lambda factory: factory.revoke_data(name, reason=reason))
 
 
 @store_app.command("add")
@@ -479,26 +452,20 @@ def store_add(
     secret_ref: str | None = typer.Option(None, "--secret-ref"),
     plan: bool = typer.Option(False, "--plan", "--dry-run"),
 ) -> None:
-    def run() -> dict[str, Any]:
-        with _factory() as factory:
-            return factory.add_store(
-                name,
-                driver=driver,
-                endpoint=endpoint,
-                secret_ref=secret_ref,
-                plan=plan,
-            )
-
-    _handle(run)
+    _run(
+        lambda factory: factory.add_store(
+            name,
+            driver=driver,
+            endpoint=endpoint,
+            secret_ref=secret_ref,
+            plan=plan,
+        )
+    )
 
 
 @store_app.command("list")
 def store_list() -> None:
-    def run() -> list[dict[str, Any]]:
-        with _factory() as factory:
-            return factory.list_resources(kind="ArtifactStore")
-
-    _handle(run)
+    _run(lambda factory: factory.list_resources(kind="ArtifactStore"))
 
 
 def _sync(
@@ -548,52 +515,39 @@ def run_workload(
     binding: Path = typer.Option(Path("bindings/local.yaml"), "--binding"),
     detach: bool = typer.Option(False, "--detach"),
 ) -> None:
-    def run() -> dict[str, Any]:
-        with _factory() as factory:
-            if detach:
-                operation = factory.create_run_operation(workload, binding)
-                log_path = factory.paths.state / "operations" / f"{operation['id']}.log"
-                with log_path.open("ab") as log:
-                    subprocess.Popen(
-                        [
-                            sys.executable,
-                            "-m",
-                            "omf.run_worker",
-                            "--project",
-                            str(factory.paths.root),
-                            "--operation",
-                            operation["id"],
-                        ],
-                        stdin=subprocess.DEVNULL,
-                        stdout=log,
-                        stderr=log,
-                        close_fds=True,
-                        start_new_session=True,
-                    )
-                return operation
+    def run(factory: Factory) -> dict[str, Any]:
+        if not detach:
             return factory.run(workload, binding)
+        operation = factory.create_run_operation(workload, binding)
+        log_path = factory.paths.state / "operations" / f"{operation['id']}.log"
+        worker = ["-m", "omf.run_worker", "--project", str(factory.paths.root)]
+        with log_path.open("ab") as log:
+            subprocess.Popen(
+                [sys.executable, *worker, "--operation", operation["id"]],
+                stdin=subprocess.DEVNULL,
+                stdout=log,
+                stderr=log,
+                close_fds=True,
+                start_new_session=True,
+            )
+        return operation
 
-    _handle(run)
+    _run(run)
+
+
+@runs_app.command("list")
+def runs_list() -> None:
+    _run(lambda factory: factory.list_runs())
 
 
 @runs_app.command("status")
 def runs_status(run_id: str) -> None:
-    def run() -> dict[str, Any]:
-        with _factory() as factory:
-            return factory.run_status(run_id.removeprefix("run/"))
-
-    _handle(run)
+    _run(lambda factory: factory.run_status(run_id.removeprefix("run/")))
 
 
 @app.command("evaluate")
 def evaluate(subject: str) -> None:
-    """Materialize or inspect immutable evaluation evidence for a run."""
-
-    def run() -> dict[str, Any]:
-        with _factory() as factory:
-            return factory.evaluate(subject)
-
-    _handle(run)
+    _run(lambda factory: factory.evaluate(subject))
 
 
 @release_app.command("create")
@@ -608,21 +562,34 @@ def release_create(
     vulnerability_report: Path | None = typer.Option(None, "--vulnerability-report"),
     evaluation: str | None = typer.Option(None, "--evaluation"),
 ) -> None:
-    def run() -> dict[str, Any]:
-        with _factory() as factory:
-            return factory.create_release(
-                run_id,
-                name=name,
-                intended_use=intended_use,
-                limitations=limitation,
-                promote=promote,
-                alias=alias,
-                approvals=approval,
-                vulnerability_report=vulnerability_report,
-                evaluation_ref=evaluation,
-            )
+    _run(
+        lambda factory: factory.create_release(
+            run_id,
+            name=name,
+            intended_use=intended_use,
+            limitations=limitation,
+            promote=promote,
+            alias=alias,
+            approvals=approval,
+            vulnerability_report=vulnerability_report,
+            evaluation_ref=evaluation,
+        )
+    )
 
-    _handle(run)
+
+@release_app.command("evidence")
+def release_evidence(run_id: str) -> None:
+    _run(lambda factory: factory.release_evidence(run_id))
+
+
+@release_app.command("list")
+def release_list() -> None:
+    _run(lambda factory: factory.list_releases())
+
+
+@release_app.command("show")
+def release_show(name: str) -> None:
+    _run(lambda factory: factory.show_release(name.removeprefix("release/")))
 
 
 @experiment_app.command("create")
@@ -633,207 +600,57 @@ def experiment_create(
     metric: str = typer.Option(..., "--metric"),
     direction: str = typer.Option("maximize", "--direction"),
 ) -> None:
-    def run() -> dict[str, Any]:
-        with _factory() as factory:
-            return factory.create_experiment(
-                name=name,
-                baseline_ref=baseline,
-                candidate_ref=candidate,
-                metric=metric,
-                direction=direction,
-            )
-
-    _handle(run)
+    _run(
+        lambda factory: factory.create_experiment(
+            name=name,
+            baseline_ref=baseline,
+            candidate_ref=candidate,
+            metric=metric,
+            direction=direction,
+        )
+    )
 
 
 @app.command("deploy")
 def deploy(path: Path) -> None:
-    """Policy-check and apply a deployment resource."""
+    _run(lambda factory: factory.deploy(path))
 
-    def run() -> dict[str, Any]:
-        with _factory() as factory:
-            return factory.deploy(path)
 
-    _handle(run)
+@deployment_app.command("list")
+def deployment_list() -> None:
+    _run(lambda factory: factory.list_deployments())
 
 
 @deployment_app.command("status")
 def deployment_status(name: str) -> None:
-    def run() -> dict[str, Any]:
-        with _factory() as factory:
-            return factory.deployment_status(name)
-
-    _handle(run)
+    _run(lambda factory: factory.deployment_status(name))
 
 
 @deployment_app.command("cancel")
 def deployment_cancel(name: str) -> None:
-    def run() -> dict[str, Any]:
-        with _factory() as factory:
-            return factory.cancel_deployment(name)
-
-    _handle(run)
+    _run(lambda factory: factory.cancel_deployment(name))
 
 
 @deployment_app.command("rollback")
 def deployment_rollback(
     name: str, expected_version: int = typer.Option(..., "--expected-version", min=1)
 ) -> None:
-    def run() -> dict[str, Any]:
-        with _factory() as factory:
-            return factory.rollback_deployment(name, expected_version=expected_version)
-
-    _handle(run)
-
-
-@federation_app.command("identity")
-def federation_identity() -> None:
-    def run() -> dict[str, str]:
-        with _factory() as factory:
-            return factory.identity.export_trust_bundle()
-
-    _handle(run)
-
-
-@federation_app.command("trust")
-def federation_trust(peer_id: str, bundle: Path) -> None:
-    def run() -> dict[str, Any]:
-        value = _load_value(bundle)
-        if not isinstance(value, dict):
-            raise typer.BadParameter("trust bundle must be an object")
-        with _factory() as factory:
-            factory.federation.trust(peer_id, {str(key): str(item) for key, item in value.items()})
-        return {"peerId": peer_id, "trusted": True}
-
-    _handle(run)
-
-
-@federation_app.command("lease")
-def federation_lease(
-    peer_id: str,
-    lease_id: str = typer.Option(..., "--lease-id"),
-    expires_at: str = typer.Option(..., "--expires-at"),
-    policy_epoch: int = typer.Option(1, "--policy-epoch", min=1),
-) -> None:
-    def run() -> dict[str, Any]:
-        lease = Lease(lease_id, peer_id, expires_at, policy_epoch)
-        with _factory() as factory:
-            factory.federation.issue_lease(lease)
-        return asdict(lease)
-
-    _handle(run)
-
-
-@federation_app.command("emit")
-def federation_emit(
-    peer_id: str,
-    content: Path = typer.Option(..., "--content"),
-    lease_id: str = typer.Option(..., "--lease-id"),
-    kind: str = typer.Option(..., "--kind"),
-    resource: str = typer.Option(..., "--resource"),
-) -> None:
-    def run() -> dict[str, Any]:
-        with _factory() as factory:
-            return asdict(
-                factory.federation.emit(peer_id, lease_id, kind, resource, _load_value(content))
-            )
-
-    _handle(run)
-
-
-@federation_app.command("reconcile")
-def federation_reconcile(event: Path) -> None:
-    def run() -> dict[str, Any]:
-        value = _load_value(event)
-        if not isinstance(value, dict):
-            raise typer.BadParameter("federated event must be an object")
-        item = FederatedEvent(**value)
-        with _factory() as factory:
-            return {"eventId": item.event_id, "accepted": factory.federation.reconcile(item)}
-
-    _handle(run)
-
-
-@federation_app.command("outbox")
-def federation_outbox(peer_id: str | None = typer.Option(None, "--peer-id")) -> None:
-    def run() -> list[dict[str, Any]]:
-        with _factory() as factory:
-            return [asdict(event) for event in factory.federation.pending(peer_id)]
-
-    _handle(run)
-
-
-@federation_app.command("published")
-def federation_published(peer_id: str, event_id: str) -> None:
-    def run() -> dict[str, Any]:
-        with _factory() as factory:
-            factory.federation.mark_published(peer_id, event_id)
-        return {"peerId": peer_id, "eventId": event_id, "published": True}
-
-    _handle(run)
-
-
-@capacity_app.command("place")
-def capacity_place(
-    offers: Path,
-    residency: str = typer.Option(..., "--residency"),
-    resource: str = typer.Option(..., "--resource"),
-    amount: int = typer.Option(1, "--amount", min=1),
-    required_label: list[str] | None = typer.Option(None, "--required-label"),
-) -> None:
-    def run() -> dict[str, Any]:
-        values = _load_value(offers)
-        if not isinstance(values, list) or any(not isinstance(item, dict) for item in values):
-            raise typer.BadParameter("offers must be an array of objects")
-        candidates = [
-            CapacityOffer(
-                str(item["peer_id"]),
-                frozenset(str(label) for label in item.get("labels", [])),
-                {str(key): int(value) for key, value in item.get("capacity", {}).items()},
-                int(item.get("policy_epoch", 1)),
-            )
-            for item in values
-        ]
-        return asdict(
-            FederationBroker.place(
-                candidates,
-                required_labels=set(required_label or []),
-                residency=residency,
-                resource=resource,
-                amount=amount,
-            )
-        )
-
-    _handle(run)
+    _run(lambda factory: factory.rollback_deployment(name, expected_version=expected_version))
 
 
 @operation_app.command("list")
 def operation_list(state_filter: str | None = typer.Option(None, "--state")) -> None:
-    def run() -> list[dict[str, Any]]:
-        with _factory() as factory:
-            return factory.operations.list(state=state_filter)
-
-    _handle(run)
+    _run(lambda factory: factory.operations.list(state=state_filter))
 
 
 @operation_app.command("get")
 def operation_get(operation_id: str) -> None:
-    def run() -> dict[str, Any]:
-        with _factory() as factory:
-            return factory.operations.get(operation_id)
-
-    _handle(run)
+    _run(lambda factory: factory.operations.get(operation_id))
 
 
 @operation_app.command("reconcile")
 def operation_reconcile(operation_id: str) -> None:
-    """Execute pending work or reconcile completion evidence without uncertain replay."""
-
-    def run() -> dict[str, Any]:
-        with _factory() as factory:
-            return factory.execute_run_operation(operation_id)
-
-    _handle(run)
+    _run(lambda factory: factory.execute_run_operation(operation_id))
 
 
 @token_app.command("create")
@@ -842,41 +659,21 @@ def token_create(
     scope: list[str] | None = typer.Option(None, "--scope"),
     expires_at: str | None = typer.Option(None, "--expires-at"),
 ) -> None:
-    """Create an attributable API credential; the token is returned only once."""
-
-    def run() -> dict[str, Any]:
-        with _factory() as factory:
-            token, principal = factory.api_tokens.create(
-                actor=actor, scopes=set(scope or ["read"]), expires_at=expires_at
-            )
-        return {
-            "token": token,
-            "tokenId": principal.token_id,
-            "actor": principal.actor,
-            "scopes": sorted(principal.scopes),
-            "expiresAt": principal.expires_at,
-        }
-
-    _handle(run)
+    _run(
+        lambda factory: factory.create_api_token(
+            actor=actor, scopes=set(scope or ["read"]), expires_at=expires_at
+        )
+    )
 
 
 @token_app.command("list")
 def token_list() -> None:
-    def run() -> list[dict[str, Any]]:
-        with _factory() as factory:
-            return factory.api_tokens.list()
-
-    _handle(run)
+    _run(lambda factory: factory.api_tokens.list())
 
 
 @token_app.command("revoke")
 def token_revoke(token_id: str) -> None:
-    def run() -> dict[str, Any]:
-        with _factory() as factory:
-            factory.revoke_api_token(token_id)
-        return {"tokenId": token_id, "revoked": True}
-
-    _handle(run)
+    _run(lambda factory: factory.revoke_api_token(token_id))
 
 
 @lineage_app.command("show")
@@ -885,11 +682,7 @@ def lineage_show(
     direction: str = typer.Option("upstream"),
     max_depth: int = typer.Option(100, min=1, max=1000),
 ) -> None:
-    def run() -> list[dict[str, Any]]:
-        with _factory() as factory:
-            return factory.lineage_query(subject, direction=direction, max_depth=max_depth)
-
-    _handle(run)
+    _run(lambda factory: factory.lineage_query(subject, direction=direction, max_depth=max_depth))
 
 
 @secret_app.command("set")
@@ -899,40 +692,28 @@ def secret_set(
     value: str = typer.Option(...),
     expected_version: int | None = typer.Option(None, "--expected-version", min=1),
 ) -> None:
-    def run() -> dict[str, Any]:
-        with _factory() as factory:
-            version = factory.secrets.put(name, value, purpose, expected_version=expected_version)
-            return {"name": name, "purpose": purpose, "version": version}
+    def run(factory: Factory) -> dict[str, Any]:
+        version = factory.secrets.put(name, value, purpose, expected_version=expected_version)
+        return {"name": name, "purpose": purpose, "version": version}
 
-    _handle(run)
+    _run(run)
 
 
 @secret_app.command("list")
 def secret_list() -> None:
-    def run() -> list[dict[str, Any]]:
-        with _factory() as factory:
-            return factory.secrets.list()
-
-    _handle(run)
+    _run(lambda factory: factory.secrets.list())
 
 
-@app.command("backup")
+@admin_app.command("backup")
 def backup(destination: Path) -> None:
-    """Archive and verify metadata, identity, secrets, and local artifacts."""
-
-    def run() -> dict[str, Any]:
-        with _factory() as factory:
-            return factory.backup(destination)
-
-    _handle(run)
+    _run(lambda factory: factory.backup(destination))
 
 
-@app.command("restore")
+@admin_app.command("restore")
 def restore(
     source: Path,
     expected_key_id: str | None = typer.Option(None, "--expected-key-id"),
 ) -> None:
-    """Verify and restore a backup when the project has no existing .omf directory."""
     _handle(lambda: restore_backup(_paths(), source, expected_key_id=expected_key_id))
 
 
@@ -941,7 +722,6 @@ def api_serve(
     host: str = typer.Option("127.0.0.1"),
     port: int = typer.Option(8080, min=1, max=65535),
 ) -> None:
-    """Run the authenticated HTTP API. Keep it behind site TLS when exposed."""
     uvicorn.run(create_app(_paths()), host=host, port=port, log_level="info")
 
 

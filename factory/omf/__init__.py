@@ -1,5 +1,3 @@
-"""Open Model Factory reference implementation."""
-
 from __future__ import annotations
 
 from omf._version import __version__

@@ -2,7 +2,6 @@ apiVersion: omf.dev/v1alpha1
 kind: Policy
 metadata:
   name: default
-  namespace: local/open-model-factory
 spec:
   rules:
     - name: allow-local-project-operations

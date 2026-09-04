@@ -169,6 +169,8 @@ spec: {owners: [release-test], extensions: {}}
 """
     )
     _run(["git", "init", "-q"], cwd=project)
+    _run(["git", "config", "user.name", "OMF distribution test"], cwd=project)
+    _run(["git", "config", "user.email", "distribution-test@omf.invalid"], cwd=project)
     _run(["git", "add", "omf.yaml"], cwd=project)
     _run(["git", "commit", "-qm", "Initialize candidate project"], cwd=project)
     bootstrap = _run(
@@ -187,7 +189,7 @@ spec: {owners: [release-test], extensions: {}}
     backup = tmp_path / "candidate.omf-backup"
     backup_report = json.loads(
         _run(
-            [omf_command, "--project", project, "--output", "json", "backup", backup],
+            [omf_command, "--project", project, "--output", "json", "admin", "backup", backup],
             cwd=isolated,
             env=environment,
         ).stdout
@@ -203,6 +205,7 @@ spec: {owners: [release-test], extensions: {}}
                 restored,
                 "--output",
                 "json",
+                "admin",
                 "restore",
                 backup,
                 "--expected-key-id",
@@ -239,12 +242,12 @@ spec: {owners: [release-test], extensions: {}}
         cwd=isolated,
         env=environment,
     )
-    assert upgraded.stdout.strip() == "5"
+    assert upgraded.stdout.strip() == "6"
 
     sdist = distribution / "open_model_factory-1.0.0.tar.gz"
     with tarfile.open(sdist, "r:gz") as archive:
         members = {item.name.split("/", 1)[1] for item in archive if "/" in item.name}
-    assert {"README.md", "CHANGELOG.md", "manual/README.md", "install.sh"} <= members
+    assert {"README.md", "CHANGELOG.md", "docs/walkthrough.md", "install.sh"} <= members
     sdist_python, _ = _environment(tmp_path / "sdist-environment")
     _run(
         [

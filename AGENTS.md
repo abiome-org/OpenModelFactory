@@ -23,8 +23,7 @@ Read and change the system in this order:
    versioned resource and wire formats.
 2. `factory/omf/` and `tests/` define executable behavior and its evidence.
 3. `docs/architecture.md` explains system invariants and ownership boundaries.
-4. `manual/` provides status-labeled, tested model-building workflows.
-5. `README.md`, the rest of `docs/`, and `ROADMAP.md` explain orientation,
+4. `README.md`, the rest of `docs/`, and `ROADMAP.md` explain each concept,
    operation, and planned maturity.
 
 If these disagree, do not hide the conflict with a documentation-only change.
@@ -75,12 +74,11 @@ compatibility notes, implementation, tests, and documentation together.
   audit evidence, derivation, and long-running operation records.
 - `artifacts.py`, `data.py`, `sync.py`, and `stores/`: payload identity,
   registration, transfer, and storage.
-- `evaluation.py`, `policy.py`, `releases.py`, and `deployments.py`: measured
-  evidence and governed progression toward serving.
+- `policy.py` and `releases.py`: governed progression toward serving.
 - `install.sh`, `factory/omf/install_support.py`, and `templates/project/`:
   non-destructive installation and the installed operator guide.
-- `manual/`: task-oriented, CI-verified guidance that distinguishes tested,
-  conditional, and proposed paths.
+- `docs/`: one page per concept; `docs/walkthrough.md` carries the transcript
+  the manual test executes.
 
 Put behavior in the narrowest owner that can enforce it consistently. Change a
 source of truth instead of adding a one-use adapter or command-specific
@@ -96,8 +94,8 @@ override.
 - A new agent-visible operation must retain CLI/API parity where applicable and
   describe authorization, preconditions, effects, planning support,
   idempotency, risk, and cost in the action catalog.
-- Provider-specific options belong under `Binding.spec.config.executor`, never
-  in `WorkloadSpec`. Provider discovery uses trusted `omf.executors` entry
+- Provider-specific options belong under `Binding.spec.config`, never in
+  `WorkloadSpec`. Provider discovery uses trusted `omf.executors` entry
   points; duplicate or invalid providers must stop with an error.
 - A provider may advertise `omf.module/v1` only when admitted source,
   request/result, and declared artifact transport work end to end. It may
@@ -105,8 +103,43 @@ override.
 - Read `docs/executors.md` before changing executor capabilities. That guide is
   the source of truth for current built-in behavior and limitations.
 - Keep CLI reference details with the CLI, operations in `docs/operations.md`,
-  the example workflow in `manual/`, and release criteria in `ROADMAP.md`.
-  Avoid copying detailed capability claims into overview documents.
+  the tested workflow in `docs/walkthrough.md`, and release criteria in
+  `ROADMAP.md`. Avoid copying detailed capability claims into overview
+  documents.
+
+## Engineering rules
+
+These rules are not preferences. A change that violates one is not done.
+
+- **No toothless unit tests of any kind, ever.** Integration tests and stress
+  tests are permitted so long as they are realistic and never tautological. A
+  test that cannot fail when the behavior it names is broken is worthless.
+- **Never mock anything.** Always run the real full thing if possible. If the
+  real thing cannot run in the test environment, the test is skipped with the
+  reason recorded, not replaced by a fake.
+- **Tautological tests are considered actively harmful.** Asserting that code
+  returns what it was just handed, that a constant equals itself, or that a
+  fake behaves like its script is worse than no test, because it manufactures
+  confidence. This is stated twice on purpose.
+- **Never keep something ceremonially.** A schema no code produces or consumes,
+  a module nothing imports, a command that cannot complete its purpose, or a
+  required manifest field nothing enforces is deleted, not documented.
+- **Keep architecture maximally simple.** Prefer one obvious path over a
+  configurable one. Add abstraction only when a second real use exists.
+- **Deterministic linter rules that reduce cyclomatic complexity run as a hook
+  frequently.** Ruff's `C901`, `PLR0911`, `PLR0912`, and `PLR0915` are enabled
+  in `pyproject.toml`; `.claude/settings.json` runs them after every edit and
+  `make hooks` installs the same check as a Git pre-commit hook.
+- **No comments in the code.** The only documentation of code is
+  `docs/architecture.md`. Docstrings and `#` comments are rejected by
+  `make lint` (`tools/check_no_comments.py`); tool directives such as
+  `# noqa` and `# type: ignore` are the only exception.
+- **Before any PR, audit ruthlessly for cyclomatic complexity.** Run
+  `make lint` and treat every complexity finding as a defect to refactor, not
+  a threshold to raise.
+- **Before any PR, review the whole change with a subagent** when the harness
+  provides one, and ask it to ruthlessly reduce lines of code without losing
+  functionality. Apply what survives your own reading.
 
 ## Development and verification
 

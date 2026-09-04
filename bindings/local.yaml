@@ -2,21 +2,5 @@ apiVersion: omf.dev/v1alpha1
 kind: Binding
 metadata:
   name: local
-  namespace: local/open-model-factory
 spec:
   executor: local
-  resources:
-    cpu: auto
-    memory: auto
-    accelerators: []
-  config:
-    executor: {}
-    stores:
-      artifacts: local
-      checkpoints: local
-    isolation:
-      driver: subprocess
-      network: deny
-    recovery:
-      attempts: 1
-      checkpointOnCancel: false

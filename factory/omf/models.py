@@ -1,5 +1,3 @@
-"""Pydantic models and deterministic resource finalisation."""
-
 from __future__ import annotations
 
 from copy import deepcopy
@@ -13,8 +11,6 @@ from omf.ids import uuid7
 
 
 class Metadata(BaseModel):
-    """Common resource metadata; server-owned fields are optional while authoring."""
-
     model_config = ConfigDict(extra="forbid")
     name: str = Field(pattern=r"^[a-z0-9](?:[a-z0-9.-]{0,61}[a-z0-9])?$")
     namespace: str = Field(pattern=r"^[a-z0-9](?:[a-z0-9./-]{0,126}[a-z0-9])?$")
@@ -32,8 +28,6 @@ class Metadata(BaseModel):
 
 
 class Resource(BaseModel):
-    """Model-neutral common resource envelope."""
-
     model_config = ConfigDict(extra="forbid")
     apiVersion: str = Field(pattern=r"^omf\.dev/v1alpha1$")
     kind: str
@@ -45,7 +39,6 @@ class Resource(BaseModel):
 def finalize_resource(
     resource: dict[str, Any], *, actor: str, now: datetime | None = None
 ) -> dict[str, Any]:
-    """Copy and fill server metadata, deriving revision solely from immutable spec."""
     result = deepcopy(resource)
     metadata = result.setdefault("metadata", {})
     digest_content = {

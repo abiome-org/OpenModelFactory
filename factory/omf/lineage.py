@@ -1,5 +1,3 @@
-"""W3C-PROV-shaped deterministic lineage graph queries."""
-
 from __future__ import annotations
 
 import json

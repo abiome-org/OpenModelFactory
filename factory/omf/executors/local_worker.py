@@ -1,5 +1,3 @@
-"""Detached local execution monitor that durably records command completion."""
-
 from __future__ import annotations
 
 import argparse
@@ -67,6 +65,34 @@ def _write_log_tail(source: BinaryIO, path: Path, limit: int) -> None:
     os.replace(temporary, path)
 
 
+def _precheck(args: argparse.Namespace, evidence: dict[str, object]) -> str | None:
+    if evidence["argvDigest"] != args.argv_digest:
+        return "argv-digest-mismatch"
+    observed = []
+    for path_value, expected in args.attested_executable:
+        path = Path(path_value)
+        actual = "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest()
+        observed.append({"path": str(path), "digest": actual})
+        if actual != expected:
+            evidence["executables"] = observed
+            return "executable-digest-mismatch"
+    evidence["executables"] = observed
+    return None
+
+
+def _wait_child(child: subprocess.Popen[bytes], timeout: float | None) -> tuple[int, str]:
+    try:
+        exit_code = child.wait(timeout=timeout)
+        return exit_code, _stop_reason or ("completed" if exit_code == 0 else "nonzero-exit")
+    except subprocess.TimeoutExpired:
+        _signal_child(signal.SIGTERM)
+        try:
+            return child.wait(timeout=5.0), "timeout"
+        except subprocess.TimeoutExpired:
+            _signal_child(signal.SIGKILL)
+            return child.wait(), "timeout"
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--completion", required=True, type=Path)
@@ -91,27 +117,10 @@ def main() -> int:
         "argvDigest": sha256_digest(command),
         "executables": [],
     }
-    if evidence["argvDigest"] != args.argv_digest:
-        _write_completion(
-            args.completion, exit_code=1, reason="argv-digest-mismatch", evidence=evidence
-        )
+    failure = _precheck(args, evidence)
+    if failure is not None:
+        _write_completion(args.completion, exit_code=1, reason=failure, evidence=evidence)
         return 1
-    observed = []
-    for path_value, expected in args.attested_executable:
-        path = Path(path_value)
-        actual = "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest()
-        observed.append({"path": str(path), "digest": actual})
-        if actual != expected:
-            evidence["executables"] = observed
-            _write_completion(
-                args.completion,
-                exit_code=1,
-                reason="executable-digest-mismatch",
-                evidence=evidence,
-            )
-            return 1
-    evidence["executables"] = observed
-
     signal.signal(signal.SIGTERM, _handle_stop)
     signal.signal(signal.SIGINT, _handle_stop)
     global _child
@@ -135,17 +144,7 @@ def main() -> int:
     ]
     for reader in readers:
         reader.start()
-    try:
-        exit_code = _child.wait(timeout=args.timeout)
-        reason = _stop_reason or ("completed" if exit_code == 0 else "nonzero-exit")
-    except subprocess.TimeoutExpired:
-        reason = "timeout"
-        _signal_child(signal.SIGTERM)
-        try:
-            exit_code = _child.wait(timeout=5.0)
-        except subprocess.TimeoutExpired:
-            _signal_child(signal.SIGKILL)
-            exit_code = _child.wait()
+    exit_code, reason = _wait_child(_child, args.timeout)
     for reader in readers:
         reader.join()
     _write_completion(args.completion, exit_code=exit_code, reason=reason, evidence=evidence)

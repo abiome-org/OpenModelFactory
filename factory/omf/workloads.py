@@ -1,5 +1,3 @@
-"""Validated workload DAG and atomic state history."""
-
 from __future__ import annotations
 
 import fcntl
@@ -46,19 +44,9 @@ class Stage(BaseModel):
     config: dict[str, Any] = Field(default_factory=dict)
     inputs: dict[str, str] = Field(default_factory=dict)
     outputs: list[str] = Field(default_factory=list)
-    checkpoint_trigger: dict[str, Any] | None = Field(
-        default=None, validation_alias="checkpointTrigger"
-    )
-    evaluation_trigger: dict[str, Any] | None = Field(
-        default=None, validation_alias="evaluationTrigger"
-    )
-    idempotent: bool = False
-    retries: int = 0
 
 
 class AdmittedWorkload(BaseModel):
-    """Internal execution projection of one canonical WorkloadSpec resource."""
-
     model_config = ConfigDict(extra="forbid")
     stages: list[Stage]
     source_digest: str
@@ -66,14 +54,9 @@ class AdmittedWorkload(BaseModel):
     module_digests: dict[str, str] = Field(default_factory=dict)
     environments: dict[str, dict[str, Any]] = Field(default_factory=dict)
     input_revisions: dict[str, str] = Field(default_factory=dict)
-    parameters: dict[str, Any] = Field(default_factory=dict)
-    reproducibility: str = "lineage"
+    reference_revisions: dict[str, str] = Field(default_factory=dict)
     model_package_ref: str | None = None
-    mix_ref: str | None = None
     evaluation_refs: list[str] = Field(default_factory=list)
-    budget: dict[str, Any] = Field(default_factory=dict)
-    policies: list[str] = Field(default_factory=list)
-    child_work: dict[str, Any] = Field(default_factory=dict)
 
     @model_validator(mode="after")
     def graph(self) -> AdmittedWorkload:
@@ -84,8 +67,6 @@ class AdmittedWorkload(BaseModel):
         for stage in self.stages:
             if stage.name in stage.needs or not set(stage.needs) <= known:
                 raise ValueError(f"invalid dependency for {stage.name}")
-            if stage.retries and not stage.idempotent:
-                raise ValueError("retries require idempotent stage")
             for reference in stage.inputs.values():
                 producer, separator, output = reference.partition(".")
                 if separator and producer in known:
@@ -123,7 +104,6 @@ class AdmittedWorkload(BaseModel):
 
 
 def project_workload(resource: Any) -> AdmittedWorkload:
-    """Validate and project the only supported WorkloadSpec authoring contract."""
     value = default_registry.validate_as(resource, "WorkloadSpec")
     spec = value["spec"]
     try:
@@ -133,50 +113,20 @@ def project_workload(resource: Any) -> AdmittedWorkload:
         admitted = AdmittedWorkload(
             stages=stages,
             source_digest="pending",
-            parameters=spec["parameters"],
-            reproducibility=str(spec.get("reproducibility", "lineage")),
             model_package_ref=spec.get("modelPackageRef"),
-            mix_ref=spec.get("mixRef"),
             evaluation_refs=spec.get("evaluationRefs", []),
-            budget=spec.get("budget", {}),
-            policies=spec.get("policies", []),
-            child_work=spec.get("childWork", {}),
         )
     except PydanticValidationError as exc:
         raise ValidationError(
             "workload semantic validation failed",
             details={"errors": exc.error_count()},
         ) from exc
-    unsupported = [
-        field
-        for field in (
-            "parameters",
-            "budget",
-            "policies",
-            "childWork",
-        )
-        if spec.get(field)
-    ]
-    if any(stage.checkpoint_trigger or stage.evaluation_trigger for stage in stages):
-        unsupported.append("stageTriggers")
-    if any(stage.retries for stage in stages):
-        unsupported.append("retries")
-    if unsupported:
-        raise ValidationError(
-            "workload requests lifecycle features that are not executable",
-            details={"fields": unsupported},
-        )
-    reproducibility = admitted.reproducibility
-    if reproducibility != "lineage":
-        raise ValidationError(
-            f"reproducibility class {reproducibility!r} is not executable; use 'lineage'"
-        )
     desired = {
         "apiVersion": value["apiVersion"],
         "kind": value["kind"],
         "metadata": {
             "name": value["metadata"]["name"],
-            "namespace": value["metadata"]["namespace"],
+            "namespace": value["metadata"].get("namespace"),
         },
         "spec": spec,
     }
@@ -209,8 +159,8 @@ class StateStore:
             "modules": spec.module_digests,
             "environments": spec.environments,
             "inputs": spec.input_revisions,
+            "references": spec.reference_revisions,
             "modelPackage": spec.model_package_ref,
-            "reproducibility": spec.reproducibility,
         }
 
     def verify(self, spec: AdmittedWorkload) -> dict[str, Any]:
@@ -222,24 +172,9 @@ class StateStore:
         if not isinstance(stages, dict) or not set(stages) <= known:
             raise IntegrityError("run state contains an unknown stage")
         for name, stage in stages.items():
-            if not isinstance(stage, dict) or stage.get("status") not in {"succeeded", "failed"}:
-                raise IntegrityError(f"run state for stage {name!r} is invalid")
-            attempt = stage.get("attempt")
-            if not isinstance(attempt, int) or isinstance(attempt, bool) or attempt < 1:
-                raise IntegrityError(f"run state attempt for stage {name!r} is invalid")
-            if stage["status"] == "succeeded" and not isinstance(stage.get("outputs"), dict):
-                raise IntegrityError(f"run state outputs for stage {name!r} are invalid")
+            _verify_stage_record(name, stage)
         if value.get("state") == RunState.SUCCEEDED.value:
-            if set(stages) != known or any(
-                stage["status"] != "succeeded" for stage in stages.values()
-            ):
-                raise IntegrityError("succeeded run state does not contain every successful stage")
-            expected_outputs = {stage.name: set(stage.outputs) for stage in spec.stages}
-            for name, expected in expected_outputs.items():
-                if not expected <= set(stages[name]["outputs"]):
-                    raise IntegrityError(
-                        f"succeeded run state is missing declared outputs for stage {name!r}"
-                    )
+            _verify_succeeded(spec, stages)
         return value
 
     def _write(self, value: dict[str, Any]) -> None:
@@ -284,9 +219,28 @@ class StateStore:
             return value
 
 
-class WorkloadRunner:
-    """Mechanical synchronous runner; callable receives Stage and returns output digest mapping."""
+def _verify_stage_record(name: str, stage: Any) -> None:
+    if not isinstance(stage, dict) or stage.get("status") not in {"succeeded", "failed"}:
+        raise IntegrityError(f"run state for stage {name!r} is invalid")
+    attempt = stage.get("attempt")
+    if not isinstance(attempt, int) or isinstance(attempt, bool) or attempt < 1:
+        raise IntegrityError(f"run state attempt for stage {name!r} is invalid")
+    if stage["status"] == "succeeded" and not isinstance(stage.get("outputs"), dict):
+        raise IntegrityError(f"run state outputs for stage {name!r} are invalid")
 
+
+def _verify_succeeded(spec: AdmittedWorkload, stages: dict[str, Any]) -> None:
+    known = {stage.name for stage in spec.stages}
+    if set(stages) != known or any(stage["status"] != "succeeded" for stage in stages.values()):
+        raise IntegrityError("succeeded run state does not contain every successful stage")
+    for stage in spec.stages:
+        if not set(stage.outputs) <= set(stages[stage.name]["outputs"]):
+            raise IntegrityError(
+                f"succeeded run state is missing declared outputs for stage {stage.name!r}"
+            )
+
+
+class WorkloadRunner:
     def __init__(self, spec: AdmittedWorkload, store: StateStore) -> None:
         self.spec = spec
         self.store = store
@@ -303,19 +257,12 @@ class WorkloadRunner:
                 raise IntegrityError(
                     f"succeeded stage {name!r} output evidence failed verification"
                 )
-            for attempt in range(stage.retries + 1):
-                try:
-                    outputs = execute(stage)
-                    value["stages"][name] = {
-                        "status": "succeeded",
-                        "attempt": attempt + 1,
-                        "outputs": outputs,
-                    }
-                    self.store._write(value)
-                    break
-                except Exception:
-                    if attempt == stage.retries:
-                        value["stages"][name] = {"status": "failed", "attempt": attempt + 1}
-                        self.store._write(value)
-                        raise
+            try:
+                outputs = execute(stage)
+            except Exception:
+                value["stages"][name] = {"status": "failed", "attempt": 1}
+                self.store._write(value)
+                raise
+            value["stages"][name] = {"status": "succeeded", "attempt": 1, "outputs": outputs}
+            self.store._write(value)
         return value

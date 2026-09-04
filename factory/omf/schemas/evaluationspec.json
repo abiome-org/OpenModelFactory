@@ -2,38 +2,65 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "x-omf-kind": "EvaluationSpec",
   "type": "object",
-  "required": ["apiVersion", "kind", "metadata", "spec"],
+  "required": [
+    "apiVersion",
+    "kind",
+    "metadata",
+    "spec"
+  ],
   "properties": {
-    "apiVersion": {"const": "omf.dev/v1alpha1"},
-    "kind": {"const": "EvaluationSpec"},
-    "metadata": {"$ref": "#/$defs/metadata"},
+    "apiVersion": {
+      "const": "omf.dev/v1alpha1"
+    },
+    "kind": {
+      "const": "EvaluationSpec"
+    },
+    "metadata": {
+      "$ref": "#/$defs/metadata"
+    },
     "spec": {
       "type": "object",
-      "required": ["protocol", "metrics", "data", "inferencePolicy"],
+      "required": [
+        "metrics"
+      ],
       "properties": {
-        "protocol": {"const": "omf.evaluation/v1"},
         "metrics": {
           "type": "array",
           "minItems": 1,
           "items": {
             "type": "object",
-            "required": ["name", "output"],
+            "required": [
+              "name",
+              "output"
+            ],
             "properties": {
-              "name": {"type": "string", "minLength": 1},
-              "output": {"type": "string", "minLength": 1},
-              "minimum": {"type": "number"},
-              "maximum": {"type": "number"}
+              "name": {
+                "type": "string",
+                "minLength": 1
+              },
+              "output": {
+                "type": "string",
+                "minLength": 1
+              },
+              "minimum": {
+                "type": "number"
+              },
+              "maximum": {
+                "type": "number"
+              }
             },
             "additionalProperties": false
           }
         },
-        "data": {"type": "array"},
-        "inferencePolicy": {"type": "object"},
-        "extensions": {"$ref": "#/$defs/extension"}
+        "extensions": {
+          "$ref": "#/$defs/extension"
+        }
       },
       "additionalProperties": false
     },
-    "status": {"type": "object"}
+    "status": {
+      "type": "object"
+    }
   },
   "additionalProperties": false
 }

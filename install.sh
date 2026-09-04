@@ -181,9 +181,9 @@ project name if created: ${PROJECT_NAME}
 2. Install hash-locked runtime and build dependencies as binary wheels.
 3. Build this exact source without build isolation and install it into .venv.
 4. Preserve existing MODEL_CARD.md and omf.yaml, or create their project scaffolds.
-5. Create missing workspace directories, local binding, and default policy.
+5. Copy the runnable starter example, local binding, and default policy when missing.
 6. Preserve and extend AGENTS.md and .gitignore with managed OMF sections.
-7. Initialize Git only when the target is not already inside a repository.
+7. Initialize Git when needed and commit the project when it has no commit yet.
 8. Print and apply the repository-scoped local bootstrap plan under .omf/.
 9. Require omf doctor and bounded agent context to succeed.
 
@@ -226,17 +226,13 @@ if (
 PY
 
 for existing_directory in \
-  "${TARGET_ANCHOR}/connectors" \
-  "${TARGET_ANCHOR}/data" \
-  "${TARGET_ANCHOR}/deployments" \
-  "${TARGET_ANCHOR}/evaluations" \
   "${TARGET_ANCHOR}/bindings" \
-  "${TARGET_ANCHOR}/mixes" \
+  "${TARGET_ANCHOR}/data" \
+  "${TARGET_ANCHOR}/evaluations" \
   "${TARGET_ANCHOR}/model-packages" \
+  "${TARGET_ANCHOR}/modules" \
   "${TARGET_ANCHOR}/policies" \
-  "${TARGET_ANCHOR}/starter-packs" \
-  "${TARGET_ANCHOR}/workloads" \
-  "${TARGET_ANCHOR}/modules"; do
+  "${TARGET_ANCHOR}/workloads"; do
   assert_safe_directory "${existing_directory}"
 done
 for protected_path in \
@@ -249,7 +245,6 @@ for protected_path in \
   "${TARGET_ANCHOR}/.omf/store" \
   "${TARGET_ANCHOR}/.omf/runs" \
   "${TARGET_ANCHOR}/.omf/packages" \
-  "${TARGET_ANCHOR}/.omf/telemetry" \
   "${TARGET_ANCHOR}/.omf/operations"; do
   reject_symbolic_link "${protected_path}"
 done
@@ -640,23 +635,11 @@ render_template \
   "${PROJECT_NAME}" \
   "${PROJECT_NAMESPACE}"
 
-for directory in \
-  connectors \
-  data \
-  deployments \
-  evaluations \
-  bindings \
-  mixes \
-  model-packages \
-  policies \
-  starter-packs \
-  workloads \
-  modules; do
+for directory in bindings policies; do
   ensure_directory "${TARGET_ANCHOR}/${directory}"
 done
-for directory in models objectives transforms generators trainers inference environments evaluators; do
-  ensure_directory "${TARGET_ANCHOR}/modules/${directory}"
-done
+"${PYTHON}" "${INSTALL_SUPPORT}" starter "${SOURCE_DIR}" "${TARGET_ANCHOR}" \
+  || fail "could not copy the starter example into ${TARGET}"
 
 render_template \
   "${TEMPLATE_DIR}/bindings/local.yaml" \
@@ -684,6 +667,14 @@ if ! git -C "${TARGET_ANCHOR}" rev-parse --show-toplevel >/dev/null 2>&1; then
   printf 'Initializing Git repository\n'
   git init -q "${TARGET_ANCHOR}"
 fi
+if ! git -C "${TARGET_ANCHOR}" rev-parse --verify --quiet HEAD >/dev/null; then
+  printf 'Committing the initial project\n'
+  git -C "${TARGET_ANCHOR}" add -A
+  git -C "${TARGET_ANCHOR}" \
+    -c "user.name=$(git config user.name || printf 'OMF installer')" \
+    -c "user.email=$(git config user.email || printf 'installer@omf.invalid')" \
+    commit -q -m "Initialize Open Model Factory project"
+fi
 
 for protected_path in \
   "${TARGET_ANCHOR}/.omf" \
@@ -694,7 +685,6 @@ for protected_path in \
   "${TARGET_ANCHOR}/.omf/store" \
   "${TARGET_ANCHOR}/.omf/runs" \
   "${TARGET_ANCHOR}/.omf/packages" \
-  "${TARGET_ANCHOR}/.omf/telemetry" \
   "${TARGET_ANCHOR}/.omf/operations"; do
   reject_symbolic_link "${protected_path}"
 done

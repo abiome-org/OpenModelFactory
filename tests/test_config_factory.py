@@ -1,22 +1,27 @@
 import fcntl
 import hashlib
-import importlib.metadata
 import json
+import os
 import shutil
+import socket
 import subprocess
 import threading
 import time
+import venv
 from copy import deepcopy
 from dataclasses import replace
 from pathlib import Path
 
+import httpx
 import pytest
 import yaml
 from omf.artifacts import ArtifactBuilder
 from omf.config import ProjectPaths, bootstrap
 from omf.database import AliasRepository
 from omf.errors import (
+    AuthorizationError,
     CapabilityError,
+    ConfigurationError,
     ConflictError,
     IntegrityError,
     NotFoundError,
@@ -34,6 +39,8 @@ from omf.executors import (
 )
 from omf.factory import Factory, _execution_plan_digest
 from omf.modules import load_manifest
+from omf.policy import PolicyDecision
+from omf.releases import promote_alias
 from omf.sdk import ProtocolRequest
 from omf.workloads import project_workload
 
@@ -53,17 +60,46 @@ def _project(tmp_path: Path) -> ProjectPaths:
         )
     )
     (root / "bindings").mkdir()
-    binding = yaml.safe_load(Path("bindings/local.yaml").read_text())
-    binding["metadata"]["namespace"] = "local/test-project"
-    (root / "bindings/local.yaml").write_text(yaml.safe_dump(binding))
+    shutil.copy(Path("bindings/local.yaml"), root / "bindings/local.yaml")
     shutil.copytree(Path("modules"), root / "modules")
     shutil.copytree(Path("workloads"), root / "workloads")
-    workload = yaml.safe_load((root / "workloads/example-statistical.yaml").read_text())
-    workload["metadata"]["namespace"] = "local/test-project"
-    (root / "workloads/example-statistical.yaml").write_text(yaml.safe_dump(workload))
     (root / "data").mkdir()
     shutil.copy(Path("data/fixtures/numbers.jsonl"), root / "data/numbers.jsonl")
     return ProjectPaths(root)
+
+
+@pytest.fixture
+def paths(tmp_path: Path) -> ProjectPaths:
+    project = _project(tmp_path)
+    bootstrap(project)
+    return project
+
+
+_RIGHTS = {"license": "CC0-1.0", "trainingAllowed": True}
+
+
+def _add_numbers(factory: Factory, paths: ProjectPaths, name: str = "example-numbers") -> dict:
+    return factory.add_data(
+        paths.root / "data/numbers.jsonl", name=name, mode="copy", rights=dict(_RIGHTS)
+    )
+
+
+def _add_affine(factory: Factory) -> dict:
+    return factory.add_data(
+        Path("data/fixtures/affine.jsonl").resolve(),
+        name="example-affine",
+        mode="copy",
+        rights=dict(_RIGHTS),
+    )
+
+
+def _statistical(paths: ProjectPaths) -> tuple[Path, Path]:
+    return paths.root / "workloads/example-statistical.yaml", paths.root / "bindings/local.yaml"
+
+
+def _apply_affine_resources(factory: Factory) -> None:
+    for source in ("model-packages/example-affine.yaml", "evaluations/example-affine.yaml"):
+        factory.apply_resource_file(source)
 
 
 def test_clean_clone_to_signed_release_and_edge_deployment(tmp_path):
@@ -73,12 +109,7 @@ def test_clean_clone_to_signed_release_and_edge_deployment(tmp_path):
     assert bootstrap(paths)["actions"] == []
     with Factory(paths) as factory:
         assert factory.doctor()["ready"]
-        factory.add_data(
-            paths.root / "data/numbers.jsonl",
-            name="example-numbers",
-            mode="copy",
-            rights={"license": "CC0-1.0", "trainingAllowed": True},
-        )
+        _add_numbers(factory, paths)
         factory.add_store("secondary", driver="filesystem", endpoint=".omf/secondary-store")
         planned = factory.sync("dataset/example-numbers", destination="secondary", plan=True)
         assert planned["plan"]["bytes"] > 0
@@ -96,10 +127,7 @@ def test_clean_clone_to_signed_release_and_edge_deployment(tmp_path):
             factory.test_module(paths.root / "modules/examples/statistical/module.yaml")["passed"]
             == 1
         )
-        run = factory.run(
-            paths.root / "workloads/example-statistical.yaml",
-            paths.root / "bindings/local.yaml",
-        )
+        run = factory.run(*_statistical(paths))
         assert run["state"] == "Succeeded"
         assert factory.operations.get(run["operationId"])["state"] == "succeeded"
         assert factory.operations.get(run["operationId"])["result"]["runId"] == run["runId"]
@@ -172,8 +200,6 @@ def test_clean_clone_to_signed_release_and_edge_deployment(tmp_path):
             "metadata": {"name": "edge-demo", "namespace": "local/test-project"},
             "spec": {
                 "releaseRef": "release/release-one",
-                "runtime": "omf.module/v1",
-                "routing": {},
                 "extensions": {"form": "edge"},
             },
         }
@@ -250,27 +276,23 @@ def test_clean_clone_to_signed_release_and_edge_deployment(tmp_path):
         assert restarted.deployment_status("service-demo")["status"]["state"] == "succeeded"
 
 
-def test_non_local_binding_is_not_silently_executed_locally(tmp_path):
-    paths = _project(tmp_path)
-    bootstrap(paths)
+def test_non_local_binding_is_not_silently_executed_locally(paths):
     binding = yaml.safe_load((paths.root / "bindings/local.yaml").read_text())
     binding["metadata"]["name"] = "cluster"
-    binding["spec"]["executor"] = "slurm"
+    binding["spec"]["executor"] = "cluster-provider"
     binding_path = paths.root / "bindings/cluster.yaml"
     binding_path.write_text(yaml.safe_dump(binding))
 
     with Factory(paths) as factory:
-        with pytest.raises(CapabilityError, match="not ready") as failure:
+        with pytest.raises(CapabilityError, match="unknown executor provider") as failure:
             factory.run(paths.root / "workloads/example-statistical.yaml", binding_path)
-        assert "protocol:omf.module/v1" in failure.value.details["missingCapabilities"]
+        assert failure.value.details["available"] == ["local"]
         assert factory.list_resources(kind="Run") == []
         assert factory.operations.list() == []
         assert list(paths.runs.iterdir()) == []
 
 
-def test_injected_executor_runs_unchanged_workload(tmp_path):
-    paths = _project(tmp_path)
-    bootstrap(paths)
+def test_injected_executor_runs_unchanged_workload(paths):
     binding = yaml.safe_load((paths.root / "bindings/local.yaml").read_text())
     binding["metadata"]["name"] = "remote"
     binding["spec"]["executor"] = "test-remote"
@@ -300,12 +322,7 @@ def test_injected_executor_runs_unchanged_workload(tmp_path):
         )
     )
     with Factory(paths, executors=registry) as factory:
-        factory.add_data(
-            paths.root / "data/numbers.jsonl",
-            name="example-numbers",
-            mode="copy",
-            rights={"license": "CC0-1.0", "trainingAllowed": True},
-        )
+        _add_numbers(factory, paths)
         result = factory.run(paths.root / "workloads/example-statistical.yaml", binding_path)
     assert result["state"] == "Succeeded"
     assert len(created) == 2
@@ -314,15 +331,17 @@ def test_injected_executor_runs_unchanged_workload(tmp_path):
 
 
 def test_stable_executor_plugin_acceptance(tmp_path, monkeypatch):
-    plugin_root = Path("tests/fixtures/executor_plugin/src").resolve()
-    monkeypatch.syspath_prepend(str(plugin_root))
-    entry_point = importlib.metadata.EntryPoint(
-        name="stable-test",
-        value="omf_stable_executor:provider",
-        group="omf.executors",
+    site = tmp_path / "site"
+    info = site / "omf_stable_executor_test_plugin-1.0.0.dist-info"
+    info.mkdir(parents=True)
+    (info / "METADATA").write_text(
+        "Metadata-Version: 2.1\nName: omf-stable-executor-test-plugin\nVersion: 1.0.0\n"
     )
-    entry_points = importlib.metadata.EntryPoints([entry_point])
-    monkeypatch.setattr("omf.executors.registry.metadata.entry_points", lambda: entry_points)
+    (info / "entry_points.txt").write_text(
+        "[omf.executors]\nstable-test = omf_stable_executor:provider\n"
+    )
+    monkeypatch.syspath_prepend(str(site))
+    monkeypatch.syspath_prepend(str(Path("tests/fixtures/executor_plugin/src").resolve()))
     registry = ExecutorRegistry()
     registry.discover()
     assert registry.catalog() == {
@@ -332,7 +351,9 @@ def test_stable_executor_plugin_acceptance(tmp_path, monkeypatch):
             {
                 "name": "stable-test",
                 "apiVersion": EXECUTOR_API_VERSION,
-                "source": "entry-point:unknown:omf_stable_executor:provider",
+                "source": (
+                    "entry-point:omf-stable-executor-test-plugin:omf_stable_executor:provider"
+                ),
                 "description": "Independent acceptance-test executor.",
                 "capabilities": sorted(
                     MODULE_PROTOCOL_CAPABILITIES
@@ -363,22 +384,14 @@ def test_stable_executor_plugin_acceptance(tmp_path, monkeypatch):
     stable_binding = yaml.safe_load((paths.root / "bindings/local.yaml").read_text())
     stable_binding["metadata"]["name"] = "stable-test"
     stable_binding["spec"]["executor"] = "stable-test"
-    stable_binding["spec"]["config"]["executor"] = {"interruptStatusOnce": True}
+    stable_binding["spec"]["config"] = {"interruptStatusOnce": True}
     stable_binding_path = paths.root / "bindings/stable-test.yaml"
     stable_binding_path.write_text(yaml.safe_dump(stable_binding))
     bootstrap(paths)
 
     with Factory(paths) as local:
-        local.add_data(
-            paths.root / "data/numbers.jsonl",
-            name="example-numbers",
-            mode="copy",
-            rights={"license": "CC0-1.0", "trainingAllowed": True},
-        )
-        local_run = local.run(
-            paths.root / "workloads/example-statistical.yaml",
-            paths.root / "bindings/local.yaml",
-        )
+        _add_numbers(local, paths)
+        local_run = local.run(*_statistical(paths))
     with Factory(paths, executors=registry) as external:
         assert external.executor_preflight(
             stable_binding_path,
@@ -424,7 +437,7 @@ def test_stable_executor_plugin_acceptance(tmp_path, monkeypatch):
 
     recover_binding = deepcopy(stable_binding)
     recover_binding["metadata"]["name"] = "stable-test-recover"
-    recover_binding["spec"]["config"]["executor"] = {"interruptSubmitOnce": True}
+    recover_binding["spec"]["config"] = {"interruptSubmitOnce": True}
     recover_binding_path = paths.root / "bindings/stable-test-recover.yaml"
     recover_binding_path.write_text(yaml.safe_dump(recover_binding))
     with Factory(paths, executors=restarted_registry) as external:
@@ -528,9 +541,7 @@ def test_stable_executor_plugin_acceptance(tmp_path, monkeypatch):
     assert original.status(execution_id).state == "canceled"
 
 
-def test_opaque_dependency_lock_reaches_provider_without_core_interpretation(tmp_path):
-    paths = _project(tmp_path)
-    bootstrap(paths)
+def test_opaque_dependency_lock_reaches_provider_without_core_interpretation(paths, tmp_path):
     module_path = paths.root / "modules/examples/statistical/module.yaml"
     lock = b"\x00provider-specific\xff\n"
     (module_path.parent / "requirements.lock").write_bytes(lock)
@@ -608,9 +619,7 @@ def test_opaque_dependency_lock_reaches_provider_without_core_interpretation(tmp
         ),
     ],
 )
-def test_provider_environment_descriptor_is_centrally_validated(tmp_path, descriptor, message):
-    paths = _project(tmp_path)
-    bootstrap(paths)
+def test_provider_environment_descriptor_is_centrally_validated(paths, descriptor, message):
     module_path = paths.root / "modules/examples/statistical/module.yaml"
 
     class DescriptorExecutor(LocalExecutor):
@@ -632,26 +641,14 @@ def test_provider_environment_descriptor_is_centrally_validated(tmp_path, descri
             factory._prepare_module_environment(DescriptorExecutor(), manifest, code_root)
 
 
-def test_run_pins_dataset_revision_before_execution(tmp_path):
-    paths = _project(tmp_path)
-    bootstrap(paths)
+def test_run_pins_dataset_revision_before_execution(paths):
     with Factory(paths) as factory:
-        first = factory.add_data(
-            paths.root / "data/numbers.jsonl",
-            name="example-numbers",
-            mode="copy",
-            rights={"license": "CC0-1.0", "trainingAllowed": True},
-        )
+        first = _add_numbers(factory, paths)
         workload = yaml.safe_load((paths.root / "workloads/example-statistical.yaml").read_text())
         pinned = factory._pin_stage_inputs(project_workload(workload).stages)
 
         (paths.root / "data/numbers.jsonl").write_text('{"value": 99}\n')
-        second = factory.add_data(
-            paths.root / "data/numbers.jsonl",
-            name="example-numbers",
-            mode="copy",
-            rights={"license": "CC0-1.0", "trainingAllowed": True},
-        )
+        second = _add_numbers(factory, paths)
 
         assert first["metadata"]["revision"] != second["metadata"]["revision"]
         assert (
@@ -660,9 +657,7 @@ def test_run_pins_dataset_revision_before_execution(tmp_path):
         )
 
 
-def test_run_rejects_non_copy_dataset_before_allocation(tmp_path):
-    paths = _project(tmp_path)
-    bootstrap(paths)
+def test_run_rejects_non_copy_dataset_before_allocation(paths):
     with Factory(paths) as factory:
         factory.add_data(
             paths.root / "data/numbers.jsonl",
@@ -671,26 +666,478 @@ def test_run_rejects_non_copy_dataset_before_allocation(tmp_path):
             rights={"license": "CC0-1.0", "trainingAllowed": True},
         )
         with pytest.raises(CapabilityError, match="only copied dataset snapshots"):
-            factory.run(
-                paths.root / "workloads/example-statistical.yaml",
-                paths.root / "bindings/local.yaml",
-            )
+            factory.run(*_statistical(paths))
         assert factory.list_resources(kind="Run") == []
         assert list(paths.runs.iterdir()) == []
 
 
-def test_module_manifest_revision_changes_admitted_source_identity(tmp_path):
-    paths = _project(tmp_path)
-    bootstrap(paths)
+def test_module_manifest_revision_changes_admitted_source_identity(paths):
     manifest_path = paths.root / "modules/examples/statistical/module.yaml"
     with Factory(paths) as factory:
         first = factory.validate_module(manifest_path)
         manifest = yaml.safe_load(manifest_path.read_text())
-        manifest["spec"]["provenance"]["sourceRef"] = "repository:modules/examples/statistical-v2"
+        manifest["spec"]["extensions"] = {"sourceRef": "repository:modules/examples/statistical-v2"}
         manifest_path.write_text(yaml.safe_dump(manifest))
         second = factory.validate_module(manifest_path)
 
     assert first["artifactManifest"] != second["artifactManifest"]
+
+
+def test_module_test_executes_inside_symlink_virtual_environment(paths, tmp_path, monkeypatch):
+    environment_path = tmp_path / "venv"
+    venv.EnvBuilder(symlinks=True, with_pip=False, system_site_packages=True).create(
+        environment_path
+    )
+    python = environment_path / "bin" / "python3"
+    if not python.is_symlink():
+        pytest.skip("this platform does not create symlink interpreters")
+    module_dir = paths.root / "modules/examples/statistical"
+    (module_dir / "main.py").write_text(
+        "import json, os, sys\n"
+        f"EXPECTED = {str(environment_path)!r}\n"
+        "if sys.prefix != EXPECTED:\n"
+        "    raise SystemExit(f'wrong interpreter environment: {sys.prefix}')\n"
+        "with open(os.environ['OMF_RESULT_FILE'], 'w') as stream:\n"
+        "    json.dump({'protocol': 'omf.module/v1', 'status': 'ok'}, stream)\n"
+    )
+    monkeypatch.setenv("PATH", f"{environment_path / 'bin'}{os.pathsep}{os.environ['PATH']}")
+
+    with Factory(paths) as factory:
+        report = factory.test_module(module_dir / "module.yaml")
+
+    assert report["passed"] == 1
+
+
+def test_run_realizes_module_dependency_lock_from_binding_wheelhouse(tmp_path):
+    from _wheels import build_wheel, lock_for
+
+    paths = _project(tmp_path)
+    bootstrap(paths)
+    wheelhouse = paths.root / "wheels"
+    _wheel, wheel_digest = build_wheel(wheelhouse)
+    lock = lock_for("omftiny", "1.0", wheel_digest)
+    module_dir = paths.root / "modules/locked"
+    shutil.copytree(paths.root / "modules/examples/statistical", module_dir)
+    (module_dir / "requirements.lock").write_bytes(lock)
+    manifest = yaml.safe_load((module_dir / "module.yaml").read_text())
+    manifest["metadata"]["name"] = "locked"
+    manifest["spec"]["environment"]["dependencyDigest"] = (
+        "sha256:" + hashlib.sha256(lock).hexdigest()
+    )
+    manifest["spec"]["extensions"] = {"sourceRef": "repository:modules/locked"}
+    (module_dir / "module.yaml").write_text(yaml.safe_dump(manifest))
+    (module_dir / "main.py").write_text(
+        "import omftiny\n"
+        "from omf.sdk import ProtocolResult, main\n"
+        "def validate(_request):\n"
+        "    return ProtocolResult(status='ok')\n"
+        "def run(_request):\n"
+        "    return ProtocolResult(status='ok', outputs={'omftiny': omftiny.VERSION})\n"
+        "if __name__ == '__main__':\n"
+        "    raise SystemExit(main({'validate': validate, 'run': run}))\n"
+    )
+    binding = yaml.safe_load((paths.root / "bindings/local.yaml").read_text())
+    binding["spec"]["config"] = {
+        "dependencyWheelhouse": "wheels",
+        "dependencyIndex": False,
+    }
+    binding_path = paths.root / "bindings/wheelhouse.yaml"
+    binding_path.write_text(yaml.safe_dump(binding))
+    workload_path = paths.root / "workloads/locked.yaml"
+    workload_path.write_text(
+        yaml.safe_dump(
+            {
+                "apiVersion": "omf.dev/v1alpha1",
+                "kind": "WorkloadSpec",
+                "metadata": {"name": "locked", "namespace": "local/test-project"},
+                "spec": {
+                    "graph": {
+                        "stages": [
+                            {
+                                "name": "train",
+                                "module": "modules/locked/module.yaml",
+                                "operation": "run",
+                                "outputs": ["omftiny"],
+                            }
+                        ]
+                    },
+                },
+            }
+        )
+    )
+
+    with Factory(paths) as factory:
+        tested = factory.test_module(module_dir / "module.yaml", binding_path=binding_path)
+        result = factory.run(workload_path, binding_path)
+        admission = factory._run_resource(result["runId"])["spec"]["extensions"]
+
+    assert tested["passed"] == 1
+    assert result["state"] == "Succeeded"
+    assert result["outputs"]["train.omftiny"] == "1.0"
+    realization = admission["environments"]["train"]["realization"]
+    assert realization["strategy"] == "venv"
+    assert realization["options"] == {"index": False, "wheelhouse": str(wheelhouse)}
+    assert len(list(paths.environments.glob("*/omf-environment.json"))) == 1
+
+
+def _scan_for(paths: ProjectPaths, factory: Factory, run: dict) -> Path:
+    admission = factory._run_resource(run["runId"])["spec"]["extensions"]
+    subjects = [run["outputs"]["train.model"], *admission["moduleDigests"].values()]
+    if admission.get("inferenceAdapter"):
+        subjects.append(admission["inferenceAdapter"]["sourceDigest"])
+    scan_path = paths.root / f"scan-{run['runId']}.yaml"
+    scan_path.write_text(
+        yaml.safe_dump(
+            {
+                "scanner": {"name": "test-scanner", "version": "1"},
+                "databaseRevision": "test-db-1",
+                "generatedAt": "2026-09-01T00:00:00Z",
+                "subjects": subjects,
+                "findings": [],
+                "waivers": [],
+            }
+        )
+    )
+    return scan_path
+
+
+def test_alias_promotion_moves_between_releases(paths):
+    with Factory(paths) as factory:
+        _add_numbers(factory, paths)
+        run = factory.run(*_statistical(paths))
+        factory.evaluate(f"run/{run['runId']}")
+        scan_path = _scan_for(paths, factory, run)
+        first = factory.create_release(
+            run["runId"],
+            name="release-one",
+            intended_use="test",
+            promote=True,
+            approvals=["independent-reviewer"],
+            vulnerability_report=scan_path,
+        )
+        aliases = AliasRepository(factory.db)
+        assert aliases.get("candidate") == (
+            first["metadata"]["uid"],
+            first["metadata"]["revision"],
+            1,
+        )
+        second = factory.create_release(
+            run["runId"],
+            name="release-two",
+            intended_use="test",
+            promote=True,
+            approvals=["independent-reviewer"],
+            vulnerability_report=scan_path,
+        )
+        assert aliases.get("candidate") == (
+            second["metadata"]["uid"],
+            second["metadata"]["revision"],
+            2,
+        )
+        with pytest.raises(ConflictError, match="alias version mismatch"):
+            promote_alias(
+                factory.db,
+                factory.events,
+                name="candidate",
+                uid=first["metadata"]["uid"],
+                revision=first["metadata"]["revision"],
+                expected_version=1,
+                actor="tester",
+                policy_decision=PolicyDecision("allow", "sha256:policy", ()),
+            )
+        assert aliases.get("candidate")[2] == 2
+        moved = list(factory.events.query(type="AliasMoved"))
+        assert [event.data["version"] for event in moved] == [1, 2]
+
+
+def _committed_policy_project(tmp_path: Path, *, dirty_worktree: str = "deny") -> ProjectPaths:
+    paths = _project(tmp_path)
+    (paths.root / ".gitignore").write_text(".omf/\n")
+    (paths.root / "policies").mkdir()
+    policy = yaml.safe_load(Path("policies/default.yaml").read_text())
+    policy["metadata"]["namespace"] = "local/test-project"
+    policy["spec"]["rules"][0]["match"]["resource"] = "local/test-project"
+    policy["spec"]["config"]["dirtyWorktree"] = dirty_worktree
+    (paths.root / "policies/default.yaml").write_text(yaml.safe_dump(policy))
+    for command in (
+        ["git", "config", "user.name", "t"],
+        ["git", "config", "user.email", "t@t"],
+        ["git", "add", "."],
+        ["git", "commit", "-qm", "Commit the project"],
+    ):
+        subprocess.run(command, cwd=paths.root, check=True)
+    bootstrap(paths)
+    return paths
+
+
+def test_policy_directory_governs_admission_actors_and_worktree(tmp_path):
+    paths = _committed_policy_project(tmp_path)
+    workload, binding = _statistical(paths)
+    with Factory(paths) as factory:
+        checks = {item["name"]: item for item in factory.doctor()["checks"]}
+        assert checks["policy"]["status"] == "pass"
+        assert factory.policy.enforced
+        _add_numbers(factory, paths)
+        run = factory.run(workload, binding)
+        admission = factory._run_resource(run["runId"])["spec"]["extensions"]
+        assert admission["policyDigest"] == factory.policy.digest
+        assert admission["worktree"]["dirty"] is False
+        assert admission["worktree"]["commit"]
+        assert admission["worktree"]["policy"] == "deny"
+        admitted = next(iter(factory.events.query(run_id=run["runId"], type="RunAdmitted")))
+        assert admitted.policy_digest == factory.policy.digest
+        assert factory.operations.get(run["operationId"])["request"]["worktree"]["dirty"] is False
+
+        (paths.root / "scratch.txt").write_text("uncommitted\n")
+        with pytest.raises(ValidationError, match="dirty worktree"):
+            factory.run(workload, binding)
+        assert len(factory.operations.list()) == 1
+
+        policy_path = paths.root / "policies/default.yaml"
+        policy = yaml.safe_load(policy_path.read_text())
+        policy["spec"]["config"]["dirtyWorktree"] = "archive"
+        policy_path.write_text(yaml.safe_dump(policy))
+        assert factory.policy.dirty_worktree == "archive"
+        archived = factory.run(workload, binding)
+        worktree = factory._run_resource(archived["runId"])["spec"]["extensions"]["worktree"]
+        assert worktree["dirty"] is True
+        assert worktree["policy"] == "archive"
+        assert "scratch.txt" in worktree["untracked"]
+        assert worktree["untrackedCount"] == 1
+        patch = factory.local_store.read_manifest(worktree["patchArtifact"])
+        assert patch.logical_kind == "worktree-patch"
+        assert patch.provenance["commit"] == worktree["commit"]
+
+        policy["spec"]["config"]["retention"] = {"days": 1}
+        policy_path.write_text(yaml.safe_dump(policy))
+        with pytest.raises(ConfigurationError, match="not enforced"):
+            factory.run(workload, binding)
+        checks = {item["name"]: item for item in factory.doctor()["checks"]}
+        assert checks["policy"]["status"] == "fail"
+        del policy["spec"]["config"]["retention"]
+        policy_path.write_text(yaml.safe_dump(policy))
+
+    with Factory(paths, actor="stranger") as stranger:
+        with pytest.raises(AuthorizationError, match="policy denies actor 'stranger'"):
+            stranger.run(workload, binding)
+        with pytest.raises(AuthorizationError):
+            _add_numbers(stranger, paths, name="more")
+        with pytest.raises(AuthorizationError):
+            stranger.revoke_data("example-numbers", reason="not allowed")
+        denials = list(stranger.events.query(type="PolicyDecisionRecorded"))
+        assert denials
+        assert denials[-1].data["outcome"] == "deny"
+        assert denials[-1].actor == "stranger"
+        assert stranger.find_resource("DatasetSnapshot", "example-numbers")["spec"]["rights"][
+            "trainingAllowed"
+        ]
+
+
+def _affine_project(tmp_path: Path) -> tuple[ProjectPaths, Path]:
+    paths = _project(tmp_path)
+    workload_path = paths.root / "workloads/example-from-scratch.yaml"
+    bootstrap(paths)
+    with Factory(paths) as factory:
+        _apply_affine_resources(factory)
+        _add_affine(factory)
+    return paths, workload_path
+
+
+def _free_port() -> int:
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        return int(sock.getsockname()[1])
+
+
+def test_service_deployment_serves_release_through_admitted_adapter(tmp_path):
+    paths, workload_path = _affine_project(tmp_path)
+    port = _free_port()
+    with Factory(paths) as factory:
+        run = factory.run(workload_path, paths.root / "bindings/local.yaml")
+        factory.evaluate(f"run/{run['runId']}")
+        release = factory.create_release(
+            run["runId"],
+            name="affine-v1",
+            intended_use="test",
+            promote=True,
+            approvals=["independent-reviewer"],
+            vulnerability_report=_scan_for(paths, factory, run),
+        )
+        (paths.root / "modules/examples/affine-serving/main.py").write_text(
+            "raise RuntimeError('live serving source must not execute')\n"
+        )
+        deployment_path = paths.root / "service.yaml"
+        deployment_path.write_text(
+            yaml.safe_dump(
+                {
+                    "apiVersion": "omf.dev/v1alpha1",
+                    "kind": "DeploymentSpec",
+                    "metadata": {"name": "affine-service", "namespace": "local/test-project"},
+                    "spec": {
+                        "releaseRef": "release/affine-v1",
+                        "extensions": {"form": "service", "port": port},
+                    },
+                }
+            )
+        )
+        applied = factory.deploy(deployment_path)
+        assert applied["state"] == "running"
+        status = factory.deployment_status("affine-service")["status"]
+        assert status["endpoint"] == f"http://127.0.0.1:{port}"
+        serving = json.loads((Path(status["runDirectory"]) / "serving.json").read_text())
+        assert serving["state"]["format"] == "json-affine/v1"
+        assert (
+            serving["modelPackageRef"]
+            == (release["spec"]["extensions"]["manifest"]["modelPackage"]["ref"])
+        )
+        assert serving["cwd"].startswith(status["runDirectory"])
+
+        with httpx.Client(base_url=status["endpoint"], timeout=5.0) as client:
+            health = None
+            for _ in range(300):
+                try:
+                    health = client.get("/healthz")
+                    if health.status_code == 200:
+                        break
+                except httpx.HTTPError:
+                    pass
+                assert factory.deployment_status("affine-service")["status"]["state"] == "running"
+                time.sleep(0.1)
+            assert health is not None, "endpoint never became healthy"
+            assert health.status_code == 200, "endpoint never became healthy"
+            assert health.json()["release"] == release["metadata"]["revision"]
+            inference = client.post("/v1/infer", json={"inputs": {"input": 3.0}})
+            assert inference.status_code == 200, inference.text
+            body = inference.json()
+            assert body["outputs"]["prediction"] == pytest.approx(7.0, abs=0.01)
+            assert body["release"] == release["metadata"]["revision"]
+            invalid = client.post("/v1/infer", json={"inputs": {"input": "three"}})
+            assert invalid.status_code == 400
+            assert "three" not in invalid.text
+            unknown = client.post("/v1/infer", json={"inputs": {"input": 1.0, "extra": 2}})
+            assert unknown.status_code == 400
+            assert client.get("/healthz").json()["requests"] == 1
+
+        canceled = factory.cancel_deployment("affine-service")
+        assert canceled["status"]["state"] == "canceled"
+
+        deployment_path.write_text(
+            deployment_path.read_text().replace("form: service", "form: batch")
+        )
+        with pytest.raises(ValidationError, match=r"require extensions\.command"):
+            factory.deploy(deployment_path)
+
+
+def test_reference_inputs_pin_prior_release_checkpoint_and_artifact(tmp_path):
+    paths, workload_path = _affine_project(tmp_path)
+    probe = paths.root / "modules/probe"
+    shutil.copytree(paths.root / "modules/examples/statistical", probe)
+    manifest = yaml.safe_load((probe / "module.yaml").read_text())
+    manifest["metadata"]["name"] = "probe"
+    manifest["spec"]["extensions"] = {"sourceRef": "repository:modules/probe"}
+    (probe / "module.yaml").write_text(yaml.safe_dump(manifest))
+    (probe / "main.py").write_text(
+        "import os\n"
+        "from omf.sdk import ProtocolResult, main\n"
+        "def validate(_request):\n"
+        "    return ProtocolResult(status='ok')\n"
+        "def run(request):\n"
+        "    seen = {}\n"
+        "    for key, value in request.inputs.items():\n"
+        "        seen[key] = {\n"
+        "            'kind': value['kind'],\n"
+        "            'exists': os.path.isfile(value['path']),\n"
+        "            'state': value.get('state'),\n"
+        "            'resource': value['resource'],\n"
+        "        }\n"
+        "    return ProtocolResult(status='ok', outputs={'seen': seen})\n"
+        "if __name__ == '__main__':\n"
+        "    raise SystemExit(main({'validate': validate, 'run': run}))\n"
+    )
+
+    def refine_workload(base: str, checkpoint: str, raw: str) -> Path:
+        path = paths.root / "workloads/refine.yaml"
+        path.write_text(
+            yaml.safe_dump(
+                {
+                    "apiVersion": "omf.dev/v1alpha1",
+                    "kind": "WorkloadSpec",
+                    "metadata": {"name": "refine", "namespace": "local/test-project"},
+                    "spec": {
+                        "graph": {
+                            "stages": [
+                                {
+                                    "name": "refine",
+                                    "module": "modules/probe/module.yaml",
+                                    "operation": "run",
+                                    "inputs": {"base": base, "ckpt": checkpoint, "raw": raw},
+                                    "outputs": ["seen"],
+                                }
+                            ]
+                        },
+                    },
+                }
+            )
+        )
+        return path
+
+    with Factory(paths) as factory:
+        baseline = factory.run(workload_path, paths.root / "bindings/local.yaml")
+        factory.evaluate(f"run/{baseline['runId']}")
+        release = factory.create_release(
+            baseline["runId"],
+            name="affine-v1",
+            intended_use="test",
+            promote=True,
+            approvals=["independent-reviewer"],
+            vulnerability_report=_scan_for(paths, factory, baseline),
+        )
+        release_uri = factory._resource_uri(release)
+        checkpoint = factory.list_resources(kind="Checkpoint")[0]
+        checkpoint_name = checkpoint["metadata"]["name"]
+        model_digest = baseline["outputs"]["train.model"]
+        operations_before = len(factory.operations.list())
+
+        with pytest.raises(NotFoundError):
+            factory.run(
+                refine_workload("release/missing", f"checkpoint/{checkpoint_name}", model_digest),
+                paths.root / "bindings/local.yaml",
+            )
+        assert len(factory.operations.list()) == operations_before
+        assert len(factory.list_resources(kind="Run")) == 1
+
+        refined = factory.run(
+            refine_workload("release/affine-v1", f"checkpoint/{checkpoint_name}", model_digest),
+            paths.root / "bindings/local.yaml",
+        )
+        seen = refined["outputs"]["refine.seen"]
+        admission = factory._run_resource(refined["runId"])["spec"]["extensions"]
+        stage_lineage = factory.lineage_query(f"run:{refined['runId']}/stage:refine")
+        impact = factory.lineage_query(release_uri, direction="downstream")
+        materialized = sorted(
+            item.name for item in (paths.runs / refined["runId"] / "stages/refine/inputs").iterdir()
+        )
+
+    assert refined["state"] == "Succeeded"
+    assert seen["base"]["kind"] == "release"
+    assert seen["base"]["exists"]
+    assert seen["base"]["resource"] == release_uri
+    assert seen["base"]["state"]["format"] == "json-affine/v1"
+    assert seen["ckpt"]["kind"] == "checkpoint"
+    assert seen["ckpt"]["exists"]
+    assert seen["ckpt"]["state"]["slope"] == pytest.approx(2.0, abs=0.01)
+    assert seen["raw"]["kind"] == "artifact"
+    assert seen["raw"]["exists"]
+    assert seen["raw"]["state"] is None
+    assert materialized == ["base", "ckpt", "raw"]
+    assert admission["admittedReferences"] == {
+        "release/affine-v1": release_uri,
+        f"checkpoint/{checkpoint_name}": factory._resource_uri(checkpoint),
+        model_digest: f"artifact:{model_digest}",
+    }
+    used = {edge["source"] for edge in stage_lineage if edge["relation"] == "used"}
+    assert {release_uri, factory._resource_uri(checkpoint), f"artifact:{model_digest}"} <= used
+    assert any(edge["target"] == f"run:{refined['runId']}/stage:refine" for edge in impact)
 
 
 def test_copied_dataset_revision_is_relocatable(tmp_path):
@@ -701,43 +1148,26 @@ def test_copied_dataset_revision_is_relocatable(tmp_path):
         paths = _project(project_parent)
         bootstrap(paths)
         with Factory(paths) as factory:
-            resource = factory.add_data(
-                paths.root / "data/numbers.jsonl",
-                name="example-numbers",
-                mode="copy",
-                rights={"license": "CC0-1.0", "trainingAllowed": True},
-            )
+            resource = _add_numbers(factory, paths)
             revisions.append(resource["metadata"]["revision"])
             assert resource["spec"]["extensions"]["source"].startswith("sha256:")
     assert revisions[0] == revisions[1]
 
 
-def test_run_rejects_corrupted_dataset_before_allocation(tmp_path):
-    paths = _project(tmp_path)
-    bootstrap(paths)
+def test_run_rejects_corrupted_dataset_before_allocation(paths):
     with Factory(paths) as factory:
-        resource = factory.add_data(
-            paths.root / "data/numbers.jsonl",
-            name="example-numbers",
-            mode="copy",
-            rights={"license": "CC0-1.0", "trainingAllowed": True},
-        )
+        resource = _add_numbers(factory, paths)
         digest = resource["spec"]["extensions"]["artifact"]["chunks"][0]["digest"]
         digest_hex = digest.removeprefix("sha256:")
         (paths.store / "blobs" / digest_hex[:2] / digest_hex).write_bytes(b"corrupt")
 
         with pytest.raises(IntegrityError, match="dataset artifact"):
-            factory.run(
-                paths.root / "workloads/example-statistical.yaml",
-                paths.root / "bindings/local.yaml",
-            )
+            factory.run(*_statistical(paths))
         assert factory.list_resources(kind="Run") == []
         assert list(paths.runs.iterdir()) == []
 
 
-def test_workload_preflight_checks_environment_and_binding_semantics(tmp_path):
-    paths = _project(tmp_path)
-    bootstrap(paths)
+def test_workload_preflight_checks_environment_and_binding_semantics(paths, tmp_path):
     workload_path = paths.root / "workloads/example-statistical.yaml"
     binding_path = paths.root / "bindings/local.yaml"
     module_path = paths.root / "modules/examples/statistical/module.yaml"
@@ -750,16 +1180,6 @@ def test_workload_preflight_checks_environment_and_binding_semantics(tmp_path):
     assert not report["ready"]
     assert any("unavailable" in issue for issue in report["issues"])
 
-    module["spec"]["entryPoint"]["command"][0] = "python3"
-    module_path.write_text(yaml.safe_dump(module))
-    binding = yaml.safe_load(binding_path.read_text())
-    binding["spec"]["placement"] = {"zone": "ignored"}
-    binding_path.write_text(yaml.safe_dump(binding))
-    with Factory(paths) as factory:
-        report = factory.executor_preflight(binding_path, workload_path=workload_path)
-    assert not report["ready"]
-    assert any("placement" in issue for issue in report["issues"])
-
 
 @pytest.mark.parametrize(
     "rights",
@@ -771,9 +1191,7 @@ def test_workload_preflight_checks_environment_and_binding_semantics(tmp_path):
         {"trainingAllowed": True, "revoked": "false"},
     ],
 )
-def test_run_admission_rejects_data_without_current_training_rights(tmp_path, rights):
-    paths = _project(tmp_path)
-    bootstrap(paths)
+def test_run_admission_rejects_data_without_current_training_rights(paths, rights):
     with Factory(paths) as factory:
         factory.add_data(
             paths.root / "data/numbers.jsonl",
@@ -782,24 +1200,14 @@ def test_run_admission_rejects_data_without_current_training_rights(tmp_path, ri
             rights=rights,
         )
         with pytest.raises(ValidationError, match="rights do not allow training"):
-            factory.create_run_operation(
-                paths.root / "workloads/example-statistical.yaml",
-                paths.root / "bindings/local.yaml",
-            )
+            factory.create_run_operation(*_statistical(paths))
         assert factory.operations.list() == []
         assert factory.list_resources(kind="Run") == []
 
 
-def test_revocation_is_current_despite_future_authored_timestamp(tmp_path):
-    paths = _project(tmp_path)
-    bootstrap(paths)
+def test_revocation_is_current_despite_future_authored_timestamp(paths):
     with Factory(paths) as factory:
-        initial = factory.add_data(
-            paths.root / "data/numbers.jsonl",
-            name="example-numbers",
-            mode="copy",
-            rights={"license": "CC0-1.0", "trainingAllowed": True},
-        )
+        initial = _add_numbers(factory, paths)
         future = {
             "apiVersion": initial["apiVersion"],
             "kind": initial["kind"],
@@ -813,10 +1221,7 @@ def test_revocation_is_current_despite_future_authored_timestamp(tmp_path):
         }
         future["spec"]["rights"]["rightsRevision"] = "future-authored"
         authorized = factory.apply_resource(future)
-        queued = factory.create_run_operation(
-            paths.root / "workloads/example-statistical.yaml",
-            paths.root / "bindings/local.yaml",
-        )
+        queued = factory.create_run_operation(*_statistical(paths))
         revoked = factory.revoke_data("example-numbers", reason="consent withdrawn")
 
         assert factory.find_resource("DatasetSnapshot", "example-numbers") == revoked
@@ -825,20 +1230,10 @@ def test_revocation_is_current_despite_future_authored_timestamp(tmp_path):
             factory.execute_run_operation(queued["id"])
 
 
-def test_revocation_before_final_admission_prevents_run_admission(tmp_path, monkeypatch):
-    paths = _project(tmp_path)
-    bootstrap(paths)
+def test_revocation_before_final_admission_prevents_run_admission(paths, monkeypatch):
     with Factory(paths) as factory:
-        factory.add_data(
-            paths.root / "data/numbers.jsonl",
-            name="example-numbers",
-            mode="copy",
-            rights={"license": "CC0-1.0", "trainingAllowed": True},
-        )
-        operation = factory.create_run_operation(
-            paths.root / "workloads/example-statistical.yaml",
-            paths.root / "bindings/local.yaml",
-        )
+        _add_numbers(factory, paths)
+        operation = factory.create_run_operation(*_statistical(paths))
         inputs_pinned = threading.Event()
         continue_admission = threading.Event()
         original_pin = factory._pin_stage_inputs
@@ -921,12 +1316,7 @@ def test_revocation_stops_queued_and_recovering_training_without_replay(tmp_path
         )
     )
     with Factory(paths, executors=registry) as factory:
-        factory.add_data(
-            paths.root / "data/numbers.jsonl",
-            name="example-numbers",
-            mode="copy",
-            rights={"license": "CC0-1.0", "trainingAllowed": True},
-        )
+        _add_numbers(factory, paths)
         queued = factory.create_run_operation(
             paths.root / "workloads/example-statistical.yaml", binding_path
         )
@@ -937,12 +1327,7 @@ def test_revocation_stops_queued_and_recovering_training_without_replay(tmp_path
         assert factory.operations.get(queued["id"])["state"] == "failed"
         assert factory.list_resources(kind="Run") == []
 
-        allowed = factory.add_data(
-            paths.root / "data/numbers.jsonl",
-            name="second-numbers",
-            mode="copy",
-            rights={"license": "CC0-1.0", "trainingAllowed": True},
-        )
+        allowed = _add_numbers(factory, paths, name="second-numbers")
         workload_path = paths.root / "workloads/recovery-rights.yaml"
         workload = yaml.safe_load((paths.root / "workloads/example-statistical.yaml").read_text())
         workload["metadata"]["name"] = "recovery-rights"
@@ -1017,12 +1402,7 @@ def test_revocation_winning_submit_race_prevents_allocation(tmp_path):
         )
     )
     with Factory(paths, executors=registry) as factory:
-        factory.add_data(
-            paths.root / "data/numbers.jsonl",
-            name="example-numbers",
-            mode="copy",
-            rights={"license": "CC0-1.0", "trainingAllowed": True},
-        )
+        _add_numbers(factory, paths)
         operation = factory.create_run_operation(
             paths.root / "workloads/example-statistical.yaml", binding_path
         )
@@ -1054,26 +1434,11 @@ def test_revocation_winning_submit_race_prevents_allocation(tmp_path):
 def test_model_neutral_from_scratch_golden_path(tmp_path, monkeypatch):
     paths = _project(tmp_path)
     workload_path = paths.root / "workloads/example-from-scratch.yaml"
-    workload = yaml.safe_load(workload_path.read_text())
-    workload["metadata"]["namespace"] = "local/test-project"
-    workload_path.write_text(yaml.safe_dump(workload))
-    model_package = yaml.safe_load(Path("model-packages/example-affine.yaml").read_text())
-    model_package["metadata"]["namespace"] = "local/test-project"
-    evaluation_spec = yaml.safe_load(Path("evaluations/example-affine.yaml").read_text())
-    evaluation_spec["metadata"]["namespace"] = "local/test-project"
-    mix = yaml.safe_load(Path("mixes/example-affine.yaml").read_text())
-    mix["metadata"]["namespace"] = "local/test-project"
     bootstrap(paths)
     with Factory(paths) as factory:
-        package_resource = factory.apply_resource(model_package)
-        suite_resource = factory.apply_resource(evaluation_spec)
-        dataset = factory.add_data(
-            Path("data/fixtures/affine.jsonl").resolve(),
-            name="example-affine",
-            mode="copy",
-            rights={"license": "CC0-1.0", "trainingAllowed": True},
-        )
-        mix_resource = factory.apply_resource(mix)
+        package_resource = factory.apply_resource_file("model-packages/example-affine.yaml")
+        suite_resource = factory.apply_resource_file("evaluations/example-affine.yaml")
+        dataset = _add_affine(factory)
         result = factory.run(workload_path, paths.root / "bindings/local.yaml")
         state = json.loads((paths.runs / result["runId"] / "state.json").read_text())
         state["digests"]["modules"]["train"] = "sha256:" + "0" * 64
@@ -1188,7 +1553,7 @@ def test_model_neutral_from_scratch_golden_path(tmp_path, monkeypatch):
         ]
         experiment = factory.create_experiment(
             name="affine-self-check",
-            baseline_ref=factory._resource_uri(evaluation),
+            baseline_ref=f"run/{result['runId']}",
             candidate_ref=factory._resource_uri(evaluation),
             metric="training-loss",
             direction="minimize",
@@ -1196,7 +1561,6 @@ def test_model_neutral_from_scratch_golden_path(tmp_path, monkeypatch):
         admitted_evaluation_refs = factory._run_resource(result["runId"])["spec"]["extensions"][
             "evaluationRefs"
         ]
-        admitted_mix_ref = factory._run_resource(result["runId"])["spec"]["extensions"]["mixRef"]
         checkpoints = factory.list_resources(kind="Checkpoint")
         model_manifest = factory.local_store.read_manifest(result["outputs"]["train.model"])
         restored = tmp_path / "restored-model"
@@ -1210,10 +1574,6 @@ def test_model_neutral_from_scratch_golden_path(tmp_path, monkeypatch):
     assert len(checkpoints) == 1
     assert checkpoints[0]["spec"]["artifactRef"] == result["outputs"]["train.checkpoint"]
     assert checkpoints[0]["spec"]["components"]["protocol-state"].startswith("sha256:")
-    assert checkpoints[0]["spec"]["replay"] == {
-        "status": "not-claimed",
-        "reason": "sampler-state-not-observed",
-    }
     assert json.loads((restored / "payload").read_text()) == result["outputs"]["train.modelState"]
     assert evaluation["spec"]["extensions"]["compatibilityPassed"] is True
     assert admission["inferenceAdapter"]["sourceDigest"] != admission["moduleDigests"]["train"]
@@ -1225,30 +1585,17 @@ def test_model_neutral_from_scratch_golden_path(tmp_path, monkeypatch):
     assert evaluation["spec"]["scores"]["training-loss"] < 1e-6
     assert experiment["spec"]["decision"] == "tie"
     assert factory._resource_uri(suite_resource) in admitted_evaluation_refs
-    assert admitted_mix_ref == factory._resource_uri(mix_resource)
     assert evaluation["spec"]["extensions"]["modelPackageRef"] == factory._resource_uri(
         package_resource
     )
 
 
-def test_model_package_admission_rejects_unexecutable_contracts(tmp_path):
-    paths = _project(tmp_path)
-    bootstrap(paths)
+def test_model_package_admission_rejects_unexecutable_contracts(paths):
     workload = yaml.safe_load((paths.root / "workloads/example-from-scratch.yaml").read_text())
     stages = project_workload(workload).stages
     base = yaml.safe_load(Path("model-packages/example-affine.yaml").read_text())
-    base["metadata"]["namespace"] = "local/test-project"
 
     with Factory(paths) as factory:
-        optimized = deepcopy(base)
-        optimized["metadata"]["name"] = "optimized"
-        optimized["spec"]["adapters"]["optimized"] = [
-            deepcopy(optimized["spec"]["adapters"]["inferenceReference"])
-        ]
-        factory.apply_resource(optimized)
-        with pytest.raises(ValidationError, match="optimized model adapters"):
-            factory._pin_model_package("modelpackage/optimized", stages)
-
         tolerance = deepcopy(base)
         tolerance["metadata"]["name"] = "invalid-tolerance"
         tolerance["spec"]["compatibilityVectors"][0]["tolerances"]["prediction"]["absolute"] = -1
@@ -1264,13 +1611,10 @@ def test_model_package_admission_rejects_unexecutable_contracts(tmp_path):
             factory._pin_model_package("modelpackage/invalid-signature", stages)
 
 
-def test_model_package_admission_rejects_adapter_and_vector_drift(tmp_path):
-    paths = _project(tmp_path)
-    bootstrap(paths)
+def test_model_package_admission_rejects_adapter_and_vector_drift(paths):
     workload = yaml.safe_load((paths.root / "workloads/example-from-scratch.yaml").read_text())
     stages = project_workload(workload).stages
     base = yaml.safe_load(Path("model-packages/example-affine.yaml").read_text())
-    base["metadata"]["namespace"] = "local/test-project"
 
     with Factory(paths) as factory:
         with pytest.raises(IntegrityError, match="does not match the workload"):
@@ -1355,56 +1699,14 @@ def test_model_package_admission_rejects_adapter_and_vector_drift(tmp_path):
         )
 
 
-def test_legacy_model_package_is_readable_but_requires_an_explicit_serving_migration(tmp_path):
-    paths = _project(tmp_path)
-    bootstrap(paths)
-    workload = yaml.safe_load((paths.root / "workloads/example-from-scratch.yaml").read_text())
-    stages = project_workload(workload).stages
-    current = yaml.safe_load(Path("model-packages/example-affine.yaml").read_text())
-    current["metadata"]["name"] = "legacy-affine"
-    current["metadata"]["namespace"] = "local/test-project"
-    legacy = deepcopy(current)
-    legacy["spec"]["adapters"]["inferenceReference"] = {
-        "stage": "train",
-        "operation": "run",
-        "stateOutput": "train.modelState",
-        "config": {"action": "infer"},
-    }
-
-    with Factory(paths) as factory:
-        legacy_resource = factory.apply_resource(legacy)
-        with pytest.raises(ValidationError, match="legacy stage-based inference adapter"):
-            factory._pin_model_package("modelpackage/legacy-affine", stages)
-
-        migrated = factory.apply_resource(current)
-        selected = factory._pin_model_package("modelpackage/legacy-affine", stages)
-        retained_legacy = factory.resources.get(
-            legacy_resource["metadata"]["uid"], legacy_resource["metadata"]["revision"]
-        )
-
-    assert selected == migrated
-    assert retained_legacy["spec"]["adapters"]["inferenceReference"]["stage"] == "train"
-
-
-def test_resource_pinning_and_resolution_fail_closed(tmp_path):
-    paths = _project(tmp_path)
-    bootstrap(paths)
+def test_resource_pinning_and_resolution_fail_closed(paths):
     workload = yaml.safe_load((paths.root / "workloads/example-from-scratch.yaml").read_text())
     stages = project_workload(workload).stages
     evaluation = yaml.safe_load(Path("evaluations/example-affine.yaml").read_text())
-    evaluation["metadata"]["namespace"] = "local/test-project"
-    mix = yaml.safe_load(Path("mixes/example-affine.yaml").read_text())
-    mix["metadata"]["namespace"] = "local/test-project"
 
     with Factory(paths) as factory:
-        dataset = factory.add_data(
-            Path("data/fixtures/affine.jsonl").resolve(),
-            name="example-affine",
-            mode="copy",
-            rights={"license": "CC0-1.0", "trainingAllowed": True},
-        )
+        dataset = _add_affine(factory)
         suite = factory.apply_resource(evaluation)
-        mix_resource = factory.apply_resource(mix)
 
         with pytest.raises(IntegrityError, match="dataset reference was not pinned"):
             factory._pin_stage_inputs(stages, {})
@@ -1422,34 +1724,32 @@ def test_resource_pinning_and_resolution_fail_closed(tmp_path):
             "EvaluationSpec",
             [factory._resource_uri(suite)],
         ) == [suite]
-        with pytest.raises(IntegrityError, match="MixSpec does not match"):
-            factory._pin_mix(None, {}, factory._resource_uri(mix_resource))
-        with pytest.raises(ValidationError, match="not an admitted workload dataset"):
-            factory._pin_mix("mixspec/example-affine", {})
-        assert (
-            factory._pin_mix(
-                "mixspec/example-affine",
-                {"dataset/example-affine": dataset},
-                factory._resource_uri(mix_resource),
-            )
-            == mix_resource
-        )
 
         assert factory._resolve_output_reference("literal", {}, stages) == "literal"
         with pytest.raises(IntegrityError, match="stage output reference is unavailable"):
             factory._resolve_output_reference("train.model", {}, stages)
-        assert factory._resolve_stage_input(7, paths.runs / "x", {}) == 7
+        resolve = {"run_id": "run", "stage_name": "train"}
+        assert factory._resolve_stage_input(7, paths.runs / "x", {}, **resolve) == 7
         with pytest.raises(IntegrityError, match="not pinned at admission"):
-            factory._resolve_stage_input("dataset/missing", paths.runs / "x/y/z", {})
+            factory._resolve_stage_input("dataset/missing", paths.runs / "x/y/z", {}, **resolve)
+        with pytest.raises(IntegrityError, match="reference input was not pinned"):
+            factory._resolve_stage_input("release/missing", paths.runs / "x/y/z", {}, **resolve)
 
         target_root = paths.runs / "run" / "stages" / "train" / "inputs" / "dataset"
         materialized = factory._resolve_stage_input(
-            "dataset/example-affine", target_root, {"dataset/example-affine": dataset}
+            "dataset/example-affine", target_root, {"dataset/example-affine": dataset}, **resolve
         )
         assert materialized["manifestDigest"].startswith("sha256:")
+        assert any(
+            edge["source"] == factory._resource_uri(dataset)
+            for edge in factory.lineage_query("run:run/stage:train")
+        )
         with pytest.raises(IntegrityError, match="target already exists"):
             factory._resolve_stage_input(
-                "dataset/example-affine", target_root, {"dataset/example-affine": dataset}
+                "dataset/example-affine",
+                target_root,
+                {"dataset/example-affine": dataset},
+                **resolve,
             )
 
         assert factory._verify_stage_outputs({"value": 1})
@@ -1468,9 +1768,7 @@ def test_resource_pinning_and_resolution_fail_closed(tmp_path):
     assert not Factory._compatibility_equal("left", "right", {})
 
 
-def test_experiment_rejects_different_evaluation_revisions(tmp_path):
-    paths = _project(tmp_path)
-    bootstrap(paths)
+def test_experiment_rejects_different_evaluation_revisions(paths):
     with Factory(paths) as factory:
         baseline = factory.apply_resource(
             {
@@ -1539,20 +1837,10 @@ def test_experiment_rejects_different_evaluation_revisions(tmp_path):
                 )
 
 
-def test_pending_run_operation_executes_after_controller_restart(tmp_path):
-    paths = _project(tmp_path)
-    bootstrap(paths)
+def test_pending_run_operation_executes_after_controller_restart(paths):
     with Factory(paths) as factory:
-        factory.add_data(
-            paths.root / "data/numbers.jsonl",
-            name="example-numbers",
-            mode="copy",
-            rights={"license": "CC0-1.0", "trainingAllowed": True},
-        )
-        operation = factory.create_run_operation(
-            paths.root / "workloads/example-statistical.yaml",
-            paths.root / "bindings/local.yaml",
-        )
+        _add_numbers(factory, paths)
+        operation = factory.create_run_operation(*_statistical(paths))
 
     with Factory(paths) as restarted:
         completed = restarted.execute_run_operation(operation["id"])
@@ -1600,20 +1888,10 @@ def test_execution_plan_digest_covers_every_execution_field(tmp_path):
 
 
 @pytest.mark.parametrize("interrupted_event", ["SpecValidated", "RunAdmitted"])
-def test_recovery_repairs_run_admission_event_crash_gaps(tmp_path, monkeypatch, interrupted_event):
-    paths = _project(tmp_path)
-    bootstrap(paths)
+def test_recovery_repairs_run_admission_event_crash_gaps(paths, monkeypatch, interrupted_event):
     with Factory(paths) as factory:
-        factory.add_data(
-            paths.root / "data/numbers.jsonl",
-            name="example-numbers",
-            mode="copy",
-            rights={"license": "CC0-1.0", "trainingAllowed": True},
-        )
-        operation = factory.create_run_operation(
-            paths.root / "workloads/example-statistical.yaml",
-            paths.root / "bindings/local.yaml",
-        )
+        _add_numbers(factory, paths)
+        operation = factory.create_run_operation(*_statistical(paths))
         append = factory.events.append
         interrupted = False
 
@@ -1647,20 +1925,10 @@ def test_recovery_repairs_run_admission_event_crash_gaps(tmp_path, monkeypatch, 
     assert len(admission_events) == 1
 
 
-def test_recovery_does_not_backfill_admission_after_rights_revocation(tmp_path, monkeypatch):
-    paths = _project(tmp_path)
-    bootstrap(paths)
+def test_recovery_does_not_backfill_admission_after_rights_revocation(paths, monkeypatch):
     with Factory(paths) as factory:
-        factory.add_data(
-            paths.root / "data/numbers.jsonl",
-            name="example-numbers",
-            mode="copy",
-            rights={"license": "CC0-1.0", "trainingAllowed": True},
-        )
-        operation = factory.create_run_operation(
-            paths.root / "workloads/example-statistical.yaml",
-            paths.root / "bindings/local.yaml",
-        )
+        _add_numbers(factory, paths)
+        operation = factory.create_run_operation(*_statistical(paths))
         append = factory.events.append
 
         def interrupt_admission(**kwargs):
@@ -1681,20 +1949,10 @@ def test_recovery_does_not_backfill_admission_after_rights_revocation(tmp_path, 
         assert factory.operations.get(operation["id"])["state"] == "failed"
 
 
-def test_recovery_integrity_failure_finalizes_the_durable_run(tmp_path, monkeypatch):
-    paths = _project(tmp_path)
-    bootstrap(paths)
+def test_recovery_integrity_failure_finalizes_the_durable_run(paths, monkeypatch):
     with Factory(paths) as factory:
-        factory.add_data(
-            paths.root / "data/numbers.jsonl",
-            name="example-numbers",
-            mode="copy",
-            rights={"license": "CC0-1.0", "trainingAllowed": True},
-        )
-        operation = factory.create_run_operation(
-            paths.root / "workloads/example-statistical.yaml",
-            paths.root / "bindings/local.yaml",
-        )
+        _add_numbers(factory, paths)
+        operation = factory.create_run_operation(*_statistical(paths))
         append = factory.events.append
 
         def interrupt_admission(**kwargs):
@@ -1728,9 +1986,6 @@ def test_recovery_integrity_failure_finalizes_the_durable_run(tmp_path, monkeypa
 def test_running_local_operation_reattaches_without_duplicate_stage_work(tmp_path):
     paths = _project(tmp_path)
     workload_path = paths.root / "workloads/example-from-scratch.yaml"
-    workload = yaml.safe_load(workload_path.read_text())
-    workload["metadata"]["namespace"] = "local/test-project"
-    workload_path.write_text(yaml.safe_dump(workload))
     binding_path = paths.root / "bindings/local.yaml"
     binding = yaml.safe_load(binding_path.read_text())
     binding["spec"]["executor"] = "recoverable-local"
@@ -1760,20 +2015,8 @@ def test_running_local_operation_reattaches_without_duplicate_stage_work(tmp_pat
         )
     )
     with Factory(paths, executors=registry) as factory:
-        for source in (
-            Path("model-packages/example-affine.yaml"),
-            Path("evaluations/example-affine.yaml"),
-            Path("mixes/example-affine.yaml"),
-        ):
-            resource = yaml.safe_load(source.read_text())
-            resource["metadata"]["namespace"] = "local/test-project"
-            factory.apply_resource(resource)
-        factory.add_data(
-            Path("data/fixtures/affine.jsonl").resolve(),
-            name="example-affine",
-            mode="copy",
-            rights={"license": "CC0-1.0", "trainingAllowed": True},
-        )
+        _apply_affine_resources(factory)
+        _add_affine(factory)
         operation = factory.create_run_operation(workload_path, binding_path)
         with pytest.raises(KeyboardInterrupt, match="controller interrupted"):
             factory.execute_run_operation(operation["id"])
@@ -1795,9 +2038,7 @@ def test_running_local_operation_reattaches_without_duplicate_stage_work(tmp_pat
     assert len(admission_events) == 1
 
 
-def test_recovery_rejects_a_changed_plan_before_executor_attachment(tmp_path):
-    paths = _project(tmp_path)
-    bootstrap(paths)
+def test_recovery_rejects_a_changed_plan_before_executor_attachment(paths):
     module_root = paths.root / "modules/examples/statistical"
     manifest, code_root = load_manifest(module_root / "module.yaml", paths.root)
 
@@ -1850,9 +2091,7 @@ def test_recovery_rejects_a_changed_plan_before_executor_attachment(tmp_path):
     assert executor.status_calls == 1
 
 
-def test_stale_running_operation_fails_closed_without_reexecution(tmp_path, monkeypatch):
-    paths = _project(tmp_path)
-    bootstrap(paths)
+def test_stale_running_operation_fails_closed_without_reexecution(paths, monkeypatch):
     with Factory(paths) as factory:
         operation = factory.operations.create(
             "run",
@@ -1880,9 +2119,7 @@ def test_stale_running_operation_fails_closed_without_reexecution(tmp_path, monk
     assert not failed["error"]["retryable"]
 
 
-def test_module_failure_exposes_only_bounded_log_tails(tmp_path):
-    paths = _project(tmp_path)
-    bootstrap(paths)
+def test_module_failure_exposes_only_bounded_log_tails(paths):
     module_root = paths.root / "modules/examples/statistical"
     (module_root / "main.py").write_text(
         "import sys\n"
@@ -1910,20 +2147,10 @@ def test_module_failure_exposes_only_bounded_log_tails(tmp_path):
     assert len(raised.value.details["stderr"].encode()) <= 4096
 
 
-def test_running_operation_reconciles_immutable_completed_result(tmp_path, monkeypatch):
-    paths = _project(tmp_path)
-    bootstrap(paths)
+def test_running_operation_reconciles_immutable_completed_result(paths, monkeypatch):
     with Factory(paths) as factory:
-        factory.add_data(
-            paths.root / "data/numbers.jsonl",
-            name="example-numbers",
-            mode="copy",
-            rights={"license": "CC0-1.0", "trainingAllowed": True},
-        )
-        operation = factory.create_run_operation(
-            paths.root / "workloads/example-statistical.yaml",
-            paths.root / "bindings/local.yaml",
-        )
+        _add_numbers(factory, paths)
+        operation = factory.create_run_operation(*_statistical(paths))
         apply_resource = factory.apply_resource
 
         def interrupt_completion(value, **kwargs):
@@ -1957,9 +2184,7 @@ def test_running_operation_reconciles_immutable_completed_result(tmp_path, monke
     assert [event.data["state"] for event in terminal_events] == ["Succeeded"]
 
 
-def test_running_operation_publishes_result_from_succeeded_run_state(tmp_path, monkeypatch):
-    paths = _project(tmp_path)
-    bootstrap(paths)
+def test_running_operation_publishes_result_from_succeeded_run_state(paths, monkeypatch):
     submissions = 0
     submit = LocalExecutor.submit
 
@@ -1970,16 +2195,8 @@ def test_running_operation_publishes_result_from_succeeded_run_state(tmp_path, m
 
     monkeypatch.setattr(LocalExecutor, "submit", count_submit)
     with Factory(paths) as factory:
-        factory.add_data(
-            paths.root / "data/numbers.jsonl",
-            name="example-numbers",
-            mode="copy",
-            rights={"license": "CC0-1.0", "trainingAllowed": True},
-        )
-        operation = factory.create_run_operation(
-            paths.root / "workloads/example-statistical.yaml",
-            paths.root / "bindings/local.yaml",
-        )
+        _add_numbers(factory, paths)
+        operation = factory.create_run_operation(*_statistical(paths))
         apply_resource = factory.apply_resource
 
         def interrupt_before_result(value, **kwargs):
@@ -2003,20 +2220,10 @@ def test_running_operation_publishes_result_from_succeeded_run_state(tmp_path, m
     assert submissions == 2
 
 
-def test_succeeded_run_with_corrupt_output_evidence_fails_closed(tmp_path, monkeypatch):
-    paths = _project(tmp_path)
-    bootstrap(paths)
+def test_succeeded_run_with_corrupt_output_evidence_fails_closed(paths, tmp_path, monkeypatch):
     with Factory(paths) as factory:
-        factory.add_data(
-            paths.root / "data/numbers.jsonl",
-            name="example-numbers",
-            mode="copy",
-            rights={"license": "CC0-1.0", "trainingAllowed": True},
-        )
-        operation = factory.create_run_operation(
-            paths.root / "workloads/example-statistical.yaml",
-            paths.root / "bindings/local.yaml",
-        )
+        _add_numbers(factory, paths)
+        operation = factory.create_run_operation(*_statistical(paths))
         apply_resource = factory.apply_resource
 
         def interrupt_before_result(value, **kwargs):
@@ -2045,20 +2252,10 @@ def test_succeeded_run_with_corrupt_output_evidence_fails_closed(tmp_path, monke
 
 
 @pytest.mark.parametrize("tamper", ["missing-stage", "failed-stage", "missing-output"])
-def test_incomplete_succeeded_run_state_cannot_publish_a_result(tmp_path, monkeypatch, tamper):
-    paths = _project(tmp_path)
-    bootstrap(paths)
+def test_incomplete_succeeded_run_state_cannot_publish_a_result(paths, monkeypatch, tamper):
     with Factory(paths) as factory:
-        factory.add_data(
-            paths.root / "data/numbers.jsonl",
-            name="example-numbers",
-            mode="copy",
-            rights={"license": "CC0-1.0", "trainingAllowed": True},
-        )
-        operation = factory.create_run_operation(
-            paths.root / "workloads/example-statistical.yaml",
-            paths.root / "bindings/local.yaml",
-        )
+        _add_numbers(factory, paths)
+        operation = factory.create_run_operation(*_statistical(paths))
         apply_resource = factory.apply_resource
 
         def interrupt_before_result(value, **kwargs):
@@ -2090,9 +2287,7 @@ def test_incomplete_succeeded_run_state_cannot_publish_a_result(tmp_path, monkey
     assert results == []
 
 
-def test_run_operation_execution_lease_rejects_concurrent_worker(tmp_path):
-    paths = _project(tmp_path)
-    bootstrap(paths)
+def test_run_operation_execution_lease_rejects_concurrent_worker(paths):
     with Factory(paths) as factory:
         operation = factory.operations.create(
             "run", {"actor": factory.actor, "workload": "unused", "binding": "unused"}
@@ -2105,9 +2300,7 @@ def test_run_operation_execution_lease_rejects_concurrent_worker(tmp_path):
         assert factory.operations.get(operation["id"])["state"] == "pending"
 
 
-def test_queued_run_pins_manifest_outside_code_root(tmp_path):
-    paths = _project(tmp_path)
-    bootstrap(paths)
+def test_queued_run_pins_manifest_outside_code_root(paths):
     module_root = paths.root / "modules/examples/statistical"
     source_root = module_root / "src"
     source_root.mkdir()
@@ -2119,17 +2312,9 @@ def test_queued_run_pins_manifest_outside_code_root(tmp_path):
     manifest_path.write_text(yaml.safe_dump(manifest))
 
     with Factory(paths) as factory:
-        factory.add_data(
-            paths.root / "data/numbers.jsonl",
-            name="example-numbers",
-            mode="copy",
-            rights={"license": "CC0-1.0", "trainingAllowed": True},
-        )
-        operation = factory.create_run_operation(
-            paths.root / "workloads/example-statistical.yaml",
-            paths.root / "bindings/local.yaml",
-        )
-        manifest["spec"]["provenance"]["sourceRef"] = "repository:changed-after-queue"
+        _add_numbers(factory, paths)
+        operation = factory.create_run_operation(*_statistical(paths))
+        manifest["spec"]["extensions"] = {"sourceRef": "repository:changed-after-queue"}
         manifest_path.write_text(yaml.safe_dump(manifest))
 
         with pytest.raises(IntegrityError, match="module source changed"):
@@ -2141,25 +2326,10 @@ def test_queued_run_pins_manifest_outside_code_root(tmp_path):
 def test_queued_run_rejects_inference_adapter_source_drift(tmp_path):
     paths = _project(tmp_path)
     workload_path = paths.root / "workloads/example-from-scratch.yaml"
-    workload = yaml.safe_load(workload_path.read_text())
-    workload["metadata"]["namespace"] = "local/test-project"
-    workload_path.write_text(yaml.safe_dump(workload))
     bootstrap(paths)
     with Factory(paths) as factory:
-        for source in (
-            Path("model-packages/example-affine.yaml"),
-            Path("evaluations/example-affine.yaml"),
-            Path("mixes/example-affine.yaml"),
-        ):
-            resource = yaml.safe_load(source.read_text())
-            resource["metadata"]["namespace"] = "local/test-project"
-            factory.apply_resource(resource)
-        factory.add_data(
-            Path("data/fixtures/affine.jsonl").resolve(),
-            name="example-affine",
-            mode="copy",
-            rights={"license": "CC0-1.0", "trainingAllowed": True},
-        )
+        _apply_affine_resources(factory)
+        _add_affine(factory)
         operation = factory.create_run_operation(workload_path, paths.root / "bindings/local.yaml")
         (paths.root / "modules/examples/affine-serving/main.py").write_text(
             "raise RuntimeError('changed after queue')\n"
@@ -2172,36 +2342,19 @@ def test_queued_run_rejects_inference_adapter_source_drift(tmp_path):
     assert runs == []
 
 
-def test_queued_run_uses_exact_dataset_revision_after_alias_advances(tmp_path):
-    paths = _project(tmp_path)
-    bootstrap(paths)
+def test_queued_run_uses_exact_dataset_revision_after_alias_advances(paths):
     with Factory(paths) as factory:
-        factory.add_data(
-            paths.root / "data/numbers.jsonl",
-            name="example-numbers",
-            mode="copy",
-            rights={"license": "CC0-1.0", "trainingAllowed": True},
-        )
-        operation = factory.create_run_operation(
-            paths.root / "workloads/example-statistical.yaml",
-            paths.root / "bindings/local.yaml",
-        )
+        _add_numbers(factory, paths)
+        operation = factory.create_run_operation(*_statistical(paths))
         (paths.root / "data/numbers.jsonl").write_text('{"value": 99}\n')
-        factory.add_data(
-            paths.root / "data/numbers.jsonl",
-            name="example-numbers",
-            mode="copy",
-            rights={"license": "CC0-1.0", "trainingAllowed": True},
-        )
+        _add_numbers(factory, paths)
 
         completed = factory.execute_run_operation(operation["id"])
 
     assert completed["result"]["outputs"]["train.mean"] == 3.0
 
 
-def test_run_operation_records_admission_and_worker_failures(tmp_path, monkeypatch):
-    paths = _project(tmp_path)
-    bootstrap(paths)
+def test_run_operation_records_admission_and_worker_failures(paths, tmp_path):
     with Factory(paths) as factory:
         invalid_kind = factory.operations.create("other", {"actor": factory.actor})
         with pytest.raises(ValidationError, match="not an executable pending run"):
@@ -2211,80 +2364,48 @@ def test_run_operation_records_admission_and_worker_failures(tmp_path, monkeypat
         with pytest.raises(ValidationError, match="actor does not match"):
             factory.execute_run_operation(wrong_actor["id"])
 
-        def operation():
-            return factory.operations.create(
-                "run",
-                {
-                    "actor": factory.actor,
-                    "workload": "workloads/unused.yaml",
-                    "binding": "bindings/unused.yaml",
-                    "workloadDigest": "sha256:" + "0" * 64,
-                    "bindingDigest": "sha256:" + "0" * 64,
-                    "modulePackages": {},
-                    "resources": {},
-                },
-            )
+        _add_numbers(factory, paths)
+        workload, binding = _statistical(paths)
 
-        admission_domain = operation()
-        with monkeypatch.context() as patch:
-            patch.setattr(
-                factory,
-                "_verify_run_request",
-                lambda _request: (_ for _ in ()).throw(IntegrityError("admission domain")),
-            )
-            with pytest.raises(IntegrityError, match="admission domain"):
-                factory.execute_run_operation(admission_domain["id"])
-        assert factory.operations.get(admission_domain["id"])["error"]["code"] == "integrity_error"
+        def failure(operation_id: str, error: type[Exception], match: str) -> str:
+            with pytest.raises(error, match=match):
+                factory.execute_run_operation(operation_id)
+            return str(factory.operations.get(operation_id)["error"]["code"])
 
-        admission_generic = operation()
-        with monkeypatch.context() as patch:
-            patch.setattr(
-                factory,
-                "_verify_run_request",
-                lambda _request: (_ for _ in ()).throw(RuntimeError("admission generic")),
-            )
-            with pytest.raises(RuntimeError, match="admission generic"):
-                factory.execute_run_operation(admission_generic["id"])
+        admission_domain = factory.create_run_operation(workload, binding)
+        original = workload.read_text()
+        workload.write_text(original.replace("expected: 3.0", "expected: 4.0"))
         assert (
-            factory.operations.get(admission_generic["id"])["error"]["code"]
+            failure(admission_domain["id"], IntegrityError, "desired state changed")
+            == "integrity_error"
+        )
+        workload.write_text(original)
+
+        admission_generic = factory.create_run_operation(workload, binding)
+        binding.rename(paths.root / "bindings/moved.yaml")
+        assert (
+            failure(admission_generic["id"], FileNotFoundError, "local.yaml")
             == "run_admission_error"
         )
+        (paths.root / "bindings/moved.yaml").rename(binding)
 
-        worker_domain = operation()
-        with monkeypatch.context() as patch:
-            patch.setattr(factory, "_verify_run_request", lambda _request: None)
-            patch.setattr(
-                factory,
-                "_run_impl",
-                lambda *_args, **_kwargs: (_ for _ in ()).throw(ValidationError("worker domain")),
-            )
-            with pytest.raises(ValidationError, match="worker domain"):
-                factory.execute_run_operation(worker_domain["id"])
-        assert factory.operations.get(worker_domain["id"])["error"]["code"] == "validation_error"
+        worker_generic = factory.create_run_operation(workload, binding)
+        state = paths.runs / worker_generic["id"] / "state.json"
+        state.parent.mkdir(parents=True)
+        state.write_text("not json")
+        assert failure(worker_generic["id"], ValueError, "Expecting value") == "run_worker_error"
 
-        worker_generic = operation()
-        with monkeypatch.context() as patch:
-            patch.setattr(factory, "_verify_run_request", lambda _request: None)
-            patch.setattr(
-                factory,
-                "_run_impl",
-                lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("worker generic")),
-            )
-            with pytest.raises(RuntimeError, match="worker generic"):
-                factory.execute_run_operation(worker_generic["id"])
-        assert factory.operations.get(worker_generic["id"])["error"]["code"] == "run_worker_error"
+        worker_domain = factory.create_run_operation(workload, binding)
+        factory.revoke_data("example-numbers", reason="consent withdrawn")
+        assert failure(worker_domain["id"], ValidationError, "current rights") == "validation_error"
 
 
 @pytest.mark.parametrize("failure", ["multiple", "state", "declaration"])
-def test_checkpoint_publication_rejects_incomplete_stage_results(tmp_path, failure):
-    paths = _project(tmp_path)
-    bootstrap(paths)
+def test_checkpoint_publication_rejects_incomplete_stage_results(paths, failure):
     workload_path = paths.root / "workloads/example-from-scratch.yaml"
     workload = yaml.safe_load(workload_path.read_text())
-    workload["metadata"]["namespace"] = "local/test-project"
     workload["spec"].pop("modelPackageRef")
     workload["spec"].pop("evaluationRefs")
-    workload["spec"].pop("mixRef")
     workload["spec"]["graph"]["stages"] = workload["spec"]["graph"]["stages"][:1]
     workload_path.write_text(yaml.safe_dump(workload))
 
@@ -2307,17 +2428,12 @@ def test_checkpoint_publication_rejects_incomplete_stage_results(tmp_path, failu
     else:
         manifest_path = module_root / "module.yaml"
         manifest = yaml.safe_load(manifest_path.read_text())
-        manifest["spec"]["lifecycle"]["checkpoint"] = False
+        manifest["spec"]["checkpoint"] = False
         manifest_path.write_text(yaml.safe_dump(manifest))
         expected = "without declaring support"
 
     with Factory(paths) as factory:
-        factory.add_data(
-            Path("data/fixtures/affine.jsonl").resolve(),
-            name="example-affine",
-            mode="copy",
-            rights={"license": "CC0-1.0", "trainingAllowed": True},
-        )
+        _add_affine(factory)
         with pytest.raises(ValidationError, match=expected):
             factory.run(workload_path, paths.root / "bindings/local.yaml")
         operation = factory.operations.list()[-1]

@@ -2,13 +2,12 @@ apiVersion: omf.dev/v1alpha1
 kind: Module
 metadata:
   name: affine-serving
-  namespace: omf/examples
 spec:
-  contractVersion: omf.module/v1
-  moduleKind: server
   entryPoint:
     command: [python3, main.py]
-    codeRoot: .
+  environment:
+    dependencyLock: requirements.lock
+    dependencyDigest: sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
   contracts:
     input:
       type: object
@@ -31,23 +30,6 @@ spec:
         intercept: {type: number}
         format: {const: json-affine/v1}
       additionalProperties: false
-  environment:
-    dependencyLock: requirements.lock
-    dependencyDigest: sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
-  capabilities: []
-  platforms: []
-  resources: {}
-  determinism: numerical
-  lifecycle:
-    checkpoint: false
-    sideEffects: []
-    concurrency: 1
-  access:
-    secrets: []
-    network: []
-  provenance:
-    license: Apache-2.0
-    sourceRef: repository:modules/examples/affine-serving
   fixtures:
     - request:
         operation: run

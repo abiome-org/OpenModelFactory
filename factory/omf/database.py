@@ -1,4 +1,3 @@
-"""SQLite durable control-plane storage."""
 # ruff: noqa: E501
 
 from __future__ import annotations
@@ -95,6 +94,12 @@ CREATE TRIGGER IF NOT EXISTS resource_order_no_delete BEFORE DELETE ON resource_
  BEGIN SELECT RAISE(ABORT,'immutable resource order'); END;
 """
 
+_SCHEMA_V6 = """
+DROP TABLE IF EXISTS federation_inbox;
+DROP TABLE IF EXISTS federation_outbox;
+DROP TABLE IF EXISTS federation_peers;
+"""
+
 
 @dataclass(frozen=True)
 class _Migration:
@@ -135,6 +140,12 @@ _MIGRATIONS = (
         "b48b2309058ad6ce0a4f34dfdba3a14352092ed61493b7efe23db85607ba1eae",
         _SCHEMA_V5,
     ),
+    _Migration(
+        6,
+        "drop-federation",
+        "7e9e81339aa73fea140e86b2ce9a958e9d0d5d917b7f6312a8b28ad0de1d3b2f",
+        _SCHEMA_V6,
+    ),
 )
 
 
@@ -161,9 +172,50 @@ def _execute_sql(connection: sqlite3.Connection, sql: str) -> None:
         raise IntegrityError("migration contains an incomplete SQL statement")
 
 
-class Database:
-    """A SQLite database; connections are isolated per thread."""
+def _prepare_migration_table(connection: sqlite3.Connection) -> bool:
+    exists = connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='schema_migrations'"
+    ).fetchone()
+    columns = (
+        {str(row[1]) for row in connection.execute("PRAGMA table_info(schema_migrations)")}
+        if exists
+        else set()
+    )
+    legacy = columns == {"version"}
+    if not exists:
+        connection.execute(
+            "CREATE TABLE schema_migrations("
+            "version INTEGER PRIMARY KEY,name TEXT NOT NULL,checksum TEXT NOT NULL)"
+        )
+    elif legacy:
+        connection.execute("ALTER TABLE schema_migrations ADD COLUMN name TEXT")
+        connection.execute("ALTER TABLE schema_migrations ADD COLUMN checksum TEXT")
+    elif columns != {"version", "name", "checksum"}:
+        raise IntegrityError("schema migration table has an unsupported shape")
+    return legacy
 
+
+def _verify_migration_history(connection: sqlite3.Connection, legacy: bool) -> None:
+    rows = connection.execute(
+        "SELECT version,name,checksum FROM schema_migrations ORDER BY version"
+    ).fetchall()
+    versions = [int(row[0]) for row in rows]
+    if versions and versions != list(range(1, versions[-1] + 1)):
+        raise IntegrityError("schema migration history contains a version gap")
+    if versions and versions[-1] > len(_MIGRATIONS):
+        raise IntegrityError("database was created by a newer schema version")
+    for row in rows:
+        migration = _MIGRATIONS[int(row[0]) - 1]
+        if legacy:
+            connection.execute(
+                "UPDATE schema_migrations SET name=?,checksum=? WHERE version=?",
+                (migration.name, migration.checksum, migration.version),
+            )
+        elif row[1] != migration.name or row[2] != migration.checksum:
+            raise IntegrityError(f"schema migration metadata drift at version {migration.version}")
+
+
+class Database:
     def __init__(
         self,
         path: str | Path,
@@ -187,7 +239,6 @@ class Database:
 
     @classmethod
     def inspect(cls, path: str | Path, *, busy_timeout: int = 5000) -> Database:
-        """Inspect a quiescent immutable snapshot without migrations or filesystem writes."""
         return cls(path, busy_timeout=busy_timeout, migrate=False, read_only=True)
 
     def connect(self) -> sqlite3.Connection:
@@ -238,45 +289,7 @@ class Database:
         _validate_migration_registry()
         connection = self.connection
         with self.transaction(immediate=True):
-            exists = connection.execute(
-                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='schema_migrations'"
-            ).fetchone()
-            columns = (
-                {str(row[1]) for row in connection.execute("PRAGMA table_info(schema_migrations)")}
-                if exists
-                else set()
-            )
-            legacy = columns == {"version"}
-            if not exists:
-                connection.execute(
-                    "CREATE TABLE schema_migrations("
-                    "version INTEGER PRIMARY KEY,name TEXT NOT NULL,checksum TEXT NOT NULL)"
-                )
-            elif legacy:
-                connection.execute("ALTER TABLE schema_migrations ADD COLUMN name TEXT")
-                connection.execute("ALTER TABLE schema_migrations ADD COLUMN checksum TEXT")
-            elif columns != {"version", "name", "checksum"}:
-                raise IntegrityError("schema migration table has an unsupported shape")
-            rows = connection.execute(
-                "SELECT version,name,checksum FROM schema_migrations ORDER BY version"
-            ).fetchall()
-            versions = [int(row[0]) for row in rows]
-            if versions and versions != list(range(1, versions[-1] + 1)):
-                raise IntegrityError("schema migration history contains a version gap")
-            if versions and versions[-1] > len(_MIGRATIONS):
-                raise IntegrityError("database was created by a newer schema version")
-            for row in rows:
-                migration = _MIGRATIONS[int(row[0]) - 1]
-                if legacy:
-                    connection.execute(
-                        "UPDATE schema_migrations SET name=?,checksum=? WHERE version=?",
-                        (migration.name, migration.checksum, migration.version),
-                    )
-                elif row[1] != migration.name or row[2] != migration.checksum:
-                    raise IntegrityError(
-                        f"schema migration metadata drift at version {migration.version}"
-                    )
-
+            _verify_migration_history(connection, _prepare_migration_table(connection))
         for migration in _MIGRATIONS:
             with self.transaction(immediate=True):
                 if connection.execute(
@@ -294,7 +307,6 @@ class Database:
             connection.execute("REINDEX")
 
     def verify_migrations(self) -> bool:
-        """Check that the recorded schema history exactly matches this installed build."""
         _validate_migration_registry()
         columns = {
             str(row[1]) for row in self.connection.execute("PRAGMA table_info(schema_migrations)")
@@ -382,7 +394,6 @@ class ResourceRepository:
     def latest(
         self, *, kind: str | None = None, limit: int | None = None
     ) -> builtins.list[dict[str, Any]]:
-        """Return the newest immutable revision of each logical resource."""
         if limit is not None and limit < 1:
             return []
         where = "WHERE resources.kind=?" if kind is not None else ""
@@ -404,7 +415,6 @@ class ResourceRepository:
         return [json.loads(row[0]) for row in self.db.connection.execute(query, args)]
 
     def inventory(self) -> builtins.list[dict[str, Any]]:
-        """Return bounded per-kind object/revision counts without loading resource bodies."""
         rows = self.db.connection.execute(
             """
             SELECT kind,COUNT(DISTINCT uid),COUNT(*),MAX(created_at)
@@ -474,3 +484,17 @@ class AliasRepository:
         if row is None:
             raise NotFoundError("alias not found")
         return str(row[0]), str(row[1]), int(row[2])
+
+    def list(self) -> builtins.list[dict[str, Any]]:
+        rows = self.db.connection.execute(
+            "SELECT name,uid,revision,version FROM aliases ORDER BY name"
+        )
+        return [
+            {
+                "name": str(row[0]),
+                "uid": str(row[1]),
+                "revision": str(row[2]),
+                "version": int(row[3]),
+            }
+            for row in rows
+        ]

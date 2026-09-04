@@ -1,223 +1,109 @@
-# Executor providers and portable workloads
+# Executors
 
-OMF keeps what a workload does in `WorkloadSpec`. A `Binding` selects the
-execution provider, resources, placement, transport, and site policy. An
-executor provider is the replaceable bridge between that binding and a process,
-scheduler, cloud runner, or capacity broker. Moving a workload from a laptop to
-Slurm, Kubernetes, Modal, Vast.ai, or another backend must not require editing
-the workload DAG or module protocol.
-
-```diagram
-┌──────────────┐     ┌──────────────┐     ┌───────────────────┐
-│ Workload DAG │────▶│ Binding      │────▶│ Named provider    │
-│ behavior     │     │ place/policy │     │ how to execute    │
-└──────┬───────┘     └──────────────┘     └─────────┬─────────┘
-       │                                             │
-       ▼                                             ▼
-┌──────────────┐                           ┌───────────────────┐
-│ omf.module/v1│◀──────────────────────────│ runner/scheduler  │
-│ stable I/O   │ request · result · assets │ local or remote   │
-└──────────────┘                           └───────────────────┘
-```
+An executor provider is the bridge between a `Binding` and a process,
+scheduler, or cloud runner. Moving a workload between providers must not
+change the workload or the module protocol. Only `local` is built in; other
+providers are installed plugins.
 
 ## Discover and preflight
 
-Provider selection is exact. OMF returns an error for an unknown or unready
-provider instead of silently running it as `local`.
-
 ```sh
-omf --output json executor list
-omf --output json executor preflight bindings/local.yaml
-omf --output json executor preflight bindings/site.yaml \
-  --workload workloads/train.yaml
+omf executor list
+omf executor preflight bindings/local.yaml --workload workloads/train.yaml
 ```
 
-The catalog reports each provider's source, potentially supported capabilities,
-and centrally validated configuration. Preflight instantiates the
-configured provider and reports actual capabilities, missing workload
-requirements, and host or control plane issues. When a workload is supplied,
-preflight also includes requirements derived from its modules, such as
-enforceable network denial. It creates no run identity, resource, or event.
+The catalog reports each provider's source, capabilities, and configuration
+contract. Preflight instantiates the configured provider and reports actual
+capabilities, missing workload requirements, and host issues without creating
+a run, a resource, or an event. Provider selection is exact: an unknown or
+unready provider is an error, never a fallback to local.
 
-The same interfaces are `GET /v1/executors` and
-`POST /v1/executors/preflight`. Provider inventory is included in
-`AgentContext`, so an agent can choose and diagnose an execution path without
-reading implementation code first.
+## Capabilities
 
-## Binding format
-
-Executor-specific values live under `spec.config.executor`; they never enter the
-portable workload.
-
-```yaml
-apiVersion: omf.dev/v1alpha1
-kind: Binding
-metadata:
-  name: slurm-shared
-  namespace: local/my-factory
-spec:
-  executor: slurm
-  resources:
-    gpus: 8
-  config:
-    executor:
-      sharedFilesystem: true
-    stores:
-      artifacts: primary
-      checkpoints: primary
-  placement:
-    partition: gpu
-  transport:
-    moduleProtocol: shared-filesystem
-```
-
-The provider factory receives the complete declaration as an isolated deep copy
-in `ExecutorContext.declaration`, repository and state roots, the named actor,
-and only the nested executor options as `ExecutorContext.config`. A provider
-may interpret binding resources, placement, transport, and policy, but must not
-reinterpret stage semantics.
-
-Versioned configuration must not contain plaintext credentials. Refer to
-symbolic secrets or use the runner's workload identity. Provider code is trusted
-runtime code: installing a Python entry point authorizes it to run in the OMF
-service process.
-
-## End-to-end module transport
-
-Implementing scheduler submission is not enough to execute a workload. A
-provider may advertise `omf.module/v1` only when it satisfies all four
-capabilities:
+A provider may advertise `omf.module/v1` only when it carries the complete
+protocol across its execution boundary:
 
 | Capability | Required behavior |
 | --- | --- |
-| `protocol:omf.module/v1` | Preserve the protocol request and result |
+| `protocol:omf.module/v1` | Preserve the request and result exactly |
 | `transport:module-source` | Make the exact admitted source package available to the worker |
 | `transport:request-result` | Deliver `request.json`; retrieve `result.json` before success |
 | `transport:artifacts` | Retrieve declared artifacts into the stage run directory |
+| `isolation:network-deny` | Actually deny network egress; every module run requires it |
+| `protocol:omf.deployment/v1` | Run deployment commands and serving workers |
 
-Execution-environment claims are separate capabilities. The local provider
-accepts only a zero-byte dependency lock and records the selected executable digest. Its
-worker rechecks that pathname immediately before process creation and advertises
-this honestly as `environment:executable-drift-detection`, not byte-sealed
-attestation: trusted host administration could still replace the executable in
-the final check/exec interval. Non-empty dependency locks fail admission until a
-provider with a compatible resolver is installed. Slurm and Kubernetes advertise
-no environment realization in their built-in forms. None of these built-ins claim
-a content-addressed runtime closure or bitwise environment reproducibility.
+The local provider adds `environment:executable-drift-detection` (the worker
+re-hashes the module's interpreter immediately before exec and records the
+digest) and `environment:dependency-lock-realization` (hash-pinned locks are
+installed into cached virtual environments under `.omf/environments/`, keyed
+by lock, interpreter, and options, with the interpreter's site directories
+layered after the lock). Neither is a byte-sealed runtime closure.
 
-The controller writes `request.json` and passes local `run_dir`, admitted-source
-`cwd`, argv, limits, timeout, and network policy to `Executor.plan`. A remote
-provider must then:
+## The local provider
 
-1. stage or mount the exact `cwd` and `request.json`;
-2. run argv without a shell unless its plan explicitly and safely quotes it;
-3. set `OMF_REQUEST_FILE`, `OMF_RESULT_FILE`, and `OMF_RUN_ID` remotely;
-4. durably map its scheduler identity to the local run directory;
-5. retrieve result, logs, and every declared artifact before reporting
-   `succeeded`;
-6. keep artifact paths inside the local stage run directory;
-7. implement observed status, cancellation, log retrieval, and restart attach;
-8. report failure rather than fabricate a result or fall back to another
-   provider.
+Modules run as supervised POSIX process groups without a shell. The plan
+carries the argument vector, the run directory, the captured source as the
+working directory, network denial through an unprivileged user namespace, and
+the binding's resource limits. A detached worker records completion durably so
+status, logs, cancellation, and reattachment after a controller restart do not
+depend on the launching process. Set `spec.config.dependencyWheelhouse` to
+install lock contents from a local wheel directory and
+`spec.config.dependencyIndex: false` to forbid index access.
 
-If a module declares no network destinations, the provider also needs
-`isolation:network-deny`. Assertions in configuration are not enforcement: the
-adapter must actually provide the isolation boundary.
+## Writing a provider
 
-## Built-in providers
-
-| Provider | What is implemented | Complete workload status |
-| --- | --- | --- |
-| `local` | POSIX process groups, limits, timeout, durable status/logs, local protocol/artifact transport, and executable drift detection | Ready only for zero-byte dependency locks when host preflight and requested network isolation pass |
-| `slurm` | `sbatch`/`sacct`/`scancel`, deterministic scripts, request/result environment, shared-filesystem transport | Scheduler-lifecycle-only for modules because the built-in adapter cannot attest environments or enforce network denial |
-| `kubernetes` | Immutable-image Job/JobSet plans and scheduler lifecycle | Not workload-ready: source, request/result, and artifact transport are intentionally absent |
-
-These statements are capability facts, not product preferences. A site can
-extend an adapter in this clone, inject a registry in an embedding service, or
-install a separate provider package. A Kubernetes provider that adds an init
-container/object-store transport and result collector should use a distinct
-name until it fully replaces the built-in behavior in that clone.
-
-Deployments use the same registry and durable restart attachment. A deployment
-defaults to `local`; select another provider with
-`spec.extensions.executor` and place its options in
-`spec.extensions.executorConfig`. The provider must advertise
-`protocol:omf.deployment/v1`. This prevents a hidden local execution path while
-keeping deployment-form semantics separate from scheduler details.
-
-## Add a provider
-
-`omf.executor/v1` is the stable provider boundary. The controller passes an
-isolated copy of project and desired-state context to the provider factory,
-validates provider configuration before calling it, and then uses only the
-exported `Executor` methods. Plans must be deterministic. `submit` returns a
-durable provider ID. Providers that keep state in `run_dir` make `attach`
-idempotent and verify that ID against the directory; scheduler-identity-only
-providers can use the no-op default. `recover` returns `None` only when no
-allocation occurred and raises when launch outcome is ambiguous. Status and
-logs remain available after controller restart.
-
-The smallest in-repository change is to construct and inject an
-`ExecutorRegistry`; this is useful for a site service or tests. A reusable
-provider is an installed Python package exporting one `ExecutorProvider` entry
-point:
+`omf.executor/v1` is the stable plugin boundary. A provider package exports
+one `ExecutorProvider` through the `omf.executors` entry-point group:
 
 ```python
-# omf_modal/provider.py
 from omf.executors import (
     EXECUTOR_API_VERSION,
     MODULE_PROTOCOL_CAPABILITIES,
     ExecutorContext,
     ExecutorProvider,
 )
-from .executor import ModalExecutor
+from .executor import RemoteExecutor
 
 
-def create(context: ExecutorContext) -> ModalExecutor:
-    # Resolve workload identity in the Modal client; do not put a token in the binding.
-    return ModalExecutor(
-        project_root=context.project_root,
-        image=str(context.config["image"]),
-        environment=str(context.config.get("environment", "main")),
-    )
+def create(context: ExecutorContext) -> RemoteExecutor:
+    return RemoteExecutor(project_root=context.project_root, image=str(context.config["image"]))
 
 
 provider = ExecutorProvider(
-    name="modal",
+    name="remote",
     api_version=EXECUTOR_API_VERSION,
     factory=create,
-    description="Modal function runner with object-store protocol transport.",
-    capabilities=MODULE_PROTOCOL_CAPABILITIES,
+    description="Remote runner with object-store protocol transport.",
+    capabilities=MODULE_PROTOCOL_CAPABILITIES | frozenset({"isolation:network-deny"}),
     config_contract={
         "type": "object",
         "required": ["image"],
-        "properties": {
-            "image": {"type": "string"},
-            "environment": {"type": "string"},
-        },
+        "properties": {"image": {"type": "string"}},
         "additionalProperties": False,
     },
 )
 ```
 
 ```toml
-# provider package pyproject.toml
 [project.entry-points."omf.executors"]
-modal = "omf_modal.provider:provider"
+remote = "omf_remote.provider:provider"
 ```
 
-The entry point must export the current `EXECUTOR_API_VERSION`; missing or
-unsupported versions fail during discovery rather than running against an
-ambiguous interface. `ModalExecutor` implements the `Executor` abstract methods in
-`omf.executors.base`: `capabilities`, `preflight`, `plan`, `submit`, `status`,
-`cancel`, and `logs`; override `attach` when controller-local bookkeeping must
-be reconstructed after restart. `plan` must be deterministic for identical
-inputs. Entry-point name and provider name must match. Duplicate names and
-invalid provider objects fail rather than silently replacing code.
+The registry validates the binding's `spec.config` against `config_contract`
+before calling the factory, rejects controller-owned plan fields in provider
+options, and requires the entry-point name to match the provider name. The
+`Executor` methods are `capabilities`, `preflight`, `plan`, `submit`, `status`,
+`cancel`, `logs`, `read_logs`, and optionally `attach`, `recover`, and
+`prepare_environment`. Plans must be deterministic; `submit` returns a durable
+id; `recover` returns `None` only when no allocation happened and raises when
+the outcome is ambiguous; status and logs must survive a controller restart.
+A remote provider must stage the exact working directory and request, set
+`OMF_REQUEST_FILE`, `OMF_RESULT_FILE`, and `OMF_RUN_ID` remotely, retrieve the
+result, logs, and declared artifacts before reporting success, and report
+failure rather than fabricate a result.
 
-For a repository-local provider, add the class under `factory/omf/executors/`
-and register it in `default_executor_registry`. For embedding without changing
-defaults:
+For embedding, construct a registry and inject it; injection replaces the
+default registry so the trust boundary stays explicit:
 
 ```python
 registry = ExecutorRegistry()
@@ -225,40 +111,13 @@ registry.register(provider, source="site")
 factory = Factory(paths, executors=registry)
 ```
 
-Register every provider the embedding needs; injection replaces, rather than
-augments, the default registry. This makes the active trust boundary explicit.
+## Acceptance
 
-## Backend design guidance
-
-- **Modal:** package admitted source or build an immutable image, upload request
-  and inputs by digest, use a durable call ID, and download results/artifacts
-  before terminal success. Keep Modal secrets in its environment, not Git.
-- **Vast.ai:** treat instance provisioning and command execution as one durable
-  provider state machine. Verify image digests, host keys, staged content, and
-  retrieval before releasing capacity; tolerate instance disappearance.
-- **Kubernetes:** prefer immutable images, workload identity, Jobs/JobSets, an
-  init/sidecar or object-store protocol transport, explicit topology/resources,
-  and a collector that makes terminal results durable before Job cleanup.
-- **Slurm:** use a shared filesystem only when every compute node sees the same
-  absolute paths and locking semantics. Otherwise add explicit staging. Map
-  preemption signals to checkpoint hooks and never claim network denial unless
-  site isolation enforces it.
-
-## Provider acceptance tests
-
-Before supporting a binding for production work, test:
-
-- exact provider selection, unknown-provider failure, and no local fallback;
-- clean preflight failure before run allocation;
-- immutable source/request staging and digest verification;
-- successful result and multi-artifact retrieval;
-- nonzero exit, timeout, cancellation, lost worker, and lost controller;
-- attach/reconciliation after service restart;
-- bounded logs without credential or payload leakage;
-- network, identity, secret, quota, and resource enforcement;
-- checkpoint commit/recovery and idempotent retry semantics;
-- the same representative workload unchanged on local and the target binding;
-- measured scale, cost, and recovery behavior at the supported limits.
-
-Do not infer support from a provider name or a successful scheduler submit. Add
-the provider and its failure cases to the release test matrix.
+Before supporting a binding for real work, test exact selection and
+unknown-provider failure, preflight failure before allocation, source and
+request staging with digest verification, result and multi-artifact
+retrieval, nonzero exit, timeout, cancellation, lost worker, lost controller,
+reattachment after restart, bounded logs without credential leakage, network
+and resource enforcement, checkpoint recovery, and the same workload unchanged
+on local and on the target binding. A provider name or an accepted job proves
+none of these.

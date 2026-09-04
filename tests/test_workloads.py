@@ -15,11 +15,6 @@ def test_cycle_retry_and_state(tmp_path):
                 Stage(name="b", module="m", needs=["a"]),
             ],
         )
-    with pytest.raises(ValueError, match="idempotent"):
-        AdmittedWorkload(
-            source_digest="sha256:" + "0" * 64,
-            stages=[Stage(name="a", module="m", retries=1)],
-        )
     spec = AdmittedWorkload(
         source_digest="sha256:" + "0" * 64, stages=[Stage(name="a", module="m")]
     )
@@ -39,11 +34,6 @@ def test_canonical_workload_projection_enforces_semantics():
     workload = yaml.safe_load(path.read_text())
     workload["spec"]["graph"]["stages"][0]["needs"] = ["evaluate"]
     with pytest.raises(ValidationError, match="semantic"):
-        project_workload(workload)
-
-    workload = yaml.safe_load(path.read_text())
-    workload["spec"]["reproducibility"] = "bitwise"
-    with pytest.raises(ValidationError, match="not executable"):
         project_workload(workload)
 
     workload = yaml.safe_load(path.read_text())

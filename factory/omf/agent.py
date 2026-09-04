@@ -1,5 +1,3 @@
-"""Bounded, deterministic control and accumulated-knowledge surface for agents."""
-
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -40,8 +38,6 @@ def _instant(value: datetime | None = None) -> datetime:
 
 @dataclass(frozen=True)
 class ActionDefinition:
-    """Stable machine contract for one agent-operable action."""
-
     action: str
     description: str
     command: str
@@ -482,7 +478,7 @@ _ACTIONS: tuple[ActionDefinition, ...] = (
     ActionDefinition(
         "backup.create",
         "Archive and verify the complete durable local state.",
-        "omf backup <destination>",
+        "omf admin backup <destination>",
         "POST",
         "/v1/backups",
         "admin",
@@ -625,7 +621,7 @@ _ACTIONS += (
     ActionDefinition(
         "token.create",
         "Create an attributable scoped API credential returned exactly once.",
-        "omf token create --actor <actor> --scope <scope>",
+        "omf admin token create --actor <actor> --scope <scope>",
         "POST",
         "/v1/tokens",
         "admin",
@@ -641,7 +637,7 @@ _ACTIONS += (
     ActionDefinition(
         "token.list",
         "List API credential metadata without plaintext token values.",
-        "omf token list",
+        "omf admin token list",
         "GET",
         "/v1/tokens",
         "admin",
@@ -656,7 +652,7 @@ _ACTIONS += (
     ActionDefinition(
         "token.revoke",
         "Irreversibly revoke one API credential by stable token ID.",
-        "omf token revoke <token-id>",
+        "omf admin token revoke <token-id>",
         "DELETE",
         "/v1/tokens/{token_id}",
         "admin",
@@ -721,132 +717,10 @@ _ACTIONS += (
         ),
     ),
     ActionDefinition(
-        "federation.identity",
-        "Export this factory's public trust bundle.",
-        "omf federation identity",
-        "GET",
-        "/v1/federation/identity",
-        "read",
-        False,
-        False,
-        "read-only",
-        "low",
-        "negligible",
-        ("factory.bootstrapped",),
-        ("No state change; no private signing material is returned.",),
-    ),
-    ActionDefinition(
-        "federation.trust",
-        "Trust or replace a peer's public federation identity.",
-        "omf federation trust <peer-id> <bundle>",
-        "POST",
-        "/v1/federation/trust",
-        "admin",
-        True,
-        False,
-        "named-peer-upsert",
-        "high",
-        "metadata",
-        ("peer.id-verified", "trust-bundle.valid"),
-        ("Future peer signatures are evaluated against the supplied identity.",),
-        approval_required=True,
-    ),
-    ActionDefinition(
-        "federation.lease",
-        "Issue a bounded policy-epoch lease to a trusted peer.",
-        "omf federation lease <peer-id> --lease-id <id> --expires-at <time>",
-        "POST",
-        "/v1/federation/leases",
-        "admin",
-        True,
-        False,
-        "lease-identity-guarded",
-        "high",
-        "external",
-        ("peer.trusted", "expiry.future", "policyEpoch.current"),
-        ("Peer receives bounded authority until expiry or epoch invalidation.",),
-        approval_required=True,
-    ),
-    ActionDefinition(
-        "federation.emit",
-        "Sign and queue a federated event for a leased peer.",
-        "omf federation emit <peer-id> --content <path> --lease-id <id> --kind <kind> "
-        "--resource <ref>",
-        "POST",
-        "/v1/federation/events",
-        "write",
-        True,
-        False,
-        "new-event-identity",
-        "medium",
-        "external",
-        ("peer.trusted", "lease.valid", "content.canonical"),
-        ("Signed event queued in the peer outbox.",),
-    ),
-    ActionDefinition(
-        "federation.reconcile",
-        "Verify and idempotently reconcile an incoming federated event.",
-        "omf federation reconcile <event>",
-        "POST",
-        "/v1/federation/reconcile",
-        "write",
-        True,
-        False,
-        "event-idempotent",
-        "medium",
-        "metadata",
-        ("peer.trusted", "lease.valid", "signature.valid", "sequence.acceptable"),
-        ("Accepted event stored once; replay does not duplicate state.",),
-    ),
-    ActionDefinition(
-        "federation.outbox",
-        "List pending signed events for one or all federation peers.",
-        "omf federation outbox [--peer-id <peer-id>]",
-        "GET",
-        "/v1/federation/outbox",
-        "read",
-        False,
-        False,
-        "read-only",
-        "medium",
-        "metadata",
-        ("factory.bootstrapped",),
-        ("No state change; response contains federated event content.",),
-    ),
-    ActionDefinition(
-        "federation.published",
-        "Idempotently acknowledge successful peer delivery for an outbox event.",
-        "omf federation published <peer-id> <event-id>",
-        "POST",
-        "/v1/federation/outbox/published",
-        "write",
-        True,
-        False,
-        "content-idempotent",
-        "medium",
-        "metadata",
-        ("outbox-event.exists", "peer-delivery.verified"),
-        ("Event leaves the pending delivery view; immutable history remains.",),
-    ),
-    ActionDefinition(
-        "capacity.place",
-        "Select a policy-compatible capacity offer without allocating it.",
-        "omf capacity place <offers> --residency <label> --resource <type>",
-        "POST",
-        "/v1/capacity/place",
-        "write",
-        False,
-        False,
-        "read-only",
-        "low",
-        "negligible",
-        ("offers.current", "constraints.explicit"),
-        ("No allocation or state change; selected offer is returned.",),
-    ),
-    ActionDefinition(
         "secret.set",
         "Encrypt and create or replace a purpose-bound local secret.",
-        "omf secret set <name> --purpose <purpose> --value <value> [--expected-version <version>]",
+        "omf admin secret set <name> --purpose <purpose> --value <value> "
+        "[--expected-version <version>]",
         None,
         None,
         "admin",
@@ -863,7 +737,7 @@ _ACTIONS += (
     ActionDefinition(
         "secret.list",
         "List secret names, purposes, and versions without plaintext values.",
-        "omf secret list",
+        "omf admin secret list",
         None,
         None,
         "admin",
@@ -881,7 +755,6 @@ _ACTION_BY_NAME = {item.action: item for item in _ACTIONS}
 
 
 def capability_catalog() -> dict[str, Any]:
-    """Return the action catalog without requiring initialized factory state."""
     actions = [item.as_dict() for item in _ACTIONS]
     body = {"apiVersion": "omf.agent/v1alpha1", "catalogVersion": 1, "actions": actions}
     return {**body, "catalogDigest": sha256_digest(body)}
@@ -895,7 +768,6 @@ def initial_context(
     since: str | None = None,
     max_bytes: int = 65_536,
 ) -> dict[str, Any]:
-    """Return an actionable context before repository-local state exists."""
     from omf.config import bootstrap, load_project
     from omf.executors import default_executor_registry
 
@@ -975,8 +847,6 @@ def initial_context(
 
 
 class AgentControl:
-    """Agent-facing projection over the authoritative factory state."""
-
     def __init__(self, factory: Factory) -> None:
         self.factory = factory
 
@@ -1279,7 +1149,6 @@ class AgentControl:
         max_bytes: int = 65_536,
         at: datetime | None = None,
     ) -> dict[str, Any]:
-        """Build a bounded projection of facts needed for the next control decision."""
         self._check_limit(limit)
         if max_bytes < 16_384 or max_bytes > 1_048_576:
             raise ValidationError("max_bytes must be between 16384 and 1048576")
@@ -1491,6 +1360,62 @@ class AgentControl:
         ordered = sorted(blockers, key=lambda item: (item["severity"], item["id"]))
         return self._page(ordered, limit)
 
+    def _run_recommendations(self, latest_run: dict[str, Any]) -> list[dict[str, Any]]:
+        run_id = str(latest_run.get("runId"))
+        state = str(latest_run.get("state", "")).lower()
+        if state in {"failed", "error"}:
+            return [
+                self._recommend(
+                    "run.status",
+                    90,
+                    "run_failed",
+                    "Inspect exact stage state and admitted digests before changing the workload.",
+                    command=f"omf runs status {run_id}",
+                    parameters={"runId": run_id},
+                )
+            ]
+        if state != "succeeded":
+            return []
+        evaluations = [
+            item
+            for item in self.factory.resources.latest(kind="EvaluationResult")
+            if item["spec"].get("extensions", {}).get("runId") == run_id
+        ]
+        if not evaluations:
+            return [
+                self._recommend(
+                    "evaluation.create",
+                    80,
+                    "evaluation_missing",
+                    "The latest succeeded run has no immutable evaluation evidence.",
+                    command=f"omf evaluate run/{run_id}",
+                    parameters={"runId": run_id},
+                )
+            ]
+        if not bool(evaluations[0]["spec"].get("extensions", {}).get("passed")):
+            return []
+        releases = [
+            item
+            for item in self.factory.resources.latest(kind="Release")
+            if item["spec"]
+            .get("extensions", {})
+            .get("manifest", {})
+            .get("provenance", {})
+            .get("runId")
+            == run_id
+        ]
+        if releases:
+            return []
+        return [
+            self._recommend(
+                "release.create",
+                55,
+                "release_missing",
+                "A passing evaluated run is not yet packaged as a signed release.",
+                parameters={"runId": run_id},
+            )
+        ]
+
     def _recommendations(self, at: datetime | None = None) -> list[dict[str, Any]]:
         recommendations: list[dict[str, Any]] = []
         active_goals = [
@@ -1540,59 +1465,7 @@ class AgentControl:
                 ]
             )
         else:
-            latest_run = run_items[0]
-            run_id = str(latest_run.get("runId"))
-            state = str(latest_run.get("state", "")).lower()
-            if state in {"failed", "error"}:
-                recommendations.append(
-                    self._recommend(
-                        "run.status",
-                        90,
-                        "run_failed",
-                        "Inspect exact stage state and admitted digests before changing "
-                        "the workload.",
-                        command=f"omf runs status {run_id}",
-                        parameters={"runId": run_id},
-                    )
-                )
-            elif state == "succeeded":
-                evaluations = [
-                    item
-                    for item in self.factory.resources.latest(kind="EvaluationResult")
-                    if item["spec"].get("extensions", {}).get("runId") == run_id
-                ]
-                if not evaluations:
-                    recommendations.append(
-                        self._recommend(
-                            "evaluation.create",
-                            80,
-                            "evaluation_missing",
-                            "The latest succeeded run has no immutable evaluation evidence.",
-                            command=f"omf evaluate run/{run_id}",
-                            parameters={"runId": run_id},
-                        )
-                    )
-                elif bool(evaluations[0]["spec"].get("extensions", {}).get("passed")):
-                    releases = [
-                        item
-                        for item in self.factory.resources.latest(kind="Release")
-                        if item["spec"]
-                        .get("extensions", {})
-                        .get("manifest", {})
-                        .get("provenance", {})
-                        .get("runId")
-                        == run_id
-                    ]
-                    if not releases:
-                        recommendations.append(
-                            self._recommend(
-                                "release.create",
-                                55,
-                                "release_missing",
-                                "A passing evaluated run is not yet packaged as a signed release.",
-                                parameters={"runId": run_id},
-                            )
-                        )
+            recommendations.extend(self._run_recommendations(run_items[0]))
         deployments = self._recent_resource_status("DeploymentSpec", 1, None)
         if inventory.get("Release") and not deployments["items"]:
             recommendations.append(

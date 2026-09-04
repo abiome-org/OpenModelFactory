@@ -1,49 +1,35 @@
-"""Module manifests, safe resolution, and reproducible source packages."""
-
 from __future__ import annotations
 
 import hashlib
 import io
 import os
+import shutil
 import stat
 import subprocess
 import tarfile
 from pathlib import Path, PurePosixPath
 from typing import Any
 
+import yaml
 from jsonschema import Draft202012Validator
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from omf.canonical import load_document, portable_relative_path
-from omf.errors import ValidationError
+from omf.errors import ConfigurationError, ValidationError
 from omf.executors.base import DependencyLock
 from omf.schema_registry import default_registry
 
 
 class ModuleManifest(BaseModel):
-    """Validated runtime projection of the canonical Module resource."""
-
     model_config = ConfigDict(extra="forbid")
     name: str
-    namespace: str
-    contract_version: str
-    kind: str
     code_root: str = "."
     argv: list[str]
     schemas: dict[str, Any] = Field(default_factory=dict)
     dependency_lock: str
     dependency_digest: str
     dependency_contents: bytes = Field(repr=False)
-    capabilities: set[str] = Field(default_factory=set)
-    platforms: set[str] = Field(default_factory=set)
-    resources: dict[str, Any] = Field(default_factory=dict)
-    determinism: str = "declared"
     checkpoint: bool = False
-    side_effects: list[str] = Field(default_factory=list)
-    concurrency: int = 1
-    secrets: list[str] = Field(default_factory=list)
-    network: list[str] = Field(default_factory=list)
-    provenance: dict[str, str]
     fixtures: list[dict[str, Any]] = Field(default_factory=list)
 
     @field_validator("argv")
@@ -54,95 +40,121 @@ class ModuleManifest(BaseModel):
         return value
 
 
+def _within(path: Path, root: Path, message: str) -> None:
+    try:
+        path.relative_to(root)
+    except ValueError as exc:
+        raise ValidationError(message) from exc
+
+
+def _code_root(manifest_path: Path, root: Path, code_root: str) -> Path:
+    portable_relative_path(code_root, "module code root")
+    lexical = manifest_path.parent / code_root
+    if lexical.is_symlink():
+        raise ValidationError("module code root may not be a symlink")
+    code = lexical.resolve()
+    _within(code, root, "module code root escapes project root")
+    if not code.is_dir():
+        raise ValidationError("module code root must be a directory")
+    return code
+
+
+def _lock_contents(code: Path, manifest: ModuleManifest) -> bytes:
+    portable_relative_path(manifest.dependency_lock, "module dependency lock")
+    lock_path = (code / manifest.dependency_lock).resolve()
+    _within(lock_path, code, "module dependency lock escapes code root")
+    if not lock_path.is_file() or lock_path.is_symlink():
+        raise ValidationError("module dependency lock must be a regular file")
+    contents = lock_path.read_bytes()
+    if "sha256:" + hashlib.sha256(contents).hexdigest() != manifest.dependency_digest:
+        raise ValidationError("module dependency lock digest does not match")
+    return contents
+
+
+def _check_executable(code: Path, executable: str) -> None:
+    if executable.startswith("/"):
+        raise ValidationError("module executable must not be an absolute path")
+    if "/" not in executable:
+        return
+    portable_relative_path(executable, "module executable")
+    target = (code / executable).resolve()
+    if code not in target.parents or not target.is_file() or not os.access(target, os.X_OK):
+        raise ValidationError("module executable is missing or not executable")
+
+
 def load_manifest(path: str | Path, project_root: str | Path) -> tuple[ModuleManifest, Path]:
     manifest_path, root = Path(path).resolve(), Path(project_root).resolve()
-    try:
-        manifest_path.relative_to(root)
-    except ValueError as exc:
-        raise ValidationError("manifest is outside project root") from exc
+    _within(manifest_path, root, "manifest is outside project root")
     raw = load_document(manifest_path.read_bytes())
     resource = default_registry.validate_as(raw, "Module")
     spec = resource["spec"]
     entry_point = spec["entryPoint"]
-    environment = spec["environment"]
-    lifecycle = spec["lifecycle"]
-    access = spec["access"]
+    contracts = spec.get("contracts", {})
     manifest = ModuleManifest.model_validate(
         {
             "name": resource["metadata"]["name"],
-            "namespace": resource["metadata"]["namespace"],
-            "contract_version": spec["contractVersion"],
-            "kind": spec["moduleKind"],
             "code_root": entry_point.get("codeRoot", "."),
             "argv": entry_point["command"],
-            "schemas": spec["contracts"],
-            "dependency_lock": environment.get("dependencyLock"),
-            "dependency_digest": environment.get("dependencyDigest"),
+            "schemas": {
+                name: contracts.get(name, {"type": "object"})
+                for name in ("input", "output", "config", "state")
+            },
+            "dependency_lock": spec["environment"]["dependencyLock"],
+            "dependency_digest": spec["environment"]["dependencyDigest"],
             "dependency_contents": b"",
-            "capabilities": spec.get("capabilities", []),
-            "platforms": spec.get("platforms", []),
-            "resources": spec.get("resources", {}),
-            "determinism": spec.get("determinism", "declared"),
-            "checkpoint": lifecycle["checkpoint"],
-            "side_effects": lifecycle["sideEffects"],
-            "concurrency": lifecycle["concurrency"],
-            "secrets": access["secrets"],
-            "network": access["network"],
-            "provenance": spec["provenance"],
+            "checkpoint": spec.get("checkpoint", False),
             "fixtures": spec.get("fixtures", []),
         }
     )
-    portable_relative_path(manifest.code_root, "module code root")
-    lexical = manifest_path.parent / manifest.code_root
-    if lexical.is_symlink():
-        raise ValidationError("module code root may not be a symlink")
-    code = lexical.resolve()
-    try:
-        code.relative_to(root)
-    except ValueError as exc:
-        raise ValidationError("module code root escapes project root") from exc
-    if not code.is_dir():
-        raise ValidationError("module code root must be a directory")
-    portable_relative_path(manifest.dependency_lock, "module dependency lock")
-    lock_path = (code / manifest.dependency_lock).resolve()
-    try:
-        lock_path.relative_to(code)
-    except ValueError as exc:
-        raise ValidationError("module dependency lock escapes code root") from exc
-    if not lock_path.is_file() or lock_path.is_symlink():
-        raise ValidationError("module dependency lock must be a regular file")
-    lock_contents = lock_path.read_bytes()
-    actual_digest = "sha256:" + hashlib.sha256(lock_contents).hexdigest()
-    if actual_digest != manifest.dependency_digest:
-        raise ValidationError("module dependency lock digest does not match")
-    manifest = manifest.model_copy(update={"dependency_contents": lock_contents})
+    code = _code_root(manifest_path, root, manifest.code_root)
+    manifest = manifest.model_copy(update={"dependency_contents": _lock_contents(code, manifest)})
     for name, contract in manifest.schemas.items():
         validate_contract_schema(contract, f"module {name}")
-    if manifest.resources:
-        raise ValidationError(
-            "module resource requirements are not executable; declare placement in Binding"
-        )
-    if manifest.network:
-        raise ValidationError(
-            "module network destinations require an executor with allowlist enforcement"
-        )
-    if manifest.capabilities or manifest.platforms or manifest.secrets:
-        raise ValidationError(
-            "module capability, platform, and secret requirements need provider negotiation"
-        )
-    executable = manifest.argv[0]
-    if executable.startswith("/"):
-        raise ValidationError("module executable must not be an absolute path")
-    if "/" in executable:
-        portable_relative_path(executable, "module executable")
-        target = (code / executable).resolve()
-        if code not in target.parents or not target.is_file() or not os.access(target, os.X_OK):
-            raise ValidationError("module executable is missing or not executable")
+    _check_executable(code, manifest.argv[0])
     return manifest, code
 
 
+_SCAFFOLD_MAIN = """from omf.sdk import ProtocolRequest, ProtocolResult, main
+
+
+def validate(_request: ProtocolRequest) -> ProtocolResult:
+    return ProtocolResult(status="ok")
+
+
+def run(request: ProtocolRequest) -> ProtocolResult:
+    return ProtocolResult(status="ok", outputs={"echo": request.inputs})
+
+
+if __name__ == "__main__":
+    raise SystemExit(main({"validate": validate, "run": run}))
+"""
+
+
+def scaffold_module(directory: str | Path, name: str | None = None) -> Path:
+    root = Path(directory)
+    if root.exists():
+        raise ValidationError(f"module directory already exists: {root}")
+    root.mkdir(parents=True)
+    (root / "main.py").write_text(_SCAFFOLD_MAIN)
+    (root / "requirements.lock").write_bytes(b"")
+    manifest = {
+        "apiVersion": "omf.dev/v1alpha1",
+        "kind": "Module",
+        "metadata": {"name": name or root.name},
+        "spec": {
+            "entryPoint": {"command": ["python3", "main.py"]},
+            "environment": {
+                "dependencyLock": "requirements.lock",
+                "dependencyDigest": "sha256:" + hashlib.sha256(b"").hexdigest(),
+            },
+        },
+    }
+    path = root / "module.yaml"
+    path.write_text(yaml.safe_dump(manifest, sort_keys=False))
+    return path
+
+
 def dependency_lock(manifest: ModuleManifest) -> DependencyLock:
-    """Return the already-confined and digest-verified lock as opaque provider input."""
     return DependencyLock(
         relative_path=manifest.dependency_lock,
         digest=manifest.dependency_digest,
@@ -163,7 +175,6 @@ _EXCLUDED = {
 
 
 def package_module(code_root: str | Path, output: str | Path) -> str:
-    """Create a byte-reproducible tar, rejecting links/special files and secret areas."""
     root, destination = Path(code_root).resolve(), Path(output)
     with (
         destination.open("wb") as raw,
@@ -192,7 +203,6 @@ def package_module(code_root: str | Path, output: str | Path) -> str:
 
 
 def extract_module_package(package: str | Path, destination: str | Path) -> Path:
-    """Materialize a validated module tar without tar traversal or special-file behavior."""
     target = Path(destination)
     if target.exists():
         raise ValidationError("module extraction destination already exists")
@@ -216,46 +226,56 @@ def extract_module_package(package: str | Path, destination: str | Path) -> Path
                     raise ValidationError(f"unsupported module package entry: {member.name}")
                 os.chmod(output, member.mode & 0o777)
     except Exception:
-        import shutil
-
         shutil.rmtree(target, ignore_errors=True)
         raise
     return target
 
 
-def git_source(root: str | Path, *, allow_dirty: bool = False) -> dict[str, Any]:
+def worktree_state(root: str | Path) -> dict[str, Any]:
     cwd = Path(root)
-    commit = subprocess.run(
-        ["git", "rev-parse", "HEAD"], cwd=cwd, check=True, capture_output=True, text=True
-    ).stdout.strip()
-    patch = subprocess.run(
-        ["git", "diff", "--binary", "HEAD"], cwd=cwd, check=True, capture_output=True
-    ).stdout
-    untracked = subprocess.run(
-        ["git", "ls-files", "--others", "--exclude-standard"],
-        cwd=cwd,
-        check=True,
-        capture_output=True,
-        text=True,
-    ).stdout.splitlines()
-    if (patch or untracked) and not allow_dirty:
-        raise ValidationError("dirty Git tree requires explicit allow_dirty policy")
+
+    def git(*arguments: str, text: bool = True, check: bool = True) -> Any:
+        try:
+            return subprocess.run(
+                ["git", *arguments], cwd=cwd, check=check, capture_output=True, text=text
+            )
+        except (OSError, subprocess.CalledProcessError) as exc:
+            raise ConfigurationError(
+                "the project must be a Git working tree to admit a workload",
+                details={"root": str(cwd)},
+            ) from exc
+
+    head = git("rev-parse", "--verify", "--quiet", "HEAD", check=False)
+    commit = head.stdout.strip() if head.returncode == 0 else None
+    patch = git("diff", "--binary", "HEAD", "--", ".", text=False).stdout if commit else b""
+    uncommitted = set(
+        git("ls-files", "--others", "--exclude-standard", "--", ".").stdout.splitlines()
+    )
+    if commit is None:
+        uncommitted.update(git("ls-files", "--", ".").stdout.splitlines())
+    untracked = sorted(uncommitted)
     return {
         "commit": commit,
         "patch": patch,
-        "untracked": sorted(untracked),
-        "digest": "sha256:" + hashlib.sha256(patch).hexdigest(),
+        "untracked": untracked,
+        "dirty": bool(patch or untracked),
+        "patchDigest": "sha256:" + hashlib.sha256(patch).hexdigest(),
     }
 
 
-def validate_fixtures(manifest: ModuleManifest) -> None:
-    for fixture in manifest.fixtures:
-        if "request" not in fixture or "result" not in fixture:
-            raise ValidationError("fixtures require request and result")
+def git_source(root: str | Path, *, allow_dirty: bool = False) -> dict[str, Any]:
+    state = worktree_state(root)
+    if state["dirty"] and not allow_dirty:
+        raise ValidationError("dirty Git tree requires explicit allow_dirty policy")
+    return {
+        "commit": state["commit"],
+        "patch": state["patch"],
+        "untracked": state["untracked"],
+        "digest": state["patchDigest"],
+    }
 
 
 def validate_contract(contract: Any, value: Any, name: str) -> None:
-    """Validate a protocol value without including untrusted values in errors."""
     errors = sorted(
         Draft202012Validator(contract).iter_errors(value),
         key=lambda error: tuple(str(item) for item in error.absolute_path),
@@ -280,7 +300,6 @@ def validate_contract(contract: Any, value: Any, name: str) -> None:
 
 
 def validate_contract_schema(contract: Any, name: str) -> None:
-    """Validate an embedded, self-contained JSON Schema at admission."""
     reject_schema_references(contract, name)
     try:
         Draft202012Validator.check_schema(contract)
@@ -289,7 +308,6 @@ def validate_contract_schema(contract: Any, name: str) -> None:
 
 
 def reject_schema_references(value: Any, name: str) -> None:
-    """Reject actual JSON Schema reference keywords without inspecting instance literals."""
     if isinstance(value, dict):
         if isinstance(value.get("$ref"), str) or isinstance(value.get("$dynamicRef"), str):
             raise ValidationError(f"module {name} contract references are not supported")

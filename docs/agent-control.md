@@ -133,8 +133,8 @@ their reasons and content.
 Claims are visible to principals with project read scope. Never put credentials,
 private keys, raw sensitive samples, prompts, or model payloads in a claim;
 reference a governed artifact or event digest instead. Knowledge and goals are
-factory metadata and must be included in normal metadata backup, restore, and
-federation procedures.
+factory metadata and must be included in normal metadata backup and restore
+procedures.
 
 ## Machine-actionable errors
 

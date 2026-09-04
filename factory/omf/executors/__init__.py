@@ -7,7 +7,6 @@ from omf.executors.base import (
     ExecutionStatus,
     Executor,
 )
-from omf.executors.kubernetes import KubernetesExecutor
 from omf.executors.local import LocalExecutor
 from omf.executors.registry import (
     EXECUTOR_API_VERSION,
@@ -17,7 +16,6 @@ from omf.executors.registry import (
     ResolvedExecutor,
     default_executor_registry,
 )
-from omf.executors.slurm import SlurmExecutor
 
 __all__ = [
     "DEPLOYMENT_PROTOCOL_CAPABILITIES",
@@ -31,9 +29,7 @@ __all__ = [
     "ExecutorContext",
     "ExecutorProvider",
     "ExecutorRegistry",
-    "KubernetesExecutor",
     "LocalExecutor",
     "ResolvedExecutor",
-    "SlurmExecutor",
     "default_executor_registry",
 ]

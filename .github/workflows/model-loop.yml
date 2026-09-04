@@ -1,6 +1,7 @@
 name: model-loop
 
 on:
+  workflow_dispatch:
   pull_request:
     paths:
       - "modules/**"
@@ -8,9 +9,8 @@ on:
       - "workloads/**"
       - "model-packages/**"
       - "evaluations/**"
-      - "mixes/**"
       - "factory/**"
-      - "tests/test_manual.py"
+      - "tests/test_walkthrough.py"
   push:
     branches: [main]
     paths:
@@ -19,9 +19,8 @@ on:
       - "workloads/**"
       - "model-packages/**"
       - "evaluations/**"
-      - "mixes/**"
       - "factory/**"
-      - "tests/test_manual.py"
+      - "tests/test_walkthrough.py"
 
 permissions:
   contents: read
@@ -35,7 +34,13 @@ jobs:
         with:
           python-version: "3.11"
           cache: pip
-      - run: python -m pip install --only-binary=:all: --require-hashes -r requirements.lock
-      - run: python -m pip install --only-binary=:all: --require-hashes -r requirements.build.lock
+      - run: "python -m pip install --only-binary=:all: --require-hashes -r requirements.lock"
+      - run: "python -m pip install --only-binary=:all: --require-hashes -r requirements.build.lock"
       - run: python -m pip install --no-build-isolation --no-deps -e .
-      - run: python -m pytest tests/test_manual.py::test_greenfield_model_card_to_compared_candidate
+      - name: Allow unprivileged user namespaces for module network isolation
+        run: |
+          if sysctl -n kernel.apparmor_restrict_unprivileged_userns >/dev/null 2>&1; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+          unshare --user --map-root-user --net true
+      - run: python -m pytest tests/test_walkthrough.py::test_greenfield_model_card_to_compared_candidate

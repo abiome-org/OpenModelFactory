@@ -50,13 +50,8 @@ spec: {owners: [local-user], extensions: {}}
     )
     shutil.copytree("modules", root / "modules")
     shutil.copytree("workloads", root / "workloads")
-    workload = yaml.safe_load((root / "workloads/example-statistical.yaml").read_text())
-    workload["metadata"]["namespace"] = "local/cli-full"
-    (root / "workloads/example-statistical.yaml").write_text(yaml.safe_dump(workload))
     (root / "bindings").mkdir()
-    binding = yaml.safe_load(Path("bindings/local.yaml").read_text())
-    binding["metadata"]["namespace"] = "local/cli-full"
-    (root / "bindings/local.yaml").write_text(yaml.safe_dump(binding))
+    shutil.copy("bindings/local.yaml", root / "bindings/local.yaml")
     (root / "numbers.jsonl").write_text(Path("data/fixtures/numbers.jsonl").read_text())
     (root / "rights.yaml").write_text("license: CC0-1.0\ntrainingAllowed: true\n")
     return root
@@ -145,6 +140,9 @@ def test_cli_complete_local_lifecycle(tmp_path):
     validated_module = invoke("module", "validate", manifest)[0]
     assert validated_module["valid"]
     assert invoke("module", "test", manifest)[0]["passed"] == 1
+    scaffold = root / "modules/new-model"
+    assert invoke("module", "init", scaffold)["valid"]
+    assert invoke("module", "test", scaffold / "module.yaml")[0]["passed"] == 1
     assert {item["name"] for item in invoke("executor", "list")["providers"]} >= {"local"}
     assert invoke(
         "executor",
@@ -166,6 +164,20 @@ def test_cli_complete_local_lifecycle(tmp_path):
     run_id = run["runId"]
     run_status = invoke("runs", "status", run_id)
     assert run_status["status"]["state"] == "Succeeded"
+    run_resource = invoke("resource", "list", "--kind", "Run")[0]
+    assert invoke("runs", "list") == [
+        {
+            "runId": run_id,
+            "state": "Succeeded",
+            "workload": run_resource["spec"]["workloadRef"],
+            "createdAt": run_resource["metadata"]["createdAt"],
+        }
+    ]
+    rendered = runner.invoke(app, ["--project", str(root), "runs", "list"])
+    assert rendered.exit_code == 0, rendered.output
+    header, row = rendered.stdout.splitlines()
+    assert header.split() == ["runId", "state", "workload", "createdAt"]
+    assert row.split()[:2] == [run_id, "Succeeded"]
     evaluation = invoke("evaluate", f"run/{run_id}")
     assert evaluation["spec"]["scores"]["passed"]
     evaluation_ref = (
@@ -194,19 +206,18 @@ def test_cli_complete_local_lifecycle(tmp_path):
     )
     assert invalid_experiment.exit_code == 1
     assert json.loads(invalid_experiment.stdout)["error"]["code"] == "validation_error"
+    evidence = invoke("release", "evidence", f"run/{run_id}")
+    assert set(evidence["subjects"]) == {
+        run["outputs"]["train.model"],
+        *run_status["execution"]["digests"]["modules"].values(),
+    }
     vulnerability_report = root / "vulnerability-report.yaml"
     vulnerability_report.write_text(
         yaml.safe_dump(
             {
+                **evidence,
                 "scanner": {"name": "test-scanner", "version": "1"},
                 "databaseRevision": "test-db-1",
-                "generatedAt": "2026-09-01T00:00:00Z",
-                "subjects": [
-                    run["outputs"]["train.model"],
-                    *run_status["execution"]["digests"]["modules"].values(),
-                ],
-                "findings": [],
-                "waivers": [],
             }
         )
     )
@@ -225,6 +236,16 @@ def test_cli_complete_local_lifecycle(tmp_path):
         vulnerability_report,
     )
     assert release["kind"] == "Release"
+    assert invoke("release", "list") == [
+        {
+            "name": "release-one",
+            "revision": release["metadata"]["revision"],
+            "promotion": "allow",
+            "aliases": ["candidate"],
+            "createdAt": release["metadata"]["createdAt"],
+        }
+    ]
+    assert invoke("release", "show", "release/release-one")["aliases"] == ["candidate"]
     assert invoke("lineage", "show", f"run:{run_id}/stage:train")
     assert invoke("resource", "list", "--kind", "Release")[0]["metadata"]["name"] == "release-one"
     deployment = {
@@ -233,8 +254,6 @@ def test_cli_complete_local_lifecycle(tmp_path):
         "metadata": {"name": "edge-one", "namespace": "local/cli-full"},
         "spec": {
             "releaseRef": "release/release-one",
-            "runtime": "omf.module/v1",
-            "routing": {},
             "extensions": {"form": "edge"},
         },
     }
@@ -242,59 +261,31 @@ def test_cli_complete_local_lifecycle(tmp_path):
     deployment_path.write_text(yaml.safe_dump(deployment))
     assert invoke("deploy", deployment_path)["state"] == "packaged"
     assert invoke("deployment", "status", "edge-one")["status"]["state"] == "packaged"
+    [deployment] = invoke("deployment", "list")
+    assert (deployment["name"], deployment["release"], deployment["state"]) == (
+        "edge-one",
+        "release/release-one",
+        "packaged",
+    )
     revoked = invoke("data", "revoke", "example-numbers", "--reason", "test withdrawal")
     assert revoked["spec"]["rights"]["trainingAllowed"] is False
     assert revoked["spec"]["rights"]["revoked"] is True
 
-    assert "keyId" in invoke("federation", "identity")
-    content = root / "federated-content.yaml"
-    content.write_text("revision: one\n")
-    event = invoke(
-        "federation",
-        "emit",
-        "receiver",
-        "--content",
-        content,
-        "--lease-id",
-        "lease",
-        "--kind",
-        "artifact",
-        "--resource",
-        "candidate",
-    )
-    assert (
-        invoke("federation", "outbox", "--peer-id", "receiver")[0]["event_id"] == event["event_id"]
-    )
-    assert invoke("federation", "published", "receiver", event["event_id"])["published"]
-
-    offers = root / "offers.yaml"
-    offers.write_text("- peer_id: eu-cell\n  labels: [gpu, 'residency:eu']\n  capacity: {gpu: 8}\n")
-    placed = invoke(
-        "capacity",
-        "place",
-        offers,
-        "--residency",
-        "eu",
-        "--resource",
-        "gpu",
-        "--required-label",
-        "gpu",
-    )
-    assert placed["peer_id"] == "eu-cell"
     operations = invoke("operation", "list")
     assert len(operations) == 1
     assert operations[0]["kind"] == "run"
     assert operations[0]["state"] == "succeeded"
-    api_token = invoke("token", "create", "--actor", "reader", "--scope", "read")
+    api_token = invoke("admin", "token", "create", "--actor", "reader", "--scope", "read")
     assert api_token["actor"] == "reader"
-    assert api_token["token"] not in repr(invoke("token", "list"))
-    assert invoke("token", "revoke", api_token["tokenId"])["revoked"]
+    assert api_token["token"] not in repr(invoke("admin", "token", "list"))
+    assert invoke("admin", "token", "revoke", api_token["tokenId"])["revoked"]
     assert (
-        invoke("secret", "set", "example", "--purpose", "test", "--value", "not-printed")["version"]
+        invoke("admin", "secret", "set", "example", "--purpose", "test", "--value", "x")["version"]
         == 1
     )
     assert (
         invoke(
+            "admin",
             "secret",
             "set",
             "example",
@@ -307,8 +298,8 @@ def test_cli_complete_local_lifecycle(tmp_path):
         )["version"]
         == 2
     )
-    assert "example" in {item["name"] for item in invoke("secret", "list")}
-    backup = invoke("backup", root.parent / "factory.omf-backup")
+    assert "example" in {item["name"] for item in invoke("admin", "secret", "list")}
+    backup = invoke("admin", "backup", root.parent / "factory.omf-backup")
     assert backup["integrity"]
     restored = root.parent / "restored"
     restored.mkdir()
@@ -320,6 +311,7 @@ def test_cli_complete_local_lifecycle(tmp_path):
             str(restored),
             "--output",
             "json",
+            "admin",
             "restore",
             backup["path"],
             "--expected-key-id",

@@ -75,8 +75,6 @@ include = [
   "/docs",
   "/evaluations",
   "/install.sh",
-  "/manual",
-  "/mixes",
   "/model-packages",
   "/modules/examples",
   "/omf.yaml",
@@ -87,7 +85,6 @@ include = [
   "/requirements.build.lock",
   "/requirements.lock",
   "/requirements.runtime.lock",
-  "/starter-packs",
   "/templates",
   "/workloads",
   "/LICENSE",
@@ -113,12 +110,19 @@ line-length = 100
 target-version = "py311"
 
 [tool.ruff.lint]
-select = ["E", "F", "I", "UP", "B", "A", "C4", "DTZ", "ISC", "PIE", "PT", "RUF", "SIM"]
+select = [
+  "E", "F", "I", "UP", "B", "A", "C4", "C90", "DTZ", "ISC", "PIE", "PT", "RUF", "SIM",
+  "PLR0911", "PLR0912", "PLR0915",
+]
 ignore = ["ISC001"]
+
+[tool.ruff.lint.mccabe]
+max-complexity = 10
 
 [tool.ruff.lint.per-file-ignores]
 "factory/omf/api.py" = ["B008"]
 "factory/omf/cli.py" = ["B008"]
+"tests/*" = ["PLR0915"]
 
 [tool.mypy]
 python_version = "3.11"

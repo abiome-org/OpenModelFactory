@@ -1,5 +1,3 @@
-"""Complete signed release manifests and auditable alias promotion."""
-
 from __future__ import annotations
 
 from collections.abc import Callable

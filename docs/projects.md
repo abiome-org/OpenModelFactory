@@ -1,0 +1,105 @@
+# Projects
+
+A project is a Git repository with an `omf.yaml` at its root. Everything OMF
+knows about the project lives either in versioned files next to it or in the
+untracked `.omf/` directory.
+
+## The project manifest
+
+```yaml
+apiVersion: omf.dev/v1alpha1
+kind: Project
+metadata:
+  name: my-model
+  namespace: local/my-model
+spec:
+  owners: [local-user]
+```
+
+`metadata.namespace` is the identity every resource in the project carries.
+Other manifests may omit their namespace; OMF stamps the project namespace when
+it loads them, and it rejects a manifest that names a different one. `owners`
+is optional; the first owner becomes the actor of the local API token that
+`omf bootstrap` creates. `spec.extensions.policyDirectory` changes where policy
+documents are read from (default `policies`).
+
+## Local state
+
+`omf bootstrap` creates `.omf/` with a restrictive umask:
+
+| Path | Content |
+| --- | --- |
+| `metadata.db` | SQLite: resources, statuses, aliases, events, lineage, operations, tokens, secrets |
+| `identity/` | The signing key and the secrets encryption key |
+| `store/` | The local content-addressed artifact store |
+| `runs/` | Per-run directories: captured sources, requests, results, logs, state |
+| `packages/` | Temporary module packages |
+| `environments/` | Realized dependency-lock environments |
+| `operations/` | Locks and logs of detached operations |
+
+Never edit or commit `.omf/`. `omf doctor` checks the host, the project, the
+database and its migration history, identity, stores, and policy loading, and
+reports each finding with a remediation. `omf admin backup` and
+`omf admin restore` move the whole directory as one signed archive; see
+[operations](operations.md).
+
+## Actors
+
+Every mutation is attributed to an actor: `omf --actor <identity> ...` on the
+CLI, or the token's actor on the HTTP API. Replace the scaffold's `local-user`
+before sharing a project, and never reuse one identity for an independent
+approval.
+
+## Policies
+
+Every `Policy` document in the policy directory is loaded, validated, and
+applied as one decision source. A project without policy documents allows
+every actor; a project with them denies any action no rule allows and records
+the denial as a signed `PolicyDecisionRecorded` event.
+
+```yaml
+apiVersion: omf.dev/v1alpha1
+kind: Policy
+metadata:
+  name: default
+spec:
+  rules:
+    - name: allow-local-project-operations
+      effect: allow
+      match: {actor: local-user, resource: local/my-model}
+  config:
+    dirtyWorktree: deny
+    unsignedModules: deny
+    sync: {requirePlan: true, allowDelete: false}
+    promotion: {requireEvaluationPass: true, requireCompleteLineage: true}
+```
+
+Rules match an action (`workload.run`, `sync.execute`, `release.create`,
+`release.promote`, `deployment.apply`, `data.revoke`, ...), an actor, and a
+resource; `deny` overrides `allow`. `dirtyWorktree` governs admission: `deny`
+admits a workload only from a committed tree with no uncommitted or untracked
+files, `archive` admits a dirty tree and stores the patch as a
+`worktree-patch` artifact referenced by the run, and `allow` records the state
+without archiving. The other keys name behavior the factory always has and may
+only carry the values shown; an unknown key is rejected when the policy loads.
+
+## The model card
+
+`MODEL_CARD.md` is the human record of purpose, interface, benchmark targets,
+data boundaries, and risks. It is prose, not a resource: keep it short, link to
+immutable results as they appear, and record decisions in its table with the
+experiment revision that justified them.
+
+## Inspecting a project
+
+```sh
+omf doctor
+omf agent context
+omf resource list --kind WorkloadSpec
+omf runs list
+omf release list
+omf deployment list
+```
+
+`--output table` (the default) prints aligned columns for lists and YAML for
+single objects; `--output json` and `--output yaml` print the full structures.

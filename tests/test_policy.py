@@ -1,7 +1,39 @@
 from datetime import UTC, datetime, timedelta
 
-from omf.policy import BreakGlass, PolicyEngine, PolicyRule, promotion_gate
+import pytest
+import yaml
+from omf.errors import ValidationError
+from omf.policy import BreakGlass, PolicyEngine, PolicyRule, ProjectPolicy, promotion_gate
 from omf.security import SigningIdentity
+
+NAMESPACE = "local/test-project"
+PROJECT = {
+    "metadata": {"namespace": NAMESPACE},
+    "spec": {"extensions": {"policyDirectory": "policies"}},
+}
+
+
+def _policy_document(**config):
+    return {
+        "apiVersion": "omf.dev/v1alpha1",
+        "kind": "Policy",
+        "metadata": {"name": "default", "namespace": NAMESPACE},
+        "spec": {
+            "rules": [
+                {
+                    "name": "allow-owner",
+                    "effect": "allow",
+                    "match": {"actor": "local-user", "resource": NAMESPACE},
+                }
+            ],
+            "config": {"dirtyWorktree": "deny", **config},
+        },
+    }
+
+
+def _write_policy(root, document, name="default.yaml"):
+    (root / "policies").mkdir(exist_ok=True)
+    (root / "policies" / name).write_text(yaml.safe_dump(document))
 
 
 def test_deny_overrides_allow_and_default_deny():
@@ -13,6 +45,73 @@ def test_deny_overrides_allow_and_default_deny():
     )
     assert engine.evaluate({"action": "deploy", "actor": "bad"}).outcome == "deny"
     assert engine.evaluate({"action": "read"}).outcome == "deny"
+
+
+def test_project_policy_loads_documents_and_authorizes_by_actor(tmp_path):
+    _write_policy(tmp_path, _policy_document())
+    policy = ProjectPolicy.load(tmp_path, PROJECT)
+
+    assert policy.enforced
+    assert policy.dirty_worktree == "deny"
+    assert policy.directory == "policies"
+    assert policy.digest.startswith("sha256:")
+    assert policy.documents[0]["path"] == "default.yaml"
+    owner = {"actor": "local-user", "action": "workload.run", "resource": NAMESPACE}
+    assert policy.authorize(owner).outcome == "allow"
+    assert policy.authorize({**owner, "actor": "stranger"}).outcome == "deny"
+    assert ProjectPolicy.load(tmp_path, PROJECT).digest == policy.digest
+
+
+def test_project_policy_without_documents_allows_and_records_no_enforcement(tmp_path):
+    policy = ProjectPolicy.load(tmp_path, PROJECT)
+
+    assert not policy.enforced
+    assert policy.dirty_worktree == "allow"
+    decision = policy.authorize({"actor": "anyone", "action": "workload.run"})
+    assert decision.outcome == "allow"
+    assert decision.explanations[0]["rule"] == "no-policy-documents"
+
+
+@pytest.mark.parametrize(
+    ("config", "message"),
+    [
+        ({"dirtyWorktree": "sometimes"}, "dirtyWorktree"),
+        ({"unsignedModules": "allow"}, "unsignedModules"),
+        ({"sync": {"allowDelete": True}}, "allowDelete"),
+        ({"sync": {"retries": 3}}, "requirePlan and allowDelete"),
+        ({"promotion": {"requireEvaluationPass": False}}, "mandatory"),
+        ({"retention": {"days": 3}}, "not enforced"),
+    ],
+)
+def test_project_policy_rejects_unenforced_or_weakened_config(tmp_path, config, message):
+    _write_policy(tmp_path, _policy_document(**config))
+    with pytest.raises(ValidationError, match=message):
+        ProjectPolicy.load(tmp_path, PROJECT)
+
+
+def test_project_policy_rejects_conflicts_namespace_and_directory_escape(tmp_path):
+    _write_policy(tmp_path, _policy_document())
+    _write_policy(tmp_path, _policy_document(dirtyWorktree="allow"), name="second.yaml")
+    with pytest.raises(ValidationError, match="disagree"):
+        ProjectPolicy.load(tmp_path, PROJECT)
+
+    foreign = _policy_document()
+    foreign["metadata"]["namespace"] = "local/other"
+    _write_policy(tmp_path, foreign, name="second.yaml")
+    with pytest.raises(ValidationError, match="namespace"):
+        ProjectPolicy.load(tmp_path, PROJECT)
+
+    (tmp_path / "policies/second.yaml").unlink()
+    (tmp_path / "policies/notes.txt").write_text("ignored")
+    assert len(ProjectPolicy.load(tmp_path, PROJECT).documents) == 1
+    with pytest.raises(ValidationError, match="relative path"):
+        ProjectPolicy.load(
+            tmp_path,
+            {
+                "metadata": {"namespace": NAMESPACE},
+                "spec": {"extensions": {"policyDirectory": ".."}},
+            },
+        )
 
 
 def test_signed_break_glass_converts_failed_gate_to_warning(tmp_path):

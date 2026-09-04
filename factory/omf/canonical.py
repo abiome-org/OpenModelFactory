@@ -1,5 +1,3 @@
-"""Strict parsing and RFC 8785 canonicalisation helpers."""
-
 from __future__ import annotations
 
 import hashlib
@@ -52,7 +50,6 @@ def _check(value: Any, path: str = "$") -> None:
 
 
 def canonical_json(value: Any) -> bytes:
-    """Return *value* as RFC 8785 canonical JSON bytes."""
     _check(value)
     try:
         return rfc8785.dumps(value)
@@ -61,12 +58,10 @@ def canonical_json(value: Any) -> bytes:
 
 
 def sha256_digest(value: Any) -> str:
-    """Compute an ``sha256:value`` digest over canonical JSON."""
     return "sha256:" + hashlib.sha256(canonical_json(value)).hexdigest()
 
 
 def load_document(data: str | bytes) -> Any:
-    """Load strict JSON or safe YAML without interpolation or duplicate keys."""
     text = data.decode("utf-8") if isinstance(data, bytes) else data
     try:
         value = yaml.load(text, Loader=_StrictLoader)
@@ -75,7 +70,6 @@ def load_document(data: str | bytes) -> Any:
     except (yaml.YAMLError, UnicodeDecodeError) as exc:
         raise ValidationError(f"invalid YAML/JSON: {exc}") from exc
     _check(value)
-    # Round tripping also rejects YAML-only values such as dates and sets.
     try:
         json.dumps(value, allow_nan=False)
     except (TypeError, ValueError) as exc:
@@ -84,7 +78,6 @@ def load_document(data: str | bytes) -> Any:
 
 
 def portable_relative_path(value: str, field: str) -> PurePosixPath:
-    """Validate one normalized repository-relative POSIX path."""
     path = PurePosixPath(value)
     if path.is_absolute() or ".." in path.parts or "\\" in value:
         raise ValidationError(f"{field} must be a repository-relative POSIX path")
@@ -93,7 +86,6 @@ def portable_relative_path(value: str, field: str) -> PurePosixPath:
     return path
 
 
-# Descriptive compatibility names for callers that prefer verb-based APIs.
 canonicalize = canonical_json
 digest = sha256_digest
 load_yaml = load_document

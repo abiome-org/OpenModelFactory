@@ -9,7 +9,7 @@
     "metadata": {"$ref": "#/$defs/metadata"},
     "spec": {
       "type": "object",
-      "required": ["runRef", "artifactRef", "components", "replay"],
+      "required": ["runRef", "artifactRef", "components"],
       "properties": {
         "runRef": {"type": "string", "minLength": 1},
         "artifactRef": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
@@ -21,29 +21,6 @@
             "type": "string",
             "pattern": "^sha256:[0-9a-f]{64}$"
           }
-        },
-        "replay": {
-          "oneOf": [
-            {
-              "type": "object",
-              "required": ["status", "reason"],
-              "properties": {
-                "status": {"const": "not-claimed"},
-                "reason": {"type": "string", "minLength": 1}
-              },
-              "additionalProperties": false
-            },
-            {
-              "type": "object",
-              "required": ["status", "samplerStateRef", "mixRef"],
-              "properties": {
-                "status": {"const": "bound"},
-                "samplerStateRef": {"type": "string", "minLength": 1},
-                "mixRef": {"type": "string", "minLength": 1}
-              },
-              "additionalProperties": false
-            }
-          ]
         },
         "extensions": {"$ref": "#/$defs/extension"}
       },

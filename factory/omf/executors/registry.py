@@ -1,5 +1,3 @@
-"""Trusted executor-provider discovery and fail-closed binding resolution."""
-
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
@@ -14,9 +12,7 @@ from jsonschema.exceptions import SchemaError
 
 from omf.errors import CapabilityError, ConfigurationError, ValidationError
 from omf.executors.base import Executor
-from omf.executors.kubernetes import KubernetesExecutor
 from omf.executors.local import LocalExecutor
-from omf.executors.slurm import SlurmExecutor
 
 ENTRY_POINT_GROUP = "omf.executors"
 EXECUTOR_API_VERSION = "omf.executor/v1"
@@ -24,8 +20,6 @@ EXECUTOR_API_VERSION = "omf.executor/v1"
 
 @dataclass(frozen=True)
 class ExecutorContext:
-    """Isolated project and desired-state context supplied to a trusted provider factory."""
-
     project_root: Path
     state_root: Path
     actor: str
@@ -38,8 +32,6 @@ ExecutorFactory = Callable[[ExecutorContext], Executor]
 
 @dataclass(frozen=True)
 class ExecutorProvider:
-    """One named provider implementation and its agent-readable configuration contract."""
-
     name: str
     api_version: str
     factory: ExecutorFactory = field(repr=False, compare=False)
@@ -57,8 +49,6 @@ class ResolvedExecutor:
 
 
 class ExecutorRegistry:
-    """Explicit provider registry; unknown or ambiguous names never fall back to local."""
-
     def __init__(self) -> None:
         self._providers: dict[str, tuple[ExecutorProvider, str]] = {}
 
@@ -91,7 +81,6 @@ class ExecutorRegistry:
         self._providers[name] = (provider, source)
 
     def discover(self) -> None:
-        """Load trusted installed providers from the ``omf.executors`` entry-point group."""
         selected = metadata.entry_points().select(group=ENTRY_POINT_GROUP)
         for entry_point in sorted(selected, key=lambda item: (item.name, item.value)):
             try:
@@ -236,37 +225,22 @@ def _local_provider(context: ExecutorContext) -> Executor:
     resources = binding_spec.get("resources", {})
     if not isinstance(resources, dict):
         raise ValidationError("local binding resources must be an object")
-    return LocalExecutor(binding_resources=resources, binding_spec=binding_spec)
-
-
-def _kubernetes_provider(context: ExecutorContext) -> Executor:
-    value = context.config.get("context")
-    if value is not None and not isinstance(value, str):
-        raise ValidationError("kubernetes executor context must be a string")
-    spec = context.declaration.get("spec", {})
-    if not isinstance(spec, dict):
-        raise ValidationError("Kubernetes binding spec must be an object")
-    binding_spec = spec if context.declaration.get("kind") == "Binding" else {}
-    return KubernetesExecutor(context=value, binding_spec=binding_spec)
-
-
-def _slurm_provider(context: ExecutorContext) -> Executor:
-    shared = context.config.get("sharedFilesystem", False)
-    if not isinstance(shared, bool):
-        raise ValidationError("slurm sharedFilesystem must be a boolean")
-    spec = context.declaration.get("spec", {})
-    if not isinstance(spec, Mapping):
-        raise ValidationError("slurm binding spec must be an object")
-    binding_spec = spec if context.declaration.get("kind") == "Binding" else {}
-    resources = binding_spec.get("resources", {})
-    placement = binding_spec.get("placement", {})
-    if not isinstance(resources, dict) or not isinstance(placement, dict):
-        raise ValidationError("slurm binding resources and placement must be objects")
-    return SlurmExecutor(
-        shared_filesystem=shared,
-        binding_resources=resources,
-        placement=placement,
-        binding_spec=dict(binding_spec),
+    wheelhouse = context.config.get("dependencyWheelhouse")
+    wheelhouse_path: Path | None = None
+    if wheelhouse is not None:
+        if not isinstance(wheelhouse, str) or not wheelhouse:
+            raise ValidationError("local dependencyWheelhouse must be a non-empty string")
+        wheelhouse_path = Path(wheelhouse)
+        if not wheelhouse_path.is_absolute():
+            wheelhouse_path = context.project_root / wheelhouse_path
+    index = context.config.get("dependencyIndex", True)
+    if not isinstance(index, bool):
+        raise ValidationError("local dependencyIndex must be a boolean")
+    return LocalExecutor(
+        limits=resources,
+        environment_root=context.state_root / "environments",
+        dependency_wheelhouse=wheelhouse_path,
+        dependency_index=index,
     )
 
 
@@ -279,42 +253,25 @@ def default_executor_registry(*, discover: bool = True) -> ExecutorRegistry:
             _local_provider,
             "Run modules as supervised local POSIX process groups.",
             LocalExecutor().capabilities,
-            {"type": "object", "additionalProperties": False},
-        ),
-        source="builtin",
-    )
-    registry.register(
-        ExecutorProvider(
-            "kubernetes",
-            EXECUTOR_API_VERSION,
-            _kubernetes_provider,
-            "Kubernetes Job/JobSet lifecycle adapter; module transport is not built in.",
-            KubernetesExecutor().capabilities,
             {
                 "type": "object",
                 "properties": {
-                    "context": {"type": "string", "minLength": 1},
-                    "image": {
+                    "dependencyWheelhouse": {
                         "type": "string",
-                        "pattern": "@sha256:[0-9a-f]{64}$",
-                        "description": "Immutable image digest.",
+                        "minLength": 1,
+                        "description": (
+                            "Directory of wheels used with pip --find-links when a module "
+                            "declares a non-empty dependency lock."
+                        ),
+                    },
+                    "dependencyIndex": {
+                        "type": "boolean",
+                        "description": (
+                            "Whether dependency realization may use pip's configured package "
+                            "index. False installs only from the wheelhouse."
+                        ),
                     },
                 },
-                "additionalProperties": False,
-            },
-        ),
-        source="builtin",
-    )
-    registry.register(
-        ExecutorProvider(
-            "slurm",
-            EXECUTOR_API_VERSION,
-            _slurm_provider,
-            "Slurm lifecycle adapter; module transport requires an explicit shared filesystem.",
-            SlurmExecutor(shared_filesystem=True).capabilities,
-            {
-                "type": "object",
-                "properties": {"sharedFilesystem": {"type": "boolean"}},
                 "additionalProperties": False,
             },
         ),

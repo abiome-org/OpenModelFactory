@@ -1,5 +1,3 @@
-"""Storage contract for immutable OMF artifacts."""
-
 from __future__ import annotations
 
 from collections.abc import Iterable

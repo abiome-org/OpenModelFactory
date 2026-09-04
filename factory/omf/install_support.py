@@ -1,10 +1,9 @@
-"""Standard-library file operations used by the directory installer."""
-
 from __future__ import annotations
 
 import argparse
 import os
 import secrets
+import shutil
 import stat
 import sys
 from contextlib import suppress
@@ -12,6 +11,30 @@ from pathlib import Path
 
 _NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
 _DIRECTORY = getattr(os, "O_DIRECTORY", 0)
+STARTER = (
+    "data/fixtures/affine.jsonl",
+    "data/fixtures/rights.yaml",
+    "evaluations/example-affine.yaml",
+    "model-packages/example-affine.yaml",
+    "modules/examples/affine-regression",
+    "modules/examples/affine-serving",
+    "workloads/example-from-scratch.yaml",
+)
+
+
+def copy_starter(source_root: Path, target: Path) -> list[str]:
+    copied = []
+    for relative in STARTER:
+        source, destination = source_root / relative, target / relative
+        if os.path.lexists(destination):
+            continue
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        if source.is_dir():
+            shutil.copytree(source, destination, ignore=shutil.ignore_patterns("__pycache__"))
+        else:
+            shutil.copy2(source, destination)
+        copied.append(relative)
+    return copied
 
 
 def _open_parent(path: Path) -> int:
@@ -55,8 +78,6 @@ def _validate_markers(content: str, begin: str, end: str) -> None:
 
 
 def validate_managed_file(destination: Path, begin: str, end: str) -> None:
-    """Reject malformed managed sections without changing the destination."""
-
     if not os.path.lexists(destination):
         return
     directory = _open_parent(destination)
@@ -74,8 +95,6 @@ def _temporary_name(destination_name: str) -> str:
 
 
 def upsert_managed_section(source: Path, destination: Path, begin: str, end: str) -> bool:
-    """Atomically add or replace one managed section while preserving other content."""
-
     section = source.read_text(encoding="utf-8").rstrip("\n")
     section_lines = section.splitlines()
     if not section_lines or section_lines[0] != begin or section_lines[-1] != end:
@@ -138,8 +157,6 @@ def upsert_managed_section(source: Path, destination: Path, begin: str, end: str
 
 
 def render_template(source: Path, destination: Path, name: str, namespace: str) -> bool:
-    """Create one manifest from a template, or preserve an existing regular file."""
-
     content = source.read_text(encoding="utf-8")
     content = content.replace("__OMF_PROJECT_NAME__", name)
     content = content.replace("__OMF_PROJECT_NAMESPACE__", namespace)
@@ -203,6 +220,10 @@ def _parser() -> argparse.ArgumentParser:
     render.add_argument("destination", type=Path)
     render.add_argument("name")
     render.add_argument("namespace")
+
+    starter = commands.add_parser("starter")
+    starter.add_argument("source", type=Path)
+    starter.add_argument("target", type=Path)
     return parser
 
 
@@ -218,13 +239,15 @@ def main(argv: list[str] | None = None) -> int:
                 arguments.begin,
                 arguments.end,
             )
-        else:
+        elif arguments.command == "render":
             render_template(
                 arguments.source,
                 arguments.destination,
                 arguments.name,
                 arguments.namespace,
             )
+        else:
+            copy_starter(arguments.source, arguments.target)
     except (OSError, RuntimeError, UnicodeError, ValueError) as error:
         print(f"install support: {error}", file=sys.stderr)
         return 1

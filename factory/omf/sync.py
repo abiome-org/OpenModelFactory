@@ -1,5 +1,3 @@
-"""Resumable synchronization of immutable artifacts."""
-
 from __future__ import annotations
 
 from collections.abc import Callable

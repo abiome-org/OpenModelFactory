@@ -26,7 +26,6 @@ def _documentation_paths() -> list[Path]:
     paths = [
         *ROOT.glob("*.md"),
         *(ROOT / "docs").rglob("*.md"),
-        *(ROOT / "manual").rglob("*.md"),
         *(ROOT / "templates/project").glob("*.md"),
     ]
     return sorted(set(paths))

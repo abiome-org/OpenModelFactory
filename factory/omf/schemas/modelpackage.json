@@ -2,59 +2,121 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "x-omf-kind": "ModelPackage",
   "type": "object",
-  "required": ["apiVersion", "kind", "metadata", "spec"],
+  "required": [
+    "apiVersion",
+    "kind",
+    "metadata",
+    "spec"
+  ],
   "properties": {
-    "apiVersion": {"const": "omf.dev/v1alpha1"},
-    "kind": {"const": "ModelPackage"},
-    "metadata": {"$ref": "#/$defs/metadata"},
+    "apiVersion": {
+      "const": "omf.dev/v1alpha1"
+    },
+    "kind": {
+      "const": "ModelPackage"
+    },
+    "metadata": {
+      "$ref": "#/$defs/metadata"
+    },
     "spec": {
       "type": "object",
       "required": [
-        "architecture",
         "signatures",
-        "preprocessing",
-        "postprocessing",
-        "initialization",
-        "checkpointMapping",
         "adapters",
-        "compatibilityVectors",
-        "capabilities",
-        "provenance"
+        "compatibilityVectors"
       ],
       "properties": {
-        "architecture": {
-          "type": "object",
-          "required": ["parameterSchema"],
-          "properties": {"parameterSchema": {"type": "object"}},
-          "additionalProperties": true
-        },
         "signatures": {
           "type": "object",
-          "required": ["input", "output", "state", "batching"],
+          "required": [
+            "input",
+            "output",
+            "state"
+          ],
           "properties": {
-            "input": {"type": "object"},
-            "output": {"type": "object"},
-            "state": {"type": "object"},
-            "batching": {"type": "object"}
+            "input": {
+              "type": "object"
+            },
+            "output": {
+              "type": "object"
+            },
+            "state": {
+              "type": "object"
+            }
           },
           "additionalProperties": false
         },
-        "preprocessing": {"type": "array"},
-        "postprocessing": {"type": "array"},
-        "initialization": {"type": "object"},
-        "checkpointMapping": {"type": "object"},
         "adapters": {
           "type": "object",
-          "required": ["trainingReference", "inferenceReference"],
+          "required": [
+            "trainingReference",
+            "inferenceReference"
+          ],
           "properties": {
-            "trainingReference": {"$ref": "#/$defs/trainingAdapter"},
-            "inferenceReference": {
-              "oneOf": [
-                {"$ref": "#/$defs/inferenceAdapter"},
-                {"$ref": "#/$defs/legacyInferenceAdapter"}
-              ]
+            "trainingReference": {
+              "type": "object",
+              "required": [
+                "stage",
+                "operation",
+                "config"
+              ],
+              "properties": {
+                "stage": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "operation": {
+                  "enum": [
+                    "validate",
+                    "prepare",
+                    "run",
+                    "quiesce",
+                    "checkpoint",
+                    "restore",
+                    "stop"
+                  ]
+                },
+                "config": {
+                  "type": "object"
+                }
+              },
+              "additionalProperties": false
             },
-            "optimized": {"type": "array", "items": {"$ref": "#/$defs/inferenceAdapter"}}
+            "inferenceReference": {
+              "type": "object",
+              "required": [
+                "module",
+                "operation",
+                "stateOutput",
+                "config"
+              ],
+              "properties": {
+                "module": {
+                  "type": "string",
+                  "minLength": 1,
+                  "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.(?:/|$)).+$"
+                },
+                "operation": {
+                  "enum": [
+                    "validate",
+                    "prepare",
+                    "run",
+                    "quiesce",
+                    "checkpoint",
+                    "restore",
+                    "stop"
+                  ]
+                },
+                "stateOutput": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "config": {
+                  "type": "object"
+                }
+              },
+              "additionalProperties": false
+            }
           },
           "additionalProperties": false
         },
@@ -63,77 +125,51 @@
           "minItems": 1,
           "items": {
             "type": "object",
-            "required": ["name", "method", "inputs", "expected"],
+            "required": [
+              "name",
+              "method",
+              "inputs",
+              "expected"
+            ],
             "properties": {
-              "name": {"type": "string", "minLength": 1},
-              "method": {"enum": ["predict", "generate", "embed", "score", "custom"]},
-              "inputs": {"type": "object"},
-              "expected": {"type": "object"},
-              "tolerances": {"type": "object"},
-              "seed": {"type": "integer"}
+              "name": {
+                "type": "string",
+                "minLength": 1
+              },
+              "method": {
+                "enum": [
+                  "predict",
+                  "generate",
+                  "embed",
+                  "score",
+                  "custom"
+                ]
+              },
+              "inputs": {
+                "type": "object"
+              },
+              "expected": {
+                "type": "object"
+              },
+              "tolerances": {
+                "type": "object"
+              },
+              "seed": {
+                "type": "integer"
+              }
             },
             "additionalProperties": false
           }
         },
-        "capabilities": {"type": "object"},
-        "provenance": {
-          "type": "object",
-          "required": ["sourceRef", "license", "dependencies", "security", "build"],
-          "properties": {
-            "sourceRef": {"type": "string", "minLength": 1},
-            "license": {"type": "string", "minLength": 1},
-            "dependencies": {"type": "object"},
-            "security": {"type": "object"},
-            "build": {"type": "object"}
-          },
-          "additionalProperties": false
-        },
-        "migrations": {"type": "array"},
-        "extensions": {"$ref": "#/$defs/extension"}
+        "extensions": {
+          "$ref": "#/$defs/extension"
+        }
       },
       "additionalProperties": false
     },
-    "status": {"type": "object"}
-  },
-  "additionalProperties": false,
-  "$defs": {
-    "trainingAdapter": {
-      "type": "object",
-      "required": ["stage", "operation", "config"],
-      "properties": {
-        "stage": {"type": "string", "minLength": 1},
-        "operation": {
-          "enum": ["validate", "prepare", "run", "quiesce", "checkpoint", "restore", "stop"]
-        },
-        "config": {"type": "object"}
-      },
-      "additionalProperties": false
-    },
-    "inferenceAdapter": {
-      "type": "object",
-      "required": ["module", "operation", "stateOutput", "config"],
-      "properties": {
-        "module": {"type": "string", "minLength": 1},
-        "operation": {
-          "enum": ["validate", "prepare", "run", "quiesce", "checkpoint", "restore", "stop"]
-        },
-        "stateOutput": {"type": "string", "minLength": 1},
-        "config": {"type": "object"}
-      },
-      "additionalProperties": false
-    },
-    "legacyInferenceAdapter": {
-      "type": "object",
-      "required": ["stage", "operation", "config"],
-      "properties": {
-        "stage": {"type": "string", "minLength": 1},
-        "operation": {
-          "enum": ["validate", "prepare", "run", "quiesce", "checkpoint", "restore", "stop"]
-        },
-        "stateOutput": {"type": "string", "minLength": 1},
-        "config": {"type": "object"}
-      },
-      "additionalProperties": false
+    "status": {
+      "type": "object"
     }
-  }
+  },
+  "additionalProperties": false
 }
