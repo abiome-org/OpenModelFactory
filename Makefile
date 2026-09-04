@@ -1,4 +1,4 @@
-.PHONY: install format lint typecheck test test-all build release-candidate
+.PHONY: install format lint typecheck test test-all build release-candidate hooks
 
 install:
 	python3 -m pip install --only-binary=:all: --require-hashes -r requirements.lock
@@ -10,8 +10,13 @@ format:
 	python3 -m ruff check --fix factory tests modules/examples
 
 lint:
-	python3 -m ruff check factory tests modules/examples
-	python3 -m ruff format --check factory tests modules/examples
+	python3 -m ruff check factory tests tools modules/examples
+	python3 -m ruff format --check factory tests tools modules/examples
+	python3 tools/check_no_comments.py factory tests tools modules/examples
+
+hooks:
+	printf '#!/bin/sh\nexec make lint\n' > .git/hooks/pre-commit
+	chmod +x .git/hooks/pre-commit
 
 typecheck:
 	python3 -m mypy

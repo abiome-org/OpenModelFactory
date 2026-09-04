@@ -232,39 +232,83 @@ def _validated_manifest(
         raise IntegrityError("backup file inventory is invalid")
     records: dict[str, Any] = {}
     for record in value["files"]:
-        if not isinstance(record, dict) or set(record) != {"path", "digest", "size", "mode"}:
-            raise IntegrityError("backup file record is invalid")
-        path = record["path"]
-        portable = PurePosixPath(path) if isinstance(path, str) else PurePosixPath("/")
-        if (
-            not isinstance(path, str)
-            or portable.is_absolute()
-            or ".." in portable.parts
-            or portable.as_posix() != path
-            or path in records
-        ):
+        path = _validated_record(record)
+        if path in records:
             raise IntegrityError("backup file path is invalid or duplicated")
-        if path not in _REQUIRED and not path.startswith(_STORE_PREFIXES):
-            raise IntegrityError("backup contains an unsupported state path")
-        digest, size, mode = record["digest"], record["size"], record["mode"]
-        if (
-            not isinstance(digest, str)
-            or len(digest) != 71
-            or not digest.startswith("sha256:")
-            or any(character not in "0123456789abcdef" for character in digest[7:])
-            or not isinstance(size, int)
-            or isinstance(size, bool)
-            or size < 0
-            or not isinstance(mode, int)
-            or isinstance(mode, bool)
-            or not 0 <= mode <= 0o777
-        ):
-            raise IntegrityError("backup file metadata is invalid")
         records[path] = record
     if not records.keys() >= _REQUIRED:
         raise IntegrityError("backup is missing required durable state")
     unsigned = {key: value[key] for key in ("format", "project", "projectDigest", "keyId", "files")}
     return unsigned, records
+
+
+def _validated_record(record: Any) -> str:
+    if not isinstance(record, dict) or set(record) != {"path", "digest", "size", "mode"}:
+        raise IntegrityError("backup file record is invalid")
+    path = record["path"]
+    portable = PurePosixPath(path) if isinstance(path, str) else PurePosixPath("/")
+    if (
+        not isinstance(path, str)
+        or portable.is_absolute()
+        or ".." in portable.parts
+        or portable.as_posix() != path
+    ):
+        raise IntegrityError("backup file path is invalid or duplicated")
+    if path not in _REQUIRED and not path.startswith(_STORE_PREFIXES):
+        raise IntegrityError("backup contains an unsupported state path")
+    digest, size, mode = record["digest"], record["size"], record["mode"]
+    if (
+        not isinstance(digest, str)
+        or len(digest) != 71
+        or not digest.startswith("sha256:")
+        or any(character not in "0123456789abcdef" for character in digest[7:])
+        or not isinstance(size, int)
+        or isinstance(size, bool)
+        or size < 0
+        or not isinstance(mode, int)
+        or isinstance(mode, bool)
+        or not 0 <= mode <= 0o777
+    ):
+        raise IntegrityError("backup file metadata is invalid")
+    return path
+
+
+def _extract_archive(
+    archive_path: Path, project: dict[str, Any], temporary: Path
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+    with tarfile.open(archive_path, mode="r:") as archive:
+        members = _archive_members(archive)
+        manifest_member = members.get(_MANIFEST)
+        if manifest_member is None or manifest_member.size > _MAX_MANIFEST_BYTES:
+            raise IntegrityError("backup manifest is missing or too large")
+        manifest_source = archive.extractfile(manifest_member)
+        if manifest_source is None:
+            raise IntegrityError("backup manifest cannot be read")
+        value = json.loads(manifest_source.read())
+        unsigned, records = _validated_manifest(value, project)
+        if set(members) != {_MANIFEST, *records}:
+            raise IntegrityError("backup archive and file inventory differ")
+        for path, record in sorted(records.items()):
+            member = members[path]
+            if member.size != record["size"]:
+                raise IntegrityError("backup member size differs from its inventory")
+            member_source = archive.extractfile(member)
+            if member_source is None:
+                raise IntegrityError("backup member cannot be read")
+            _extract_file(member_source, temporary / path, record)
+    return value, unsigned, records
+
+
+def _verified_identity(
+    temporary: Path, value: dict[str, Any], unsigned: dict[str, Any], expected_key_id: str | None
+) -> SigningIdentity:
+    identity = SigningIdentity(temporary / "identity" / "signing.key")
+    if identity.key_id != value["keyId"]:
+        raise IntegrityError("backup signing identity does not match its manifest")
+    if expected_key_id is not None and identity.key_id != expected_key_id:
+        raise IntegrityError("backup signing identity does not match the expected identity")
+    identity.verify(unsigned, value["signature"])
+    return identity
 
 
 def _archive_members(archive: tarfile.TarFile) -> dict[str, tarfile.TarInfo]:
@@ -320,32 +364,8 @@ def restore_backup(
     temporary = Path(tempfile.mkdtemp(dir=paths.root, prefix=".omf-restore-"))
     os.chmod(temporary, 0o700)
     try:
-        with tarfile.open(archive_path, mode="r:") as archive:
-            members = _archive_members(archive)
-            manifest_member = members.get(_MANIFEST)
-            if manifest_member is None or manifest_member.size > _MAX_MANIFEST_BYTES:
-                raise IntegrityError("backup manifest is missing or too large")
-            manifest_source = archive.extractfile(manifest_member)
-            if manifest_source is None:
-                raise IntegrityError("backup manifest cannot be read")
-            value = json.loads(manifest_source.read())
-            unsigned, records = _validated_manifest(value, project)
-            if set(members) != {_MANIFEST, *records}:
-                raise IntegrityError("backup archive and file inventory differ")
-            for path, record in sorted(records.items()):
-                member = members[path]
-                if member.size != record["size"]:
-                    raise IntegrityError("backup member size differs from its inventory")
-                member_source = archive.extractfile(member)
-                if member_source is None:
-                    raise IntegrityError("backup member cannot be read")
-                _extract_file(member_source, temporary / path, record)
-        identity = SigningIdentity(temporary / "identity" / "signing.key")
-        if identity.key_id != value["keyId"]:
-            raise IntegrityError("backup signing identity does not match its manifest")
-        if expected_key_id is not None and identity.key_id != expected_key_id:
-            raise IntegrityError("backup signing identity does not match the expected identity")
-        identity.verify(unsigned, value["signature"])
+        value, unsigned, records = _extract_archive(archive_path, project, temporary)
+        identity = _verified_identity(temporary, value, unsigned, expected_key_id)
         counts = _verify_state(temporary)
         for relative in _RUNTIME_DIRECTORIES:
             directory = temporary / relative

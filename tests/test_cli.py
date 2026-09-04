@@ -145,6 +145,9 @@ def test_cli_complete_local_lifecycle(tmp_path):
     validated_module = invoke("module", "validate", manifest)[0]
     assert validated_module["valid"]
     assert invoke("module", "test", manifest)[0]["passed"] == 1
+    scaffold = root / "modules/new-model"
+    assert invoke("module", "init", scaffold)["valid"]
+    assert invoke("module", "test", scaffold / "module.yaml")[0]["passed"] == 1
     assert {item["name"] for item in invoke("executor", "list")["providers"]} >= {"local"}
     assert invoke(
         "executor",
@@ -208,19 +211,18 @@ def test_cli_complete_local_lifecycle(tmp_path):
     )
     assert invalid_experiment.exit_code == 1
     assert json.loads(invalid_experiment.stdout)["error"]["code"] == "validation_error"
+    evidence = invoke("release", "evidence", f"run/{run_id}")
+    assert set(evidence["subjects"]) == {
+        run["outputs"]["train.model"],
+        *run_status["execution"]["digests"]["modules"].values(),
+    }
     vulnerability_report = root / "vulnerability-report.yaml"
     vulnerability_report.write_text(
         yaml.safe_dump(
             {
+                **evidence,
                 "scanner": {"name": "test-scanner", "version": "1"},
                 "databaseRevision": "test-db-1",
-                "generatedAt": "2026-09-01T00:00:00Z",
-                "subjects": [
-                    run["outputs"]["train.model"],
-                    *run_status["execution"]["digests"]["modules"].values(),
-                ],
-                "findings": [],
-                "waivers": [],
             }
         )
     )

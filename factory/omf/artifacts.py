@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import os
 import re
+import shutil
 import stat
 import tempfile
 from collections.abc import Iterable
@@ -204,26 +205,22 @@ class ArtifactBuilder:
         verified: set[str] = set()
         visiting: set[str] = set()
 
+        def component_verified(reference: str) -> bool:
+            try:
+                return visit(self.store.read_manifest(reference))
+            except (IntegrityError, NotFoundError, ValidationError):
+                return False
+
         def visit(current: ArtifactManifest) -> bool:
             digest = current.manifest_digest
             if digest in verified:
                 return True
-            if digest in visiting or not self.verify(current):
+            references = _checkpoint_components(current)
+            if digest in visiting or references is None or not self.verify(current):
                 return False
             visiting.add(digest)
-            if current.logical_kind == "checkpoint":
-                components = current.provenance.get("components")
-                if not isinstance(components, dict) or not components:
-                    return False
-                for reference in components.values():
-                    if not isinstance(reference, str):
-                        return False
-                    try:
-                        component = self.store.read_manifest(reference)
-                    except (IntegrityError, NotFoundError, ValidationError):
-                        return False
-                    if not visit(component):
-                        return False
+            if not all(component_verified(reference) for reference in references):
+                return False
             visiting.remove(digest)
             verified.add(digest)
             return True
@@ -237,105 +234,123 @@ class ArtifactBuilder:
             root_mode = root.lstat().st_mode
         except FileNotFoundError:
             return False
-        if not stat.S_ISDIR(root_mode) or stat.S_ISLNK(root_mode):
+        actual = _restored_tree(root) if stat.S_ISDIR(root_mode) else None
+        if actual is None:
             return False
+        expected_files, expected_directories = _expected_tree(manifest)
+        actual_files, actual_directories = actual
+        return (
+            set(actual_files) == set(expected_files)
+            and actual_directories == expected_directories
+            and all(
+                _entry_matches(actual_files[relative], expected, manifest.logical_kind)
+                for relative, expected in expected_files.items()
+            )
+        )
 
-        expected_files: dict[str, TreeEntry] = {}
-        expected_directories: set[str] = set()
-        if manifest.logical_kind == "directory":
-            expected_files = {entry.path: entry for entry in manifest.entries}
-            for entry in manifest.entries:
-                parent = PurePosixPath(entry.path).parent
-                while str(parent) != ".":
-                    expected_directories.add(str(parent))
-                    parent = parent.parent
-        else:
-            expected_files = {"payload": TreeEntry("payload", 0, manifest.size, manifest.digest)}
+    def _restore_content(
+        self,
+        chunks: Iterable[ChunkDescriptor],
+        expected_digest: str,
+        expected_size: int,
+        sink: BinaryIO,
+    ) -> None:
+        whole = hashlib.sha256()
+        offset = 0
+        for chunk in chunks:
+            if chunk.offset != offset:
+                raise IntegrityError("artifact chunk layout check failed")
+            chunk_hash = hashlib.sha256()
+            size = 0
+            with self.store.read_chunk(chunk.digest) as source:
+                while block := source.read(1024 * 1024):
+                    size += len(block)
+                    chunk_hash.update(block)
+                    whole.update(block)
+                    sink.write(block)
+            actual = "sha256:" + chunk_hash.hexdigest()
+            if size != chunk.size or actual != chunk.digest:
+                raise IntegrityError("artifact chunk integrity check failed")
+            offset += size
+        if offset != expected_size or "sha256:" + whole.hexdigest() != expected_digest:
+            raise IntegrityError("artifact payload integrity check failed")
 
-        actual_files: dict[str, Path] = {}
-        actual_directories: set[str] = set()
-        for path in root.rglob("*"):
-            mode = path.lstat().st_mode
-            relative = path.relative_to(root).as_posix()
-            if stat.S_ISLNK(mode):
-                return False
-            if stat.S_ISDIR(mode):
-                actual_directories.add(relative)
-            elif stat.S_ISREG(mode):
-                actual_files[relative] = path
-            else:
-                return False
-        if set(actual_files) != set(expected_files) or actual_directories != expected_directories:
-            return False
-        for relative, expected in expected_files.items():
-            path = actual_files[relative]
-            with path.open("rb") as stream:
-                digest, size = _hash_stream(stream)
-            if digest != expected.digest or size != expected.size:
-                return False
-            if (
-                manifest.logical_kind == "directory"
-                and stat.S_IMODE(path.stat().st_mode) != expected.mode
-            ):
-                return False
-        return True
+    def _restore_tree(self, manifest: ArtifactManifest, temporary: Path) -> None:
+        if not manifest.entries:
+            with (temporary / "payload").open("wb") as output_sink:
+                self._restore_content(manifest.chunks, manifest.digest, manifest.size, output_sink)
+            return
+        with tempfile.TemporaryFile() as index_sink:
+            self._restore_content(manifest.chunks, manifest.digest, manifest.size, index_sink)
+        for entry in manifest.entries:
+            output = temporary / entry.path
+            if temporary.resolve() not in output.resolve().parents:
+                raise ValidationError("tree path escapes destination")
+            output.parent.mkdir(parents=True, exist_ok=True)
+            with output.open("wb") as output_sink:
+                self._restore_content(entry.chunks, entry.digest, entry.size, output_sink)
+            os.chmod(output, entry.mode)
 
     def restore(self, manifest: ArtifactManifest, target: str | Path) -> None:
         destination = Path(target)
         parent = destination.parent.resolve()
         parent.mkdir(parents=True, exist_ok=True)
         temporary = Path(tempfile.mkdtemp(prefix=f".{destination.name}.", dir=parent))
-
-        def restore_content(
-            chunks: Iterable[ChunkDescriptor],
-            expected_digest: str,
-            expected_size: int,
-            sink: BinaryIO,
-        ) -> None:
-            whole = hashlib.sha256()
-            offset = 0
-            for chunk in chunks:
-                if chunk.offset != offset:
-                    raise IntegrityError("artifact chunk layout check failed")
-                chunk_hash = hashlib.sha256()
-                size = 0
-                with self.store.read_chunk(chunk.digest) as source:
-                    while block := source.read(1024 * 1024):
-                        size += len(block)
-                        chunk_hash.update(block)
-                        whole.update(block)
-                        sink.write(block)
-                actual = "sha256:" + chunk_hash.hexdigest()
-                if size != chunk.size or actual != chunk.digest:
-                    raise IntegrityError("artifact chunk integrity check failed")
-                offset += size
-            if offset != expected_size or "sha256:" + whole.hexdigest() != expected_digest:
-                raise IntegrityError("artifact payload integrity check failed")
-
         try:
-            if manifest.entries:
-                with tempfile.TemporaryFile() as index_sink:
-                    restore_content(manifest.chunks, manifest.digest, manifest.size, index_sink)
-                for entry in manifest.entries:
-                    output = temporary / entry.path
-                    if temporary.resolve() not in output.resolve().parents:
-                        raise ValidationError("tree path escapes destination")
-                    output.parent.mkdir(parents=True, exist_ok=True)
-                    with output.open("wb") as output_sink:
-                        restore_content(entry.chunks, entry.digest, entry.size, output_sink)
-                    os.chmod(output, entry.mode)
-            else:
-                output = temporary / "payload"
-                with output.open("wb") as output_sink:
-                    restore_content(manifest.chunks, manifest.digest, manifest.size, output_sink)
+            self._restore_tree(manifest, temporary)
             if destination.exists():
                 raise ValidationError("restore destination already exists")
             os.replace(temporary, destination)
         except Exception:
-            import shutil
-
             shutil.rmtree(temporary, ignore_errors=True)
             raise
+
+
+def _checkpoint_components(manifest: ArtifactManifest) -> list[str] | None:
+    if manifest.logical_kind != "checkpoint":
+        return []
+    components = manifest.provenance.get("components")
+    if not isinstance(components, dict) or not components:
+        return None
+    references = list(components.values())
+    return references if all(isinstance(item, str) for item in references) else None
+
+
+def _expected_tree(manifest: ArtifactManifest) -> tuple[dict[str, TreeEntry], set[str]]:
+    if manifest.logical_kind != "directory":
+        return {"payload": TreeEntry("payload", 0, manifest.size, manifest.digest)}, set()
+    directories = {
+        str(parent)
+        for entry in manifest.entries
+        for parent in PurePosixPath(entry.path).parents
+        if str(parent) != "."
+    }
+    return {entry.path: entry for entry in manifest.entries}, directories
+
+
+def _restored_tree(root: Path) -> tuple[dict[str, Path], set[str]] | None:
+    files: dict[str, Path] = {}
+    directories: set[str] = set()
+    for path in root.rglob("*"):
+        mode = path.lstat().st_mode
+        relative = path.relative_to(root).as_posix()
+        if stat.S_ISDIR(mode):
+            directories.add(relative)
+        elif stat.S_ISREG(mode) and not stat.S_ISLNK(mode):
+            files[relative] = path
+        else:
+            return None
+    return files, directories
+
+
+def _entry_matches(path: Path, expected: TreeEntry, logical_kind: str) -> bool:
+    with path.open("rb") as stream:
+        digest, size = _hash_stream(stream)
+    return (
+        digest == expected.digest
+        and size == expected.size
+        and (logical_kind != "directory" or stat.S_IMODE(path.stat().st_mode) == expected.mode)
+    )
 
 
 class AtomicCheckpointPublisher:

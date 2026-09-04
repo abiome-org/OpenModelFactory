@@ -177,24 +177,9 @@ class StateStore:
         if not isinstance(stages, dict) or not set(stages) <= known:
             raise IntegrityError("run state contains an unknown stage")
         for name, stage in stages.items():
-            if not isinstance(stage, dict) or stage.get("status") not in {"succeeded", "failed"}:
-                raise IntegrityError(f"run state for stage {name!r} is invalid")
-            attempt = stage.get("attempt")
-            if not isinstance(attempt, int) or isinstance(attempt, bool) or attempt < 1:
-                raise IntegrityError(f"run state attempt for stage {name!r} is invalid")
-            if stage["status"] == "succeeded" and not isinstance(stage.get("outputs"), dict):
-                raise IntegrityError(f"run state outputs for stage {name!r} are invalid")
+            _verify_stage_record(name, stage)
         if value.get("state") == RunState.SUCCEEDED.value:
-            if set(stages) != known or any(
-                stage["status"] != "succeeded" for stage in stages.values()
-            ):
-                raise IntegrityError("succeeded run state does not contain every successful stage")
-            expected_outputs = {stage.name: set(stage.outputs) for stage in spec.stages}
-            for name, expected in expected_outputs.items():
-                if not expected <= set(stages[name]["outputs"]):
-                    raise IntegrityError(
-                        f"succeeded run state is missing declared outputs for stage {name!r}"
-                    )
+            _verify_succeeded(spec, stages)
         return value
 
     def _write(self, value: dict[str, Any]) -> None:
@@ -237,6 +222,27 @@ class StateStore:
             )
             self._write(value)
             return value
+
+
+def _verify_stage_record(name: str, stage: Any) -> None:
+    if not isinstance(stage, dict) or stage.get("status") not in {"succeeded", "failed"}:
+        raise IntegrityError(f"run state for stage {name!r} is invalid")
+    attempt = stage.get("attempt")
+    if not isinstance(attempt, int) or isinstance(attempt, bool) or attempt < 1:
+        raise IntegrityError(f"run state attempt for stage {name!r} is invalid")
+    if stage["status"] == "succeeded" and not isinstance(stage.get("outputs"), dict):
+        raise IntegrityError(f"run state outputs for stage {name!r} are invalid")
+
+
+def _verify_succeeded(spec: AdmittedWorkload, stages: dict[str, Any]) -> None:
+    known = {stage.name for stage in spec.stages}
+    if set(stages) != known or any(stage["status"] != "succeeded" for stage in stages.values()):
+        raise IntegrityError("succeeded run state does not contain every successful stage")
+    for stage in spec.stages:
+        if not set(stage.outputs) <= set(stages[stage.name]["outputs"]):
+            raise IntegrityError(
+                f"succeeded run state is missing declared outputs for stage {stage.name!r}"
+            )
 
 
 class WorkloadRunner:

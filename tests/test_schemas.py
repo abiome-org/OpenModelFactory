@@ -8,6 +8,26 @@ from omf.models import Metadata, finalize_resource
 from omf.schema_registry import SchemaRegistry
 
 
+def _object_value(schema, root):
+    value = {
+        key: _value(schema.get("properties", {})[key], root) for key in schema.get("required", [])
+    }
+    for key in schema.get("oneOf", [{}])[0].get("required", []):
+        value[key] = _value(schema["properties"][key], root)
+    if not value and schema.get("minProperties", 0):
+        value["component"] = _value(schema.get("additionalProperties", {}), root)
+    return value
+
+
+def _string_value(schema):
+    pattern = schema.get("pattern", "")
+    if schema.get("format") == "uuid":
+        return "00000000-0000-4000-8000-000000000000"
+    if pattern.startswith("^sha256:") or pattern.endswith(":[0-9a-f]+$"):
+        return "sha256:" + "0" * 64
+    return "x"
+
+
 def _value(schema, root):
     if "$ref" in schema:
         schema = root["$defs"][schema["$ref"].split("/")[-1]]
@@ -15,35 +35,15 @@ def _value(schema, root):
         return schema["const"]
     if "enum" in schema:
         return schema["enum"][0]
-    if "oneOf" in schema and schema.get("type") != "object" and "properties" not in schema:
+    typ = schema.get("type", "object" if "properties" in schema else None)
+    if "oneOf" in schema and typ != "object":
         return _value(schema["oneOf"][0], root)
-    typ = schema.get("type")
-    if typ == "object" or "properties" in schema:
-        value = {
-            key: _value(schema.get("properties", {})[key], root)
-            for key in schema.get("required", [])
-        }
-        if "oneOf" in schema:
-            choice = schema["oneOf"][0]
-            for key in choice.get("required", []):
-                value[key] = _value(schema["properties"][key], root)
-        if not value and schema.get("minProperties", 0):
-            value["component"] = _value(schema.get("additionalProperties", {}), root)
-        return value
+    if typ == "object":
+        return _object_value(schema, root)
     if typ == "array":
         return [_value(schema.get("items", {}), root)] * schema.get("minItems", 0)
-    if typ == "integer":
-        return max(1, schema.get("minimum", 0))
-    if typ == "number":
-        return 1.0
-    if typ == "boolean":
-        return True
-    if schema.get("format") == "uuid":
-        return "00000000-0000-4000-8000-000000000000"
-    pattern = schema.get("pattern", "")
-    if pattern.startswith("^sha256:") or pattern.endswith(":[0-9a-f]+$"):
-        return "sha256:" + "0" * 64
-    return "x"
+    scalars = {"integer": max(1, schema.get("minimum", 0)), "number": 1.0, "boolean": True}
+    return scalars[typ] if typ in scalars else _string_value(schema)
 
 
 def _minimal(registry, kind):

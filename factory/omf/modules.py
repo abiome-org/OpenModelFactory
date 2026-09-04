@@ -11,6 +11,7 @@ import tarfile
 from pathlib import Path, PurePosixPath
 from typing import Any
 
+import yaml
 from jsonschema import Draft202012Validator
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -42,12 +43,51 @@ class ModuleManifest(BaseModel):
         return value
 
 
+def _within(path: Path, root: Path, message: str) -> None:
+    try:
+        path.relative_to(root)
+    except ValueError as exc:
+        raise ValidationError(message) from exc
+
+
+def _code_root(manifest_path: Path, root: Path, code_root: str) -> Path:
+    portable_relative_path(code_root, "module code root")
+    lexical = manifest_path.parent / code_root
+    if lexical.is_symlink():
+        raise ValidationError("module code root may not be a symlink")
+    code = lexical.resolve()
+    _within(code, root, "module code root escapes project root")
+    if not code.is_dir():
+        raise ValidationError("module code root must be a directory")
+    return code
+
+
+def _lock_contents(code: Path, manifest: ModuleManifest) -> bytes:
+    portable_relative_path(manifest.dependency_lock, "module dependency lock")
+    lock_path = (code / manifest.dependency_lock).resolve()
+    _within(lock_path, code, "module dependency lock escapes code root")
+    if not lock_path.is_file() or lock_path.is_symlink():
+        raise ValidationError("module dependency lock must be a regular file")
+    contents = lock_path.read_bytes()
+    if "sha256:" + hashlib.sha256(contents).hexdigest() != manifest.dependency_digest:
+        raise ValidationError("module dependency lock digest does not match")
+    return contents
+
+
+def _check_executable(code: Path, executable: str) -> None:
+    if executable.startswith("/"):
+        raise ValidationError("module executable must not be an absolute path")
+    if "/" not in executable:
+        return
+    portable_relative_path(executable, "module executable")
+    target = (code / executable).resolve()
+    if code not in target.parents or not target.is_file() or not os.access(target, os.X_OK):
+        raise ValidationError("module executable is missing or not executable")
+
+
 def load_manifest(path: str | Path, project_root: str | Path) -> tuple[ModuleManifest, Path]:
     manifest_path, root = Path(path).resolve(), Path(project_root).resolve()
-    try:
-        manifest_path.relative_to(root)
-    except ValueError as exc:
-        raise ValidationError("manifest is outside project root") from exc
+    _within(manifest_path, root, "manifest is outside project root")
     raw = load_document(manifest_path.read_bytes())
     resource = default_registry.validate_as(raw, "Module")
     spec = resource["spec"]
@@ -69,41 +109,52 @@ def load_manifest(path: str | Path, project_root: str | Path) -> tuple[ModuleMan
             "fixtures": spec.get("fixtures", []),
         }
     )
-    portable_relative_path(manifest.code_root, "module code root")
-    lexical = manifest_path.parent / manifest.code_root
-    if lexical.is_symlink():
-        raise ValidationError("module code root may not be a symlink")
-    code = lexical.resolve()
-    try:
-        code.relative_to(root)
-    except ValueError as exc:
-        raise ValidationError("module code root escapes project root") from exc
-    if not code.is_dir():
-        raise ValidationError("module code root must be a directory")
-    portable_relative_path(manifest.dependency_lock, "module dependency lock")
-    lock_path = (code / manifest.dependency_lock).resolve()
-    try:
-        lock_path.relative_to(code)
-    except ValueError as exc:
-        raise ValidationError("module dependency lock escapes code root") from exc
-    if not lock_path.is_file() or lock_path.is_symlink():
-        raise ValidationError("module dependency lock must be a regular file")
-    lock_contents = lock_path.read_bytes()
-    actual_digest = "sha256:" + hashlib.sha256(lock_contents).hexdigest()
-    if actual_digest != manifest.dependency_digest:
-        raise ValidationError("module dependency lock digest does not match")
-    manifest = manifest.model_copy(update={"dependency_contents": lock_contents})
+    code = _code_root(manifest_path, root, manifest.code_root)
+    manifest = manifest.model_copy(update={"dependency_contents": _lock_contents(code, manifest)})
     for name, contract in manifest.schemas.items():
         validate_contract_schema(contract, f"module {name}")
-    executable = manifest.argv[0]
-    if executable.startswith("/"):
-        raise ValidationError("module executable must not be an absolute path")
-    if "/" in executable:
-        portable_relative_path(executable, "module executable")
-        target = (code / executable).resolve()
-        if code not in target.parents or not target.is_file() or not os.access(target, os.X_OK):
-            raise ValidationError("module executable is missing or not executable")
+    _check_executable(code, manifest.argv[0])
     return manifest, code
+
+
+_SCAFFOLD_MAIN = """from omf.sdk import ProtocolRequest, ProtocolResult, main
+
+
+def validate(_request: ProtocolRequest) -> ProtocolResult:
+    return ProtocolResult(status="ok")
+
+
+def run(request: ProtocolRequest) -> ProtocolResult:
+    return ProtocolResult(status="ok", outputs={"echo": request.inputs})
+
+
+if __name__ == "__main__":
+    raise SystemExit(main({"validate": validate, "run": run}))
+"""
+
+
+def scaffold_module(directory: str | Path, name: str | None = None) -> Path:
+    root = Path(directory)
+    if root.exists():
+        raise ValidationError(f"module directory already exists: {root}")
+    root.mkdir(parents=True)
+    (root / "main.py").write_text(_SCAFFOLD_MAIN)
+    (root / "requirements.lock").write_bytes(b"")
+    manifest = {
+        "apiVersion": "omf.dev/v1alpha1",
+        "kind": "Module",
+        "metadata": {"name": name or root.name},
+        "spec": {
+            "entryPoint": {"command": ["python3", "main.py"]},
+            "environment": {
+                "dependencyLock": "requirements.lock",
+                "dependencyDigest": "sha256:" + hashlib.sha256(b"").hexdigest(),
+            },
+        },
+    }
+    path = root / "module.yaml"
+    path.write_text(yaml.safe_dump(manifest, sort_keys=False))
+    return path
 
 
 def dependency_lock(manifest: ModuleManifest) -> DependencyLock:

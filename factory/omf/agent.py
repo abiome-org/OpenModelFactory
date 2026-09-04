@@ -1369,6 +1369,62 @@ class AgentControl:
         ordered = sorted(blockers, key=lambda item: (item["severity"], item["id"]))
         return self._page(ordered, limit)
 
+    def _run_recommendations(self, latest_run: dict[str, Any]) -> list[dict[str, Any]]:
+        run_id = str(latest_run.get("runId"))
+        state = str(latest_run.get("state", "")).lower()
+        if state in {"failed", "error"}:
+            return [
+                self._recommend(
+                    "run.status",
+                    90,
+                    "run_failed",
+                    "Inspect exact stage state and admitted digests before changing the workload.",
+                    command=f"omf runs status {run_id}",
+                    parameters={"runId": run_id},
+                )
+            ]
+        if state != "succeeded":
+            return []
+        evaluations = [
+            item
+            for item in self.factory.resources.latest(kind="EvaluationResult")
+            if item["spec"].get("extensions", {}).get("runId") == run_id
+        ]
+        if not evaluations:
+            return [
+                self._recommend(
+                    "evaluation.create",
+                    80,
+                    "evaluation_missing",
+                    "The latest succeeded run has no immutable evaluation evidence.",
+                    command=f"omf evaluate run/{run_id}",
+                    parameters={"runId": run_id},
+                )
+            ]
+        if not bool(evaluations[0]["spec"].get("extensions", {}).get("passed")):
+            return []
+        releases = [
+            item
+            for item in self.factory.resources.latest(kind="Release")
+            if item["spec"]
+            .get("extensions", {})
+            .get("manifest", {})
+            .get("provenance", {})
+            .get("runId")
+            == run_id
+        ]
+        if releases:
+            return []
+        return [
+            self._recommend(
+                "release.create",
+                55,
+                "release_missing",
+                "A passing evaluated run is not yet packaged as a signed release.",
+                parameters={"runId": run_id},
+            )
+        ]
+
     def _recommendations(self, at: datetime | None = None) -> list[dict[str, Any]]:
         recommendations: list[dict[str, Any]] = []
         active_goals = [
@@ -1418,59 +1474,7 @@ class AgentControl:
                 ]
             )
         else:
-            latest_run = run_items[0]
-            run_id = str(latest_run.get("runId"))
-            state = str(latest_run.get("state", "")).lower()
-            if state in {"failed", "error"}:
-                recommendations.append(
-                    self._recommend(
-                        "run.status",
-                        90,
-                        "run_failed",
-                        "Inspect exact stage state and admitted digests before changing "
-                        "the workload.",
-                        command=f"omf runs status {run_id}",
-                        parameters={"runId": run_id},
-                    )
-                )
-            elif state == "succeeded":
-                evaluations = [
-                    item
-                    for item in self.factory.resources.latest(kind="EvaluationResult")
-                    if item["spec"].get("extensions", {}).get("runId") == run_id
-                ]
-                if not evaluations:
-                    recommendations.append(
-                        self._recommend(
-                            "evaluation.create",
-                            80,
-                            "evaluation_missing",
-                            "The latest succeeded run has no immutable evaluation evidence.",
-                            command=f"omf evaluate run/{run_id}",
-                            parameters={"runId": run_id},
-                        )
-                    )
-                elif bool(evaluations[0]["spec"].get("extensions", {}).get("passed")):
-                    releases = [
-                        item
-                        for item in self.factory.resources.latest(kind="Release")
-                        if item["spec"]
-                        .get("extensions", {})
-                        .get("manifest", {})
-                        .get("provenance", {})
-                        .get("runId")
-                        == run_id
-                    ]
-                    if not releases:
-                        recommendations.append(
-                            self._recommend(
-                                "release.create",
-                                55,
-                                "release_missing",
-                                "A passing evaluated run is not yet packaged as a signed release.",
-                                parameters={"runId": run_id},
-                            )
-                        )
+            recommendations.extend(self._run_recommendations(run_items[0]))
         deployments = self._recent_resource_status("DeploymentSpec", 1, None)
         if inventory.get("Release") and not deployments["items"]:
             recommendations.append(

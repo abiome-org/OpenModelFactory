@@ -22,6 +22,7 @@ from omf.config import ProjectPaths, discover_project
 from omf.config import bootstrap as bootstrap_project
 from omf.errors import OMFError
 from omf.factory import Factory
+from omf.modules import scaffold_module
 from omf.schema_registry import default_registry
 
 app = typer.Typer(no_args_is_help=True, pretty_exceptions_show_locals=False)
@@ -415,6 +416,15 @@ def _module_paths(path: Path | None) -> list[Path]:
     return paths
 
 
+@module_app.command("init")
+def module_init(directory: Path, name: str | None = typer.Option(None, "--name")) -> None:
+    def run() -> dict[str, Any]:
+        with _factory() as factory:
+            return factory.validate_module(scaffold_module(directory, name))
+
+    _handle(run)
+
+
 @module_app.command("validate")
 def module_validate(path: Path | None = typer.Argument(None)) -> None:
     def run() -> list[dict[str, Any]]:
@@ -658,6 +668,15 @@ def release_create(
                 vulnerability_report=vulnerability_report,
                 evaluation_ref=evaluation,
             )
+
+    _handle(run)
+
+
+@release_app.command("evidence")
+def release_evidence(run_id: str) -> None:
+    def run() -> dict[str, Any]:
+        with _factory() as factory:
+            return factory.release_evidence(run_id)
 
     _handle(run)
 

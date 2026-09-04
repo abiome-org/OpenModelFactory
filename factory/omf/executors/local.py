@@ -111,6 +111,20 @@ def _redact(text: str) -> str:
     return _CREDENTIAL_URL.sub("://***@", text)
 
 
+def _completed_status(
+    directory: Path, record: dict[str, Any], value: dict[str, Any]
+) -> ExecutionStatus:
+    code = int(value["exitCode"])
+    reason = str(value["reason"])
+    if reason.startswith("signal:"):
+        return ExecutionStatus("canceled", reason, code)
+    if code == 0 and (
+        not record.get("requiresResult", True) or (directory / "result.json").exists()
+    ):
+        return ExecutionStatus("succeeded", exit_code=code)
+    return ExecutionStatus("failed", reason, code)
+
+
 _LIMITS = {
     "cpuSeconds": resource.RLIMIT_CPU,
     "addressSpaceBytes": resource.RLIMIT_AS,
@@ -686,26 +700,15 @@ class LocalExecutor(Executor):
 
     def status(self, execution_id: str) -> ExecutionStatus:
         directory, record = self._record(execution_id)
-        process = self._processes.get(execution_id)
         completion = directory / "completion.json"
         if completion.exists():
-            value = json.loads(completion.read_text())
-            code = int(value["exitCode"])
-            reason = str(value["reason"])
-            if reason.startswith("signal:"):
-                return ExecutionStatus("canceled", reason, code)
-            if code == 0 and (
-                not record.get("requiresResult", True) or (directory / "result.json").exists()
-            ):
-                return ExecutionStatus("succeeded", exit_code=code)
-            return ExecutionStatus("failed", reason, code)
+            return _completed_status(directory, record, json.loads(completion.read_text()))
+        process = self._processes.get(execution_id)
         process_code = process.poll() if process else None
         alive = self._identity(record["pid"]) == record["identity"]
-        if process is None and alive:
-            return ExecutionStatus("running")
-        if process_code is None and alive:
+        if alive and process_code is None:
             timeout = record.get("timeout")
-            if timeout and time.time() - record["started"] > timeout:
+            if process is not None and timeout and time.time() - record["started"] > timeout:
                 self.cancel(execution_id)
                 return ExecutionStatus("failed", "timeout")
             return ExecutionStatus("running")

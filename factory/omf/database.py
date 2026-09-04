@@ -173,6 +173,49 @@ def _execute_sql(connection: sqlite3.Connection, sql: str) -> None:
         raise IntegrityError("migration contains an incomplete SQL statement")
 
 
+def _prepare_migration_table(connection: sqlite3.Connection) -> bool:
+    exists = connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='schema_migrations'"
+    ).fetchone()
+    columns = (
+        {str(row[1]) for row in connection.execute("PRAGMA table_info(schema_migrations)")}
+        if exists
+        else set()
+    )
+    legacy = columns == {"version"}
+    if not exists:
+        connection.execute(
+            "CREATE TABLE schema_migrations("
+            "version INTEGER PRIMARY KEY,name TEXT NOT NULL,checksum TEXT NOT NULL)"
+        )
+    elif legacy:
+        connection.execute("ALTER TABLE schema_migrations ADD COLUMN name TEXT")
+        connection.execute("ALTER TABLE schema_migrations ADD COLUMN checksum TEXT")
+    elif columns != {"version", "name", "checksum"}:
+        raise IntegrityError("schema migration table has an unsupported shape")
+    return legacy
+
+
+def _verify_migration_history(connection: sqlite3.Connection, legacy: bool) -> None:
+    rows = connection.execute(
+        "SELECT version,name,checksum FROM schema_migrations ORDER BY version"
+    ).fetchall()
+    versions = [int(row[0]) for row in rows]
+    if versions and versions != list(range(1, versions[-1] + 1)):
+        raise IntegrityError("schema migration history contains a version gap")
+    if versions and versions[-1] > len(_MIGRATIONS):
+        raise IntegrityError("database was created by a newer schema version")
+    for row in rows:
+        migration = _MIGRATIONS[int(row[0]) - 1]
+        if legacy:
+            connection.execute(
+                "UPDATE schema_migrations SET name=?,checksum=? WHERE version=?",
+                (migration.name, migration.checksum, migration.version),
+            )
+        elif row[1] != migration.name or row[2] != migration.checksum:
+            raise IntegrityError(f"schema migration metadata drift at version {migration.version}")
+
+
 class Database:
     """A SQLite database; connections are isolated per thread."""
 
@@ -250,45 +293,7 @@ class Database:
         _validate_migration_registry()
         connection = self.connection
         with self.transaction(immediate=True):
-            exists = connection.execute(
-                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='schema_migrations'"
-            ).fetchone()
-            columns = (
-                {str(row[1]) for row in connection.execute("PRAGMA table_info(schema_migrations)")}
-                if exists
-                else set()
-            )
-            legacy = columns == {"version"}
-            if not exists:
-                connection.execute(
-                    "CREATE TABLE schema_migrations("
-                    "version INTEGER PRIMARY KEY,name TEXT NOT NULL,checksum TEXT NOT NULL)"
-                )
-            elif legacy:
-                connection.execute("ALTER TABLE schema_migrations ADD COLUMN name TEXT")
-                connection.execute("ALTER TABLE schema_migrations ADD COLUMN checksum TEXT")
-            elif columns != {"version", "name", "checksum"}:
-                raise IntegrityError("schema migration table has an unsupported shape")
-            rows = connection.execute(
-                "SELECT version,name,checksum FROM schema_migrations ORDER BY version"
-            ).fetchall()
-            versions = [int(row[0]) for row in rows]
-            if versions and versions != list(range(1, versions[-1] + 1)):
-                raise IntegrityError("schema migration history contains a version gap")
-            if versions and versions[-1] > len(_MIGRATIONS):
-                raise IntegrityError("database was created by a newer schema version")
-            for row in rows:
-                migration = _MIGRATIONS[int(row[0]) - 1]
-                if legacy:
-                    connection.execute(
-                        "UPDATE schema_migrations SET name=?,checksum=? WHERE version=?",
-                        (migration.name, migration.checksum, migration.version),
-                    )
-                elif row[1] != migration.name or row[2] != migration.checksum:
-                    raise IntegrityError(
-                        f"schema migration metadata drift at version {migration.version}"
-                    )
-
+            _verify_migration_history(connection, _prepare_migration_table(connection))
         for migration in _MIGRATIONS:
             with self.transaction(immediate=True):
                 if connection.execute(
