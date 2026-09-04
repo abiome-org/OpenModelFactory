@@ -85,13 +85,7 @@ portable workloads, restart, cancellation, checkpoints, and supported scale. See
 
 ## Backup and restore
 
-Before upgrading, create and verify a backup. Model packages created by early
-`0.1.x` builds with a stage-based `inferenceReference` remain readable, but they
-cannot supply new compatibility or release evidence because a distinct serving
-implementation cannot be inferred safely. Apply a new immutable `ModelPackage`
-revision that names `inferenceReference.module`, then rerun and evaluate the
-model. Restore the pre-upgrade backup to roll back the factory state; OMF never
-rewrites the legacy resource revision.
+Before upgrading, create and verify a backup.
 
 Create one verified archive containing metadata, signing and encryption keys,
 encrypted secrets, and every local content-addressed artifact:

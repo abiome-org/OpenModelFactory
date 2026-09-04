@@ -1,43 +1,21 @@
 # Open Model Factory
 
-Open Model Factory (OMF) is a repository-centered system for developing models
-without a proprietary control plane. It supports both greenfield and existing
-projects: begin with a living model card, add model and data code, run repeatable
-training and evaluation, benchmark each candidate against known baselines, then
-release and deploy with the evidence that produced it.
-
-OMF does not prescribe a model architecture, framework, modality, training
-method, hardware platform, scheduler, cloud, or storage provider.
-
-## Product loop
-
-1. Write the intended use, interface, risks, and success measures in
-   `MODEL_CARD.md`.
-2. Implement model, data, training, and evaluation behavior as replaceable
-   modules.
-3. Describe what should run in a workload and where it should run in a binding.
-4. Run, evaluate, and compare an immutable candidate with its baseline.
-5. Repeat that cycle in continuous integration as code, data, and ideas change.
-6. Promote a reviewed candidate to a signed release, deploy it, and feed
-   operational findings into the next explicit iteration.
-
-The model card records intent for people; versioned resources and tests enforce
-machine behavior. OMF keeps the two connected without inventing a model-card
-schema.
+Open Model Factory (OMF) is a repository-centered system for developing models.
+One clone takes a project from a model card through repeated training,
+evaluation, and comparison to a signed release and a local deployment, and
+keeps the evidence that produced each result immutable. There is no proprietary
+control plane and no assumption about model architecture, framework, modality,
+training method, hardware, scheduler, cloud, or storage provider.
 
 ## Status
 
-OMF is **1.0 Stable** for the repository-centered local lifecycle on CPython
-3.11 and 3.12 on Linux x86-64, and for executor plugins implementing
-`omf.executor/v1`. The built-in Slurm and Kubernetes providers are preview
-lifecycle adapters, not supported remote workload paths. OMF makes no general
-claim of production scale, cluster recovery, full environment reproduction, or
-air-gap operation. See the [roadmap](ROADMAP.md) for the tested 1.0 boundary and
-the [executor guide](docs/executors.md) for provider limits.
+OMF is **1.0 Stable** for the local lifecycle on CPython 3.11 and 3.12 on
+Linux x86-64 and for executor plugins implementing `omf.executor/v1`. Only the
+local executor is built in. OMF makes no claim of production scale, cluster
+recovery, or air-gap operation; the [roadmap](ROADMAP.md) records the tested
+boundary.
 
-## Start a project
-
-After cloning this distribution, inspect the non-destructive installation plan:
+## Install
 
 ```sh
 ./install.sh --plan /path/to/model-project
@@ -45,77 +23,65 @@ After cloning this distribution, inspect the non-destructive installation plan:
 . /path/to/model-project/.venv/bin/activate
 ```
 
-The installer requires Python 3.11 or 3.12. It preserves existing files and
-creates missing project scaffolding, including `MODEL_CARD.md`, an operator
-`AGENTS.md`, a local binding, and a default policy. Start by completing the
-model card, then inspect the factory:
+The installer needs Python 3.11 or 3.12 and Git. It creates `omf.yaml`, a
+local binding, a default policy, `MODEL_CARD.md`, an operator `AGENTS.md`, and
+the runnable starter example, initializes Git, commits the project, and
+bootstraps `.omf/`. Existing files are preserved. The
+[operations page](docs/operations.md) covers manual installation, the HTTP
+service, and backups.
+
+## First loop
+
+Every new project ships with a working example: an affine model trained and
+evaluated by [`modules/examples/affine-regression`](modules/examples/affine-regression/main.py)
+with a separate serving module. Run it before changing anything:
 
 ```sh
-omf --project /path/to/model-project --output json doctor
-omf --project /path/to/model-project --output json agent context
-```
-
-The [operations runbook](docs/operations.md) describes exact installer effects,
-manual installation, services, backup and restore, artifact stores, and offline
-operation.
-
-## Try the checked-in example
-
-From this checkout or any installed project; the installer copies this starter
-into new projects and commits it:
-
-```sh
-omf module validate modules/examples/affine-regression/module.yaml
-omf module test modules/examples/affine-regression/module.yaml
 omf data add data/fixtures/affine.jsonl --name example-affine --mode copy \
   --rights data/fixtures/rights.yaml
 omf resource apply model-packages/example-affine.yaml
 omf resource apply evaluations/example-affine.yaml
-omf executor preflight bindings/local.yaml \
-  --workload workloads/example-from-scratch.yaml
-omf run workloads/example-from-scratch.yaml --binding bindings/local.yaml
+omf run workloads/example-from-scratch.yaml
+omf runs list
 omf evaluate run/<run-id>
 ```
 
-The [model-building manual](manual/README.md) owns the complete tested workflow,
-including baseline/candidate comparisons and the conditional release path.
+Then replace the example with the real model: write the module, point the
+workload at it, and keep the same loop. The [walkthrough](docs/walkthrough.md)
+follows a baseline and a candidate through comparison and release.
+
+## Concepts
+
+| Page | What it covers |
+| --- | --- |
+| [Projects](docs/projects.md) | `omf.yaml`, `.omf/`, namespaces, actors, policies, the model card |
+| [Modules](docs/modules.md) | The `omf.module/v1` protocol, manifests, dependency locks, fixtures |
+| [Data](docs/data.md) | Dataset snapshots, rights, verification, stores, sync |
+| [Workloads](docs/workloads.md) | Stage graphs, bindings, runs, recovery |
+| [Evaluation](docs/evaluation.md) | Model packages, evaluation specs, results, experiments |
+| [Releases](docs/releases.md) | Evidence, promotion gates, aliases, deployments, serving |
+| [Executors](docs/executors.md) | Provider capabilities and the plugin API |
+| [Agent control](docs/agent-control.md) | Bounded context, goals, knowledge, the action catalog |
+| [Operations](docs/operations.md) | Installation, service, backup and restore, distribution releases |
+| [Architecture](docs/architecture.md) | Code map, lifecycle, invariants |
 
 ## Repository map
 
 | Path | Role |
 | --- | --- |
-| `modules/` | Model, trainer, evaluator, data, and other executable components |
-| `data/` | Versioned manifests and intentionally checked-in fixtures |
-| `model-packages/` | Model interfaces, adapters, compatibility vectors, and provenance |
-| `workloads/` | Portable stage graphs describing what runs |
-| `bindings/` | Executors, resources, placement, and provider configuration |
-| `evaluations/` | Benchmark definitions |
-| `policies/`, `deployments/` | Promotion rules and serving intent |
-| `factory/omf/` | CLI, API, orchestration, storage, execution, and governance runtime |
-| `tests/` | Product guarantees and release evidence |
+| `modules/` | Executable components behind `omf.module/v1` |
+| `data/fixtures/` | Checked-in example data and rights |
+| `model-packages/`, `evaluations/` | Model interfaces and metric thresholds |
+| `workloads/`, `bindings/` | What runs and where it runs |
+| `policies/`, `deployments/` | Authorization rules and serving intent |
+| `factory/omf/` | The runtime: CLI, API, orchestration, storage, execution |
+| `tests/` | Product guarantees |
 
-Git stores code and versioned project configuration. Artifact stores hold data,
-checkpoints, model payloads, and releases. Untracked `.omf/` holds local runtime
-metadata, identity, and logs. The [architecture guide](docs/architecture.md)
-maps the runtime modules and lifecycle boundaries in more detail.
-
-## Documentation
-
-- [Model-building manual](manual/README.md): the tested development loop.
-- [Operations runbook](docs/operations.md): installation and operation.
-- [Architecture](docs/architecture.md): lifecycle, state, and code ownership.
-- [Executor guide](docs/executors.md): provider capabilities and limitations.
-- [Agent guide](docs/agent-control.md): bounded status, goals, and actions.
-- [Roadmap](ROADMAP.md): 1.0 evidence and post-1.0 direction.
+Git holds code and versioned configuration. Artifact stores hold data,
+checkpoints, models, and releases. `.omf/` holds untracked local state.
 
 ## Development
 
-Follow [CONTRIBUTING.md](CONTRIBUTING.md) and [`AGENTS.md`](AGENTS.md). Before
-completing a code change, run:
-
-```sh
-make test-all
-```
-
-Run `make build` as well for packaging, dependency, entry-point, schema, or
-distribution changes.
+Follow [CONTRIBUTING.md](CONTRIBUTING.md) and [`AGENTS.md`](AGENTS.md). Run
+`make test-all` before completing a change and `make build` for packaging
+changes. `make hooks` installs the lint pre-commit hook.

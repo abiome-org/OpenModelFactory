@@ -247,7 +247,7 @@ spec: {owners: [release-test], extensions: {}}
     sdist = distribution / "open_model_factory-1.0.0.tar.gz"
     with tarfile.open(sdist, "r:gz") as archive:
         members = {item.name.split("/", 1)[1] for item in archive if "/" in item.name}
-    assert {"README.md", "CHANGELOG.md", "manual/README.md", "install.sh"} <= members
+    assert {"README.md", "CHANGELOG.md", "docs/walkthrough.md", "install.sh"} <= members
     sdist_python, _ = _environment(tmp_path / "sdist-environment")
     _run(
         [

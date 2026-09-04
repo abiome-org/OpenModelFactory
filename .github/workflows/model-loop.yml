@@ -10,7 +10,7 @@ on:
       - "model-packages/**"
       - "evaluations/**"
       - "factory/**"
-      - "tests/test_manual.py"
+      - "tests/test_walkthrough.py"
   push:
     branches: [main]
     paths:
@@ -20,7 +20,7 @@ on:
       - "model-packages/**"
       - "evaluations/**"
       - "factory/**"
-      - "tests/test_manual.py"
+      - "tests/test_walkthrough.py"
 
 permissions:
   contents: read
@@ -43,4 +43,4 @@ jobs:
             sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
           fi
           unshare --user --map-root-user --net true
-      - run: python -m pytest tests/test_manual.py::test_greenfield_model_card_to_compared_candidate
+      - run: python -m pytest tests/test_walkthrough.py::test_greenfield_model_card_to_compared_candidate

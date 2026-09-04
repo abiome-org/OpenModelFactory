@@ -75,7 +75,6 @@ include = [
   "/docs",
   "/evaluations",
   "/install.sh",
-  "/manual",
   "/model-packages",
   "/modules/examples",
   "/omf.yaml",
