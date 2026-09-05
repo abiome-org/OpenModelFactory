@@ -77,8 +77,10 @@ launches it through the executor named in `extensions.executor` (default
 | `service`, `batch`, `actor`, `control` with `command` | Runs the given argv under the executor |
 
 A served release restores the adapter source admitted with the run, checks
-its environment digest against the admitted one, loads the model state the
-package declared, and listens on `extensions.host` and `extensions.port`
+its environment digest against the admitted one, restores the artifact named by
+`stateOutput`, and passes its usable file or directory as `request.state["path"]`.
+Inline state objects also work; see [model packages](evaluation.md#model-packages).
+The server listens on `extensions.host` and `extensions.port`
 (default `127.0.0.1:8090`). `GET /healthz` reports the release revision and
 request counters; `POST /v1/infer` with `{"inputs": {...}}` validates the
 inputs against the package input signature, runs one module exchange, and
@@ -89,3 +91,5 @@ Status changes are compare-and-set on `statusVersion`: read the current
 status, pass its version to `rollback`, and refresh after a stale-version
 error instead of retrying blindly. Rollback relaunches the previous immutable
 deployment revision.
+Reapplying the same manifest leaves a running deployment in place and starts a
+new instance when the earlier one stopped or failed.

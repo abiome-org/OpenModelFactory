@@ -24,17 +24,13 @@ spec:
       additionalProperties: false
     state:
       type: object
-      required: [slope, intercept, format]
-      properties:
-        slope: {type: number}
-        intercept: {type: number}
-        format: {const: json-affine/v1}
-      additionalProperties: false
+      required: [path]
+      properties: {path: {type: string}}
   fixtures:
     - request:
         operation: run
         inputs: {input: 3.0}
-        state: {slope: 2.0, intercept: 1.0, format: json-affine/v1}
+        state: {path: fixture-model.json}
         config: {}
       result:
         status: ok

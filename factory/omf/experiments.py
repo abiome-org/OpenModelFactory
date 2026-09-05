@@ -276,8 +276,7 @@ class ExperimentService:
                 builder.restore(manifest, bundle / "artifacts" / name)
                 exported[name] = {
                     "digest": digest,
-                    "path": f"artifacts/{name}"
-                    + ("" if manifest.logical_kind == "directory" else "/payload"),
+                    "path": f"artifacts/{name}" + ("" if manifest.is_directory else "/payload"),
                     "originalPath": filename,
                 }
             run = self.factory._run_resource(run_id)

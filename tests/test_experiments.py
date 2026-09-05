@@ -533,6 +533,7 @@ def test_directory_model_passes_between_scripts_and_exports(tmp_path, artifact):
     source = TRAIN.replace(
         'Path(a.output).write_text(json.dumps({"bias": bias}))',
         "Path(a.output).mkdir()\n"
+        '(Path(a.output) / "payload").write_text("model metadata")\n'
         '(Path(a.output) / "weights.json").write_text(json.dumps({"bias": bias}))',
     )
     (paths.root / "src/train.py").write_text(source)
@@ -547,7 +548,7 @@ def test_directory_model_passes_between_scripts_and_exports(tmp_path, artifact):
         exported = factory.experiments.export(candidate["id"], tmp_path / "directory-model")
         model = Path(exported["destination"]) / exported["artifacts"][artifact]["path"]
         assert json.loads((model / "weights.json").read_text()) == {"bias": 2.0}
-        assert {path.name for path in model.iterdir()} == {"weights.json"}
+        assert {path.name for path in model.iterdir()} == {"weights.json", "payload"}
         assert (Path(exported["destination"]) / "source/train/train.py").read_text() == source
 
 

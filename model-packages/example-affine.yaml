@@ -16,12 +16,8 @@ spec:
       additionalProperties: false
     state:
       type: object
-      required: [slope, intercept, format]
-      properties:
-        slope: {type: number}
-        intercept: {type: number}
-        format: {const: json-affine/v1}
-      additionalProperties: false
+      required: [path]
+      properties: {path: {type: string}}
   adapters:
     trainingReference:
       stage: train
@@ -30,7 +26,7 @@ spec:
     inferenceReference:
       module: modules/examples/affine-serving/module.yaml
       operation: run
-      stateOutput: train.modelState
+      stateOutput: train.model
       config: {}
   compatibilityVectors:
     - name: positive

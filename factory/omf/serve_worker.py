@@ -15,9 +15,10 @@ import uvicorn
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field
+from pydantic import ValidationError as ProtocolValidationError
 
 from omf.canonical import canonical_json
-from omf.errors import OMFError
+from omf.errors import OMFError, ValidationError
 from omf.modules import validate_contract
 from omf.sdk import ProtocolRequest, ProtocolResult
 
@@ -136,16 +137,22 @@ def create_app(config: ServingConfig, work_dir: Path) -> FastAPI:
                     },
                 )
             result = ProtocolResult.model_validate_json(result_path.read_bytes())
-            if result.status != "ok":
+            if result.status != "ok" or completed.returncode:
                 counters["failures"] += 1
                 raise HTTPException(
                     status_code=502,
                     detail={
-                        "code": result.error.code if result.error else "module_error",
+                        "code": result.error.code if result.error else "adapter_failed",
                         "requestId": request_id,
+                        "exitCode": completed.returncode,
                     },
                 )
             validate_contract(config.signatures["output"], result.outputs, "inference output")
+        except (ProtocolValidationError, ValidationError):
+            counters["failures"] += 1
+            raise HTTPException(
+                status_code=502, detail={"code": "invalid_result", "requestId": request_id}
+            ) from None
         finally:
             shutil.rmtree(directory, ignore_errors=True)
         return {

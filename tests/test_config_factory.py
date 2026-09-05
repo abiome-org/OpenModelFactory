@@ -947,22 +947,50 @@ def _free_port() -> int:
         return int(sock.getsockname()[1])
 
 
-def test_service_deployment_serves_release_through_admitted_adapter(tmp_path):
+@pytest.mark.parametrize("directory_model", [False, True])
+def test_service_deployment_serves_release_through_admitted_adapter(tmp_path, directory_model):
     paths, workload_path = _affine_project(tmp_path)
+    if directory_model:
+        trainer = paths.root / "modules/examples/affine-regression/main.py"
+        trainer.write_text(
+            trainer.read_text()
+            .replace(
+                "        return ProtocolResult(\n",
+                "        weights = model_path.parent / 'weights'\n"
+                "        weights.mkdir()\n"
+                "        (weights / 'model.json').write_bytes(model_path.read_bytes())\n"
+                "        (weights / 'payload').write_text('directory metadata')\n"
+                "        return ProtocolResult(\n",
+                1,
+            )
+            .replace(
+                '{"name": "model", "kind": "model", "path": model_path.name}',
+                '{"name": "classifier", "kind": "model", "path": "weights"}',
+            )
+        )
+        workload = yaml.safe_load(workload_path.read_text())
+        workload["spec"]["graph"]["stages"][0]["outputs"].remove("model")
+        workload["spec"]["graph"]["stages"][0]["outputs"].append("classifier")
+        workload_path.write_text(yaml.safe_dump(workload))
     port = _free_port()
     with Factory(paths) as factory:
+        if directory_model:
+            package = yaml.safe_load(Path("model-packages/example-affine.yaml").read_text())
+            package["spec"]["adapters"]["inferenceReference"]["stateOutput"] = "train.classifier"
+            factory.apply_resource(package)
         run = factory.run(workload_path, paths.root / "bindings/local.yaml")
-        factory.evaluate(f"run/{run['runId']}")
+        evaluation = factory.evaluate(f"run/{run['runId']}")
+        assert evaluation["spec"]["extensions"]["compatibilityPassed"]
         release = factory.create_release(
             run["runId"],
             name="affine-v1",
             intended_use="test",
             promote=True,
-            vulnerability_report=_scan_for(paths, factory, run),
         )
         (paths.root / "modules/examples/affine-serving/main.py").write_text(
             "raise RuntimeError('live serving source must not execute')\n"
         )
+        shutil.rmtree(paths.runs / run["runId"])
         deployment_path = paths.root / "service.yaml"
         deployment_path.write_text(
             yaml.safe_dump(
@@ -982,7 +1010,13 @@ def test_service_deployment_serves_release_through_admitted_adapter(tmp_path):
         status = factory.deployment_status("affine-service")["status"]
         assert status["endpoint"] == f"http://127.0.0.1:{port}"
         serving = json.loads((Path(status["runDirectory"]) / "serving.json").read_text())
-        assert serving["state"]["format"] == "json-affine/v1"
+        weights = Path(serving["state"]["path"])
+        assert weights.is_relative_to(status["runDirectory"])
+        assert weights.is_dir() == directory_model
+        output_name = "train.classifier" if directory_model else "train.model"
+        assert serving["state"]["artifacts"]["payload"] == run["outputs"][output_name]
+        model_file = weights / "model.json" if directory_model else weights
+        assert json.loads(model_file.read_text()) == run["outputs"]["train.modelState"]
         assert (
             serving["modelPackageRef"]
             == (release["spec"]["extensions"]["manifest"]["modelPackage"]["ref"])
@@ -1018,11 +1052,37 @@ def test_service_deployment_serves_release_through_admitted_adapter(tmp_path):
         canceled = factory.cancel_deployment("affine-service")
         assert canceled["status"]["state"] == "canceled"
 
+        restarted = factory.deploy(deployment_path)
+        assert restarted["state"] == "running"
+        restarted_status = factory.deployment_status("affine-service")["status"]
+        assert restarted_status["runDirectory"] != status["runDirectory"]
+        assert restarted_status["previousDeploymentRevision"] is None
+        factory.cancel_deployment("affine-service")
+
         deployment_path.write_text(
             deployment_path.read_text().replace("form: service", "form: batch")
         )
         with pytest.raises(ValidationError, match=r"require extensions\.command"):
             factory.deploy(deployment_path)
+
+
+def test_copied_dataset_directory_keeps_payload_member(paths):
+    source = paths.root / "data/directory"
+    source.mkdir()
+    (source / "payload").write_text("data")
+    (source / "schema.json").write_text('{"type": "text"}')
+    with Factory(paths) as factory:
+        snapshot = factory.add_data(source, name="directory", mode="copy", rights=dict(_RIGHTS))
+        resolved = factory._resolve_stage_input(
+            "dataset/directory",
+            paths.runs / "probe/inputs",
+            {"dataset/directory": snapshot},
+            run_id="probe",
+            stage_name="consume",
+        )
+    directory = Path(resolved["path"])
+    assert (directory / "payload").read_text() == "data"
+    assert json.loads((directory / "schema.json").read_text()) == {"type": "text"}
 
 
 @pytest.mark.parametrize("base_reference", ["release/affine-v1", "alias/candidate"])

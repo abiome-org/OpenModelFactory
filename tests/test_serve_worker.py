@@ -98,7 +98,8 @@ def test_serving_worker_reports_failures_without_echoing_values(tmp_path):
     bad_output = _client(tmp_path, BAD_OUTPUT_SCRIPT).post(
         "/v1/infer", json={"inputs": {"input": 41.5}}
     )
-    assert bad_output.status_code == 400
+    assert bad_output.status_code == 502
+    assert bad_output.json()["detail"]["code"] == "invalid_result"
     assert "seven" not in bad_output.text
 
     slow = _client(tmp_path, "import time; time.sleep(5)", timeout=0.2)
@@ -111,3 +112,25 @@ def test_serving_worker_reports_failures_without_echoing_values(tmp_path):
         "/v1/infer", json={"inputs": {"input": 1.0}, "unexpected": True}
     )
     assert unknown_field.status_code == 422
+
+
+def test_serving_worker_reports_malformed_result_as_adapter_failure(tmp_path):
+    client = _client(
+        tmp_path,
+        "import os; open(os.environ['OMF_RESULT_FILE'], 'w').write('not json')",
+    )
+    response = client.post("/v1/infer", json={"inputs": {"input": 3.0}})
+    assert response.status_code == 502
+    assert response.json()["detail"]["code"] == "invalid_result"
+    assert client.get("/healthz").json()["failures"] == 1
+    assert not any((tmp_path / "requests").iterdir())
+
+
+def test_serving_worker_rejects_success_result_from_failed_process(tmp_path):
+    client = _client(tmp_path, OK_SCRIPT + "raise SystemExit(3)\n")
+    response = client.post("/v1/infer", json={"inputs": {"input": 3.0}})
+    assert response.status_code == 502
+    assert response.json()["detail"]["code"] == "adapter_failed"
+    assert response.json()["detail"]["exitCode"] == 3
+    assert client.get("/healthz").json()["failures"] == 1
+    assert not any((tmp_path / "requests").iterdir())

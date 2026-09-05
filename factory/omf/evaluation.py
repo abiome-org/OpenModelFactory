@@ -104,6 +104,7 @@ class EvaluationService:
             if environment["digest"] != adapter_admission["environment"]["digest"]:
                 raise IntegrityError("compatibility adapter environment differs from run admission")
             signatures = package_spec["signatures"]
+            state = self.factory._resolve_model_state(state, temporary / "state")
             validate_contract(signatures["state"], state, "model package state")
             for index, vector in enumerate(vectors):
                 validate_contract(signatures["input"], vector["inputs"], "model package input")
