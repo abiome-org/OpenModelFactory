@@ -2,6 +2,7 @@
 
 ## 2.0.0 — 2026-09-05
 
+- Require patched `cryptography` 50.0.1 or newer and refresh the dependency locks.
 - Center the factory on captured data and recipes, durable runs, measured
   comparisons, and usable model versions. Remove goal/knowledge APIs, generic
   agent recommendations, static approval/risk labels, and unused break-glass
