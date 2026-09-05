@@ -518,6 +518,7 @@ class AgentControl:
                 "namespace": self.factory.namespace,
                 "revision": sha256_digest(self.factory.project),
                 "profile": "local",
+                "actor": self.factory.actor,
             },
             "readiness": readiness,
             "goals": goals,

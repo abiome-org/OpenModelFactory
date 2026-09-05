@@ -637,9 +637,12 @@ def _experiment_routes(app: FastAPI, authorized: Authorized) -> None:
 
     @_action_route(app, "experiment.review")
     def experiment_review(
-        run_id: str, baseline: str | None = None, service: Factory = Depends(authorized)
+        run_id: str,
+        baseline: str | None = None,
+        details: bool = False,
+        service: Factory = Depends(authorized),
     ) -> dict[str, Any]:
-        return review(service.experiments, run_id, baseline)
+        return review(service.experiments, run_id, baseline, details=details)
 
     @_action_route(app, "experiment.reproduce")
     def reproduce(

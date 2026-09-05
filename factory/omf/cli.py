@@ -18,7 +18,7 @@ from omf.actions import action_definition, capability_catalog
 from omf.agent import initial_context
 from omf.api import create_app
 from omf.backups import restore_backup
-from omf.candidate_review import review, write_review
+from omf.candidate_review import review, summarize_review, write_review
 from omf.canonical import load_document
 from omf.config import ProjectPaths, discover_project
 from omf.config import bootstrap as bootstrap_project
@@ -84,7 +84,7 @@ def _action_command(group: typer.Typer, action: str) -> Callable[[Callable[..., 
 class State:
     project: Path | None = None
     output: str = "table"
-    actor: str = "local-user"
+    actor: str | None = None
 
 
 _invocation_state: ContextVar[State] = ContextVar("omf_cli_state")
@@ -105,7 +105,9 @@ def main(
     ctx: typer.Context,
     project: Path | None = typer.Option(None, "--project", "-p", help="OMF project directory"),
     output: str = typer.Option("table", "--output", "-o", help="table, json, or yaml"),
-    actor: str = typer.Option("local-user", "--actor", help="Attributable local actor"),
+    actor: str | None = typer.Option(
+        None, "--actor", help="Configured policy identity; defaults to the local project owner"
+    ),
     version: bool = typer.Option(False, "--version", callback=_version, is_eager=True),
 ) -> None:
     del version
@@ -670,12 +672,15 @@ def experiment_review(
     run_id: str,
     baseline: str | None = typer.Option(None),
     html: Path | None = typer.Option(None),
+    details: bool = typer.Option(
+        False, help="Include source diffs, examples, and runtime evidence"
+    ),
 ) -> None:
     def render(factory: Factory) -> dict[str, Any]:
-        result = review(factory.experiments, run_id, baseline)
+        result = review(factory.experiments, run_id, baseline, details=True)
         if html is not None:
             write_review(result, html)
-        return result
+        return result if details else summarize_review(result)
 
     _run(render)
 

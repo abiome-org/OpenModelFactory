@@ -144,6 +144,15 @@ def _validated_definition(value: Any) -> ExperimentDefinition:
         raise ValidationError(
             "invalid experiment definition",
             details={"errors": exc.errors(include_input=False, include_context=False)},
+            remediation=[
+                {
+                    "command": "omf experiment schema",
+                    "description": (
+                        "Inspect supported fields. Memory limits use limits.addressSpaceBytes "
+                        "(virtual address space in bytes)."
+                    ),
+                }
+            ],
         ) from exc
 
 
@@ -178,7 +187,10 @@ def capture_script(root: Path, base: Path, script: Script, target: Path) -> dict
     with tempfile.NamedTemporaryFile(suffix=".tar") as package:
         package_module(source, package.name, included_paths=set(tracked))
         extract_module_package(package.name, target)
-    if any((target / name).exists() for name in ("omf-script.yaml", "omf-requirements.lock")):
+    if any(
+        (target / name).exists()
+        for name in ("omf-script.yaml", "omf-script-runner.py", "omf-requirements.lock")
+    ):
         raise ValidationError("script source contains reserved OMF adapter filenames")
     files = {
         path.relative_to(target).as_posix(): "sha256:"
@@ -192,13 +204,16 @@ def capture_script(root: Path, base: Path, script: Script, target: Path) -> dict
         else b""
     )
     (target / "omf-requirements.lock").write_bytes(lock)
+    (target / "omf-script-runner.py").write_bytes(
+        Path(__file__).with_name("script_runner.py").read_bytes()
+    )
     write_yaml(
         target / "omf-script.yaml",
         resource(
             "Module",
             target.name,
             {
-                "entryPoint": {"command": ["python3", "-m", "omf.script_runner"]},
+                "entryPoint": {"command": ["python3", "omf-script-runner.py"]},
                 "environment": {
                     "dependencyLock": "omf-requirements.lock",
                     "dependencyDigest": "sha256:" + hashlib.sha256(lock).hexdigest(),
@@ -218,6 +233,7 @@ def stage(
     return {
         "name": name,
         "module": module,
+        "dataUse": "evaluation" if name == "evaluate" else "training",
         "needs": ["train"] if name == "evaluate" else [],
         "inputs": inputs if script.inputs is None else {key: inputs[key] for key in script.inputs},
         "outputs": outputs,
@@ -241,7 +257,9 @@ def evaluation_spec(definition: ExperimentDefinition) -> dict[str, Any]:
     return resource("EvaluationSpec", f"{definition.name}-{sha256_digest(spec)[7:19]}", spec)
 
 
-def initialize(path: Path, *, name: str, objective: str, source: str, actor: str) -> dict[str, Any]:
+def initialize(
+    path: Path, *, name: str, objective: str, source: str, actor: str | None = None
+) -> dict[str, Any]:
     path = path.resolve()
     if path.exists():
         raise ValidationError("experiment definition already exists")
@@ -276,6 +294,7 @@ def initialize(path: Path, *, name: str, objective: str, source: str, actor: str
     root = path.parent
     root.mkdir(parents=True, exist_ok=True)
     if not (root / "omf.yaml").exists():
+        actor = actor or "local-user"
         slug = re.sub(r"[^A-Za-z0-9_-]", "-", name)
         project = resource("Project", slug, {"owners": [actor]})
         project["metadata"]["namespace"] = f"local/{slug}"

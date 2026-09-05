@@ -127,12 +127,18 @@ def test_script_candidates_review_export_and_reproduce_pinned_inputs(tmp_path):
         assert baseline["state"] == candidate["state"] == "succeeded"
         assert not baseline["scores"]["passed"]
         assert candidate["scores"]["passed"]
-        report = review(factory.experiments, candidate["runId"])
+        report = review(factory.experiments, candidate["runId"], details=True)
         assert report["comparison"]["decision"] == "candidate"
         assert report["comparison"]["metrics"][0]["delta"] == 1
         assert report["changes"]["parameters"] == [{"name": "offset", "before": 1, "after": 0}]
         assert report["examples"]["total"] == 2
         assert report["candidate"]["measurement"]["wallSeconds"] > 0
+        summary = review(factory.experiments, candidate["runId"])
+        assert summary["comparison"] == report["comparison"]
+        assert summary["examples"]["total"] == 2
+        assert "items" not in summary["examples"]
+        assert "reproduce" not in summary["candidate"]
+        assert len(json.dumps(summary)) < 4096
         html = tmp_path / "review.html"
         report["objective"] = "<script>bad()</script>"
         write_review(report, html)
@@ -169,6 +175,89 @@ def test_pending_cancellation_is_durable_and_idempotent(tmp_path):
         assert canceled == repeated
         assert canceled["state"] == "canceled"
         assert not (paths.runs / operation["id"] / "stages").exists()
+
+
+def heldout_project(tmp_path):
+    paths, definition = project(tmp_path)
+    recipe = yaml.safe_load(definition.read_text())
+    recipe["data"]["heldout"] = {
+        "source": "heldout.json",
+        "rights": {"license": "CC0-1.0", "trainingAllowed": False},
+    }
+    (paths.root / "heldout.json").write_text('[{"x": 10, "y": 12}]')
+    recipe["train"]["inputs"] = ["samples"]
+    recipe["evaluate"]["inputs"] = ["heldout", "model"]
+    recipe["evaluate"]["command"] = [
+        argument.replace("{inputs[samples]}", "{inputs[heldout]}")
+        for argument in recipe["evaluate"]["command"]
+    ]
+    definition.write_text(yaml.safe_dump(recipe))
+    return paths, definition
+
+
+def test_evaluation_only_data_runs_reproduces_and_retains_rights(tmp_path):
+    paths, definition = heldout_project(tmp_path)
+    with Factory(paths) as factory:
+        run = factory.experiments.run(definition, "candidate")
+        assert run["scores"]["accuracy"] == 1
+        assert factory.experiments.reproduce(run["id"])["scores"] == run["scores"]
+        stage = paths.runs / run["id"] / "stages"
+        assert set(json.loads((stage / "train/request.json").read_text())["inputs"]) == {"samples"}
+        assert set(json.loads((stage / "evaluate/request.json").read_text())["inputs"]) == {
+            "heldout",
+            "model",
+        }
+        heldout = factory.find_resource("DatasetSnapshot", "regression-heldout")
+        assert heldout["spec"]["rights"]["trainingAllowed"] is False
+        release = factory.create_release(run["id"], name="heldout-model", intended_use="Testing")
+        explanations = release["spec"]["extensions"]["promotionDecision"]["explanations"]
+        assert any(item["rule"] == "rights" and item["effect"] == "allow" for item in explanations)
+
+
+@pytest.mark.parametrize("use", ["training", "evaluation"])
+def test_dataset_permissions_are_checked_for_actual_use(tmp_path, use):
+    paths, definition = heldout_project(tmp_path)
+    recipe = yaml.safe_load(definition.read_text())
+    if use == "training":
+        recipe["train"]["inputs"].append("heldout")
+    else:
+        recipe["data"]["heldout"]["rights"]["evaluationAllowed"] = False
+    definition.write_text(yaml.safe_dump(recipe))
+    with Factory(paths) as factory:
+        with pytest.raises(ValidationError, match=f"rights do not allow {use}"):
+            factory.experiments.prepare(definition, "candidate")
+        assert factory.operations.list() == []
+
+
+def test_revoked_evaluation_data_cannot_start_a_queued_run(tmp_path):
+    paths, definition = heldout_project(tmp_path)
+    with Factory(paths) as factory:
+        queued = factory.experiments.prepare(definition, "candidate")
+        factory.revoke_data("regression-heldout", reason="Evaluation permission withdrawn")
+        with pytest.raises(ValidationError, match="current rights do not allow evaluation"):
+            factory.execute_run_operation(queued["id"])
+        assert not (paths.runs / queued["id"] / "stages").exists()
+
+
+def test_shared_dataset_requires_both_uses_through_release(tmp_path):
+    paths, definition = project(tmp_path)
+    with Factory(paths) as factory:
+        run = factory.experiments.run(definition, "candidate")
+        factory.add_data(
+            str(paths.root / "data.json"),
+            name="regression-samples",
+            mode="copy",
+            rights={"license": "CC0-1.0", "trainingAllowed": True, "evaluationAllowed": False},
+        )
+        release = factory.create_release(run["id"], name="shared-model", intended_use="Testing")
+        explanations = release["spec"]["extensions"]["promotionDecision"]["explanations"]
+        assert any(item["rule"] == "rights" and item["effect"] == "deny" for item in explanations)
+        recipe = yaml.safe_load(definition.read_text())
+        recipe["data"]["samples"]["rights"]["evaluationAllowed"] = False
+        definition.write_text(yaml.safe_dump(recipe))
+        with pytest.raises(ValidationError, match="rights do not allow evaluation"):
+            factory.experiments.prepare(definition, "candidate")
+        assert len(factory.operations.list()) == 1
 
 
 @pytest.mark.parametrize("ambiguous", [False, True])
@@ -372,7 +461,7 @@ def test_changed_evaluation_evidence_requires_review_and_has_source_diff(tmp_pat
         (paths.root / "src/evaluate.py").write_text(EVALUATE + "\n# Revised evaluator\n")
         (paths.root / "data.json").write_text('[{"x":1,"y":4},{"x":2,"y":5}]')
         candidate = factory.experiments.run(definition, "candidate")
-        report = review(factory.experiments, candidate["id"], baseline["id"])
+        report = review(factory.experiments, candidate["id"], baseline["id"], details=True)
         assert report["comparison"]["decision"] == "review"
         assert report["comparison"]["reasons"] == [
             "evaluation source changed",

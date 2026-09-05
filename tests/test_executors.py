@@ -516,6 +516,42 @@ def test_local_executor_realizes_dependency_lock_from_wheelhouse(tmp_path):
     assert (run_dir / "stdout.log").read_text().strip() == "1.0"
 
 
+def test_dependency_cache_distinguishes_venvs_sharing_one_interpreter(tmp_path):
+    from _wheels import build_wheel, lock_for
+
+    wheelhouse = tmp_path / "wheels"
+    _, digest = build_wheel(wheelhouse)
+    contents = lock_for("omftiny", "1.0", digest)
+    dependency = DependencyLock(
+        "requirements.lock", "sha256:" + hashlib.sha256(contents).hexdigest(), contents
+    )
+    executor = LocalExecutor(
+        environment_root=tmp_path / "cache",
+        dependency_wheelhouse=wheelhouse,
+        dependency_index=False,
+    )
+    commands = []
+    for name in ("first", "second"):
+        base = tmp_path / name
+        venv.EnvBuilder(with_pip=False, symlinks=True).create(base)
+        python = base / "bin/python3"
+        site = Path(
+            subprocess.check_output(
+                [str(python), "-c", "import sysconfig; print(sysconfig.get_path('purelib'))"],
+                text=True,
+            ).strip()
+        )
+        (site / "trial_marker.py").write_text(f"VALUE = {name!r}\n")
+        environment = executor.prepare_environment(
+            argv=[str(python), "-c", "import trial_marker, omftiny; print(trial_marker.VALUE)"],
+            cwd=tmp_path,
+            dependency=dependency,
+        )
+        commands.append(environment["command"])
+        assert subprocess.check_output(environment["command"], text=True).strip() == name
+    assert commands[0][0] != commands[1][0]
+
+
 def test_local_executor_reports_unsatisfiable_lock_without_index(tmp_path):
     lock = b"omfmissing==9.9 --hash=sha256:" + b"0" * 64 + b"\n"
     executor = LocalExecutor(environment_root=tmp_path / "environments", dependency_index=False)

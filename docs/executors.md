@@ -36,7 +36,7 @@ The local provider adds `environment:executable-drift-detection` (the worker
 re-hashes the module's interpreter immediately before exec and records the
 digest) and `environment:dependency-lock-realization` (hash-pinned locks are
 installed into cached virtual environments under `.omf/environments/`, keyed
-by lock, interpreter, and options, with the interpreter's site directories
+by lock, interpreter, inherited environment, and options, with the interpreter's site directories
 layered after the lock). Neither is a byte-sealed runtime closure.
 
 ## The local provider

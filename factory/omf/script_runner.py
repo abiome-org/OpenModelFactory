@@ -10,33 +10,54 @@ import time
 from pathlib import Path
 from typing import Any
 
-from omf.canonical import load_document, portable_relative_path
-from omf.sdk import ProtocolRequest, ProtocolResult, main
+
+def _unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    value = dict(pairs)
+    if len(value) != len(pairs):
+        raise ValueError("JSON object contains duplicate keys")
+    return value
+
+
+def _finite_float(value: str) -> float:
+    number = float(value)
+    if not math.isfinite(number):
+        raise ValueError("JSON numbers must be finite")
+    return number
+
+
+def _read_json(path: Path) -> Any:
+    return json.loads(
+        path.read_bytes(),
+        object_pairs_hook=_unique_object,
+        parse_float=_finite_float,
+        parse_constant=_finite_float,
+    )
 
 
 def _output_path(root: Path, relative: str) -> Path:
-    portable_relative_path(relative, "script output")
+    if not relative or Path(relative).is_absolute() or ".." in Path(relative).parts:
+        raise ValueError("script output must be a relative path within its output directory")
     path = (root / relative).resolve()
     if not path.is_relative_to(root.resolve()):
         raise ValueError("script output escapes its output directory")
     return path
 
 
-def _arguments(request: ProtocolRequest, output: Path) -> list[str]:
+def _arguments(request: dict[str, Any], output: Path) -> list[str]:
     inputs = {
         key: value["path"] if isinstance(value, dict) and "path" in value else value
-        for key, value in request.inputs.items()
+        for key, value in request["inputs"].items()
     }
     substitutions = {
         "inputs": inputs,
-        "parameters": request.config["parameters"],
+        "parameters": request["config"]["parameters"],
         "output": str(output),
     }
-    return [argument.format_map(substitutions) for argument in request.config["command"]]
+    return [argument.format_map(substitutions) for argument in request["config"]["command"]]
 
 
 def _metrics(path: Path) -> dict[str, Any]:
-    values = load_document(path.read_bytes())
+    values = _read_json(path)
     if not isinstance(values, dict) or not all(
         isinstance(value, (int, float)) and math.isfinite(value) for value in values.values()
     ):
@@ -44,7 +65,8 @@ def _metrics(path: Path) -> dict[str, Any]:
     return values
 
 
-def run(request: ProtocolRequest) -> ProtocolResult:
+def run(request: dict[str, Any]) -> dict[str, Any]:
+    config = request["config"]
     output = Path(os.environ["OMF_RESULT_FILE"]).resolve().parent / "outputs"
     output.mkdir(exist_ok=True)
     arguments = _arguments(request, output)
@@ -57,12 +79,8 @@ def run(request: ProtocolRequest) -> ProtocolResult:
     subprocess.run(arguments, check=True, env=environment)
     usage = resource.getrusage(resource.RUSAGE_CHILDREN)
     elapsed = time.monotonic() - started
-    values = (
-        _metrics(_output_path(output, request.config["metrics"]))
-        if request.config.get("metrics")
-        else {}
-    )
-    for name in request.config.get("metricNames", []):
+    values = _metrics(_output_path(output, config["metrics"])) if config.get("metrics") else {}
+    for name in config.get("metricNames", []):
         if name not in values or isinstance(values[name], bool):
             raise ValueError(f"declared metric must be a finite number: {name}")
     artifacts = [
@@ -71,12 +89,12 @@ def run(request: ProtocolRequest) -> ProtocolResult:
             "path": str(_output_path(output, path)),
             "kind": "model" if name == "model" else "stage-output",
         }
-        for name, path in request.config.get("artifacts", {}).items()
+        for name, path in config.get("artifacts", {}).items()
     ]
-    examples = request.config.get("examples")
+    examples = config.get("examples")
     if examples:
         path = _output_path(output, examples)
-        records = load_document(path.read_bytes())
+        records = _read_json(path)
         if not isinstance(records, list) or not all(
             isinstance(item, dict) and isinstance(item.get("id"), (str, int)) for item in records
         ):
@@ -91,8 +109,27 @@ def run(request: ProtocolRequest) -> ProtocolResult:
     measurement_path = _output_path(output.parent, "measurement.json")
     measurement_path.write_text(json.dumps(measurement))
     artifacts.append({"name": "measurement", "path": str(measurement_path), "kind": "measurement"})
-    return ProtocolResult(status="ok", outputs=values, artifacts=artifacts)
+    return {"status": "ok", "outputs": values, "artifacts": artifacts}
+
+
+def main() -> int:
+    target = Path(os.environ["OMF_RESULT_FILE"])
+    result: dict[str, Any]
+    try:
+        request = _read_json(Path(os.environ["OMF_REQUEST_FILE"]))
+        if request["operation"] == "validate":
+            result = {"status": "ok"}
+        elif request["operation"] == "run":
+            result = run(request)
+        else:
+            raise ValueError(f"unsupported script operation: {request['operation']}")
+    except Exception as exc:
+        result = {"status": "error", "error": {"code": type(exc).__name__, "message": str(exc)}}
+    temporary = target.with_suffix(".tmp")
+    temporary.write_text(json.dumps({"protocol": "omf.module/v1", **result}, allow_nan=False))
+    temporary.replace(target)
+    return int(result["status"] != "ok")
 
 
 if __name__ == "__main__":
-    raise SystemExit(main({"validate": lambda _: ProtocolResult(status="ok"), "run": run}))
+    raise SystemExit(main())

@@ -18,6 +18,13 @@ def test_cycle_retry_and_state(tmp_path):
     spec = AdmittedWorkload(
         source_digest="sha256:" + "0" * 64, stages=[Stage(name="a", module="m")]
     )
+    assert spec.digest == "sha256:a912106504415e3def9190427211043125daaa0d849fcc36289c852d04fde414"
+    assert (
+        spec.model_copy(
+            update={"stages": [Stage(name="a", module="m", dataUse="evaluation")]}
+        ).digest
+        != spec.digest
+    )
     store = StateStore(tmp_path / "state.json")
     store.initialize(spec)
     assert store.transition(RunState.DRAFT, RunState.VALIDATED)["state"] == "Validated"

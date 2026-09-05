@@ -228,7 +228,9 @@ def _comparison(
     }
 
 
-def review(service: ExperimentService, run_id: str, baseline: str | None = None) -> dict[str, Any]:
+def review(
+    service: ExperimentService, run_id: str, baseline: str | None = None, *, details: bool = False
+) -> dict[str, Any]:
     after = _subject(service, run_id)
     definition = ExperimentDefinition.model_validate(service.metadata(after["runId"])["definition"])
     if baseline is None:
@@ -270,7 +272,39 @@ def review(service: ExperimentService, run_id: str, baseline: str | None = None)
                 "examples": _example_changes(service, before, after),
             }
         )
-    return report
+    return report if details else summarize_review(report)
+
+
+def summarize_review(report: dict[str, Any]) -> dict[str, Any]:
+    summary = {key: value for key, value in report.items() if key != "modelCard"}
+    for name in ("candidate", "baseline"):
+        subject = report[name]
+        summary[name] = (
+            {
+                key: subject[key]
+                for key in (
+                    "runId",
+                    "name",
+                    "experiment",
+                    "rationale",
+                    "parameters",
+                    "scores",
+                    "measurement",
+                )
+            }
+            if subject
+            else None
+        )
+    if "examples" in report:
+        summary["examples"] = {
+            key: value for key, value in report["examples"].items() if key != "items"
+        }
+        source = report["changes"]["source"]
+        summary["changes"] = {
+            **report["changes"],
+            "source": {key: value for key, value in source.items() if key != "items"},
+        }
+    return summary
 
 
 def write_review(report: dict[str, Any], path: Path) -> None:

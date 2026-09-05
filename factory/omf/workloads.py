@@ -5,7 +5,7 @@ import json
 import os
 from enum import StrEnum
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 from pydantic import ValidationError as PydanticValidationError
@@ -35,15 +35,28 @@ _TRANSITIONS = {
 }
 
 
+DataUse = Literal["training", "evaluation"]
+
+
 class Stage(BaseModel):
     model_config = ConfigDict(extra="forbid", populate_by_name=True)
     name: str
     needs: list[str] = Field(default_factory=list)
     module: str
     operation: str = "run"
+    data_use: DataUse = Field(default="training", alias="dataUse")
     config: dict[str, Any] = Field(default_factory=dict)
     inputs: dict[str, str] = Field(default_factory=dict)
     outputs: list[str] = Field(default_factory=list)
+
+
+def dataset_uses(stages: list[Stage]) -> dict[str, list[DataUse]]:
+    uses: dict[str, set[DataUse]] = {}
+    for stage in stages:
+        for reference in stage.inputs.values():
+            if reference.startswith("dataset/"):
+                uses.setdefault(reference, set()).add(stage.data_use)
+    return {reference: sorted(purposes) for reference, purposes in uses.items()}
 
 
 class AdmittedWorkload(BaseModel):
@@ -97,6 +110,10 @@ class AdmittedWorkload(BaseModel):
     @property
     def digest(self) -> str:
         value = self.model_dump(mode="json", exclude={"binding_digest", "environments"})
+        # Preserve admission digests recorded before per-stage data uses existed.
+        for stage in value["stages"]:
+            if stage["data_use"] == "training":
+                del stage["data_use"]
         value["environmentDigests"] = {
             stage: descriptor["digest"] for stage, descriptor in sorted(self.environments.items())
         }

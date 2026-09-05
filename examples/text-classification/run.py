@@ -101,7 +101,9 @@ def run(destination, archive=None, tracking_uri=None):
         word = factory.experiments.run(definition, "word-svm")
         character = interrupted_run(factory, definition)
         runs = [baseline, word, character]
-        reports = [review(factory.experiments, item["id"], baseline["id"]) for item in runs]
+        reports = [
+            review(factory.experiments, item["id"], baseline["id"], details=True) for item in runs
+        ]
         acceptable = [report for report in reports if report["comparison"]["acceptable"]]
         if not acceptable:
             raise RuntimeError("no candidate met the declared acceptance criteria")
