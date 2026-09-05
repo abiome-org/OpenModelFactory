@@ -139,16 +139,11 @@ content and publishes the manifest only after every chunk verifies.
 
 ## Vulnerability evidence and release promotion
 
-Promotion is denied when vulnerability evidence is absent, invalid, does not
-cover the aggregate model and admitted training and inference sources, or
-contains an unwaived open high/critical finding. Import a scanner's YAML/JSON
-report with `omf release create --vulnerability-report <path>`. The report must
-contain `scanner` (name/version object), `databaseRevision`, timezone-aware
-`generatedAt`, `subjects` (OMF artifact digests), `findings`, and `waivers`.
-Each finding contains `id`, `severity`, and `status`. OMF commits the report as
-an immutable artifact and binds its summary into the signed release. A site is
-responsible for obtaining and signing scanner databases in its connected or
-air-gapped supply-chain process.
+Projects can require vulnerability scanning with `promotion.requireVulnerabilityScan`.
+Without that requirement, scanning is optional. A supplied report must cover the
+model and admitted sources and contain no unwaived open high/critical findings.
+OMF stores imported evidence; it does not run a scanner. See
+[releases](releases.md#optional-vulnerability-evidence) for the report format.
 
 ## Deployment lifecycle and rollback
 
@@ -164,8 +159,8 @@ omf deployment rollback <name> --expected-version <status-version>
 ```
 
 A stale version is rejected rather than overwriting a concurrent deployment
-change. Before starting any deployment, OMF verifies the release signature and
-requires its recorded promotion policy decision to be `allow`.
+change. Deployment and rollback verify the pinned release signature and check
+current data rights and project requirements before launch.
 
 ## Air-gapped installation
 

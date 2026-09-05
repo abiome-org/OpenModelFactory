@@ -1,6 +1,6 @@
 # Changelog
 
-## 2.0.0 — unreleased
+## 2.0.0 — 2026-09-05
 
 - Center the factory on captured data and recipes, durable runs, measured
   comparisons, and usable model versions. Remove goal/knowledge APIs, generic
