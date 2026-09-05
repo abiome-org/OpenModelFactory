@@ -109,6 +109,10 @@ class ArtifactManifest:
     def manifest_digest(self) -> str:
         return sha256_digest(self.to_dict())
 
+    @property
+    def is_directory(self) -> bool:
+        return self.media_type == "application/vnd.omf.tree+json"
+
 
 def _hash_stream(stream: BinaryIO) -> tuple[str, int]:
     digest, size = hashlib.sha256(), 0
@@ -147,8 +151,7 @@ class ArtifactBuilder:
                 "application/octet-stream", size, digest, chunks, **metadata
             )
         elif source.is_dir():
-            # Directory is a storage format: tree restoration depends on this kind.
-            metadata.pop("logical_kind", None)
+            logical_kind = metadata.pop("logical_kind", "directory")
             for candidate in sorted(source.rglob("*")):
                 relative = candidate.relative_to(source).as_posix()
                 mode = candidate.lstat().st_mode
@@ -170,7 +173,7 @@ class ArtifactBuilder:
                 len(payload),
                 digest,
                 chunks,
-                logical_kind="directory",
+                logical_kind=logical_kind,
                 entries=tuple(entries),
                 **metadata,
             )
@@ -242,7 +245,7 @@ class ArtifactBuilder:
             set(actual_files) == set(expected_files)
             and actual_directories == expected_directories
             and all(
-                _entry_matches(actual_files[relative], expected, manifest.logical_kind)
+                _entry_matches(actual_files[relative], expected, manifest.is_directory)
                 for relative, expected in expected_files.items()
             )
         )
@@ -275,7 +278,7 @@ class ArtifactBuilder:
             raise IntegrityError("artifact payload integrity check failed")
 
     def _restore_tree(self, manifest: ArtifactManifest, temporary: Path) -> None:
-        if not manifest.entries:
+        if not manifest.is_directory:
             with (temporary / "payload").open("wb") as output_sink:
                 self._restore_content(manifest.chunks, manifest.digest, manifest.size, output_sink)
             return
@@ -316,7 +319,7 @@ def _checkpoint_components(manifest: ArtifactManifest) -> list[str] | None:
 
 
 def _expected_tree(manifest: ArtifactManifest) -> tuple[dict[str, TreeEntry], set[str]]:
-    if manifest.logical_kind != "directory":
+    if not manifest.is_directory:
         return {"payload": TreeEntry("payload", 0, manifest.size, manifest.digest)}, set()
     directories = {
         str(parent)
@@ -342,13 +345,13 @@ def _restored_tree(root: Path) -> tuple[dict[str, Path], set[str]] | None:
     return files, directories
 
 
-def _entry_matches(path: Path, expected: TreeEntry, logical_kind: str) -> bool:
+def _entry_matches(path: Path, expected: TreeEntry, is_directory: bool) -> bool:
     with path.open("rb") as stream:
         digest, size = _hash_stream(stream)
     return (
         digest == expected.digest
         and size == expected.size
-        and (logical_kind != "directory" or stat.S_IMODE(path.stat().st_mode) == expected.mode)
+        and (not is_directory or stat.S_IMODE(path.stat().st_mode) == expected.mode)
     )
 
 

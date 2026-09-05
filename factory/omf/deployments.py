@@ -18,6 +18,7 @@ from omf.executors import (
     Executor,
     ResolvedExecutor,
 )
+from omf.ids import uuid7
 from omf.lineage import LineageEdge
 from omf.modules import (
     extract_module_package,
@@ -69,14 +70,14 @@ class DeploymentService:
             "revision"
         ]
         expected_version: int | None = None
-        previous_status: dict[str, Any] | None = None
+        previous_status: dict[str, Any] = {}
         try:
-            existing = self.factory.find_resource("DeploymentSpec", name)
-            previous_status, expected_version = self.factory.resources.get_status(
-                existing["metadata"]["uid"]
-            )
-            if previous_status.get("deploymentRevision") == desired_revision:
-                current = self.deployment_status(name)
+            current = self.deployment_status(name)
+            previous_status = current["status"]
+            expected_version = int(current["statusVersion"])
+            if previous_status.get(
+                "deploymentRevision"
+            ) == desired_revision and previous_status.get("state") in {"running", "packaged"}:
                 return {
                     "deployment": current["deployment"],
                     "state": current["status"]["state"],
@@ -88,6 +89,9 @@ class DeploymentService:
                 expected_version = int(canceled["statusVersion"])
         except NotFoundError:
             pass
+        previous_revision = previous_status.get("deploymentRevision")
+        if previous_revision == desired_revision:
+            previous_revision = previous_status.get("previousDeploymentRevision")
         resource = self.factory.apply_resource(raw)
         state, execution_id, run_dir, executor_name, endpoint = self._launch_deployment(resource)
         self.factory.resources.set_status(
@@ -96,9 +100,7 @@ class DeploymentService:
                 "state": state,
                 "releaseRevision": release["metadata"]["revision"],
                 "deploymentRevision": resource["metadata"]["revision"],
-                "previousDeploymentRevision": (
-                    previous_status.get("deploymentRevision") if previous_status else None
-                ),
+                "previousDeploymentRevision": previous_revision,
                 "executionId": execution_id,
                 "executor": executor_name,
                 "runDirectory": str(run_dir) if run_dir else None,
@@ -167,6 +169,7 @@ class DeploymentService:
             admitted_environment = str(admission["environment"]["digest"])
         except (KeyError, TypeError) as exc:
             raise IntegrityError("release run has no admitted inference adapter state") from exc
+        state = self.factory._resolve_model_state(state, run_dir / "state")
         validate_contract(signatures["state"], state, "model package state")
         source_manifest = self.factory.local_store.read_manifest(adapter_digest)
         builder = ArtifactBuilder(self.factory.local_store)
@@ -234,8 +237,7 @@ class DeploymentService:
             / resource["metadata"]["uid"]
             / resource["metadata"]["revision"]
         )
-        if instance:
-            run_dir /= instance
+        run_dir /= instance or str(uuid7())
         endpoint: str | None = None
         if not command and extension.get("form", "service") == "service":
             command, endpoint = self._prepare_serving(resource, run_dir)

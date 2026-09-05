@@ -69,8 +69,9 @@ Request:
 `restore`, or `stop`. `inputs` carries the resolved stage inputs: a dataset
 snapshot is an object with `path` (the restored payload) and `manifestDigest`;
 a release or checkpoint reference adds `state` (the protocol state that was
-published with it) and, for releases, `modelPackageRef`; a stage output
-reference such as `train.modelState` carries that output's value. `config` is
+published with it) and, for releases, `modelPackageRef`. An artifact output such
+as `train.model` is restored to the same path descriptor; an inline output such
+as `train.modelState` carries its value unchanged. `config` is
 the stage's semantic configuration verbatim.
 
 Result:

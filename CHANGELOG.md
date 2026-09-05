@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased
+
+- Restore artifact-backed inference state to usable file/directory paths in both
+  compatibility checks and service deployments. Exercise serving from saved weights.
+- Preserve directory artifact roots when they contain a file named `payload`,
+  and restore empty directories without adding a spurious payload file.
+- Keep model and checkpoint roles on directory artifacts, so release selection
+  does not depend on naming a model output `model` or `weights`.
+- Reject inference results from adapters that exit unsuccessfully. Report malformed
+  adapter results as server failures rather than client input errors.
+- Restart stopped or failed deployments when their unchanged manifest is reapplied,
+  using a fresh run directory and preserving the preceding release for rollback.
+
 ## 2.0.0 — 2026-09-05
 
 - Require patched `cryptography` 50.0.1 or newer and refresh the dependency locks.

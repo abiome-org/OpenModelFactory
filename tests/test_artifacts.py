@@ -6,7 +6,8 @@ from omf.errors import ConflictError, IntegrityError, ValidationError
 from omf.stores.filesystem import FilesystemStore
 
 
-def test_file_and_tree_roundtrip(tmp_path):
+@pytest.mark.parametrize("logical_kind", ["directory", "model", "checkpoint-shard"])
+def test_file_and_tree_roundtrip(tmp_path, logical_kind):
     store = FilesystemStore(tmp_path / "store")
     builder = ArtifactBuilder(store, chunk_size=2)
     source = tmp_path / "source"
@@ -14,7 +15,8 @@ def test_file_and_tree_roundtrip(tmp_path):
     (source / "a").write_bytes(b"abc")
     (source / "nested").mkdir()
     (source / "nested" / "b").write_bytes(b"def")
-    manifest = builder.import_path(source)
+    manifest = builder.import_path(source, logical_kind=logical_kind)
+    assert manifest.logical_kind == logical_kind
     assert builder.verify(manifest)
     builder.restore(manifest, tmp_path / "restored")
     assert builder.verify_restored(manifest, tmp_path / "restored")
@@ -34,6 +36,17 @@ def test_file_restore_uses_payload_name(tmp_path):
     assert builder.verify_restored(manifest, tmp_path / "out")
     (tmp_path / "out/extra").write_text("unexpected")
     assert not builder.verify_restored(manifest, tmp_path / "out")
+
+
+def test_empty_directory_roundtrip(tmp_path):
+    source = tmp_path / "empty"
+    source.mkdir()
+    builder = ArtifactBuilder(FilesystemStore(tmp_path / "store"))
+    manifest = builder.import_path(source)
+    restored = tmp_path / "restored"
+    builder.restore(manifest, restored)
+    assert list(restored.iterdir()) == []
+    assert builder.verify_restored(manifest, restored)
 
 
 def test_repeated_chunks_are_valid_and_restore_in_order(tmp_path):

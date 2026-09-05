@@ -29,13 +29,13 @@ spec:
   signatures:
     input: {type: object, required: [input], properties: {input: {type: number}}}
     output: {type: object, required: [prediction], properties: {prediction: {type: number}}}
-    state: {type: object, required: [slope, intercept]}
+    state: {type: object, required: [path], properties: {path: {type: string}}}
   adapters:
     trainingReference: {stage: train, operation: run, config: {action: train}}
     inferenceReference:
       module: modules/examples/affine-serving/module.yaml
       operation: run
-      stateOutput: train.modelState
+      stateOutput: train.model
       config: {}
   compatibilityVectors:
     - name: positive
@@ -53,6 +53,13 @@ outputs, with optional finite non-negative tolerances and a seed. Both modules
 are captured at admission, so the compatibility check later runs the exact
 admitted serving module against the trained state. This checks the serving
 behavior directly instead of relying solely on the training stage's report.
+
+When `stateOutput` names an artifact, OMF verifies and restores its bytes before
+both compatibility checks and serving. The adapter reads `request.state["path"]`:
+a file for a file artifact, or the root directory for a directory artifact.
+The state also carries `resource`, `kind`, `artifacts`, and `paths`, as with a
+resolved workload artifact input. An output containing an inline state object
+is passed through unchanged. State signatures validate this resolved value.
 
 ## Evaluation specs
 

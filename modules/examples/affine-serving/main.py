@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import json
+from pathlib import Path
+
 from omf.sdk import ProtocolRequest, ProtocolResult, main
 
 
@@ -8,10 +11,13 @@ def validate(_request: ProtocolRequest) -> ProtocolResult:
 
 
 def run(request: ProtocolRequest) -> ProtocolResult:
-    state = request.state
+    weights = Path(request.state["path"])
+    if weights.is_dir():
+        weights /= "model.json"
+    state = json.loads(weights.read_text())
     value = float(request.inputs["input"])
     prediction = float(state["slope"]) * value + float(state["intercept"])
-    return ProtocolResult(status="ok", outputs={"prediction": prediction}, state=state)
+    return ProtocolResult(status="ok", outputs={"prediction": prediction}, state=request.state)
 
 
 if __name__ == "__main__":

@@ -2420,6 +2420,17 @@ class Factory:
             if not builder.verify(manifest):
                 raise IntegrityError(f"reference input artifact failed verification: {reference}")
 
+    def _resolve_model_state(self, state: Any, target: Path) -> dict[str, Any]:
+        if isinstance(state, str) and state.startswith(("sha256:", "artifact:sha256:")):
+            state = self._materialize_reference(
+                self._pin_reference(state, None), target, allow_existing=False
+            )
+        if not isinstance(state, dict):
+            raise ValidationError(
+                "inference stateOutput must contain an object or artifact reference"
+            )
+        return state
+
     def _materialize_reference(
         self,
         pinned: dict[str, Any],
@@ -2440,8 +2451,7 @@ class Factory:
                     raise IntegrityError("materialized reference differs from admitted artifact")
             else:
                 builder.restore(manifest, target)
-            payload = target / "payload"
-            paths[role] = str(payload if payload.exists() else target)
+            paths[role] = str(target if manifest.is_directory else target / "payload")
         primary = {"release": "model", "checkpoint": "module-state", "artifact": "payload"}
         value: dict[str, Any] = {
             "resource": pinned["uri"],
@@ -2513,11 +2523,10 @@ class Factory:
                     raise IntegrityError("materialized dataset differs from admitted artifact")
             else:
                 ArtifactBuilder(self.local_store).restore(snapshot.artifact, target)
-            payload = target / "payload"
             return {
                 "resource": self._resource_uri(dataset),
                 "mode": snapshot.mode,
-                "path": str(payload if payload.exists() else target),
+                "path": str(target if snapshot.artifact.is_directory else target / "payload"),
                 "manifestDigest": snapshot.artifact.manifest_digest,
             }
         return {
