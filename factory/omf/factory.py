@@ -22,7 +22,7 @@ from omf.agent import AgentControl
 from omf.artifacts import ArtifactBuilder, ArtifactManifest, AtomicCheckpointPublisher
 from omf.backups import create_backup
 from omf.canonical import canonical_json, load_document, portable_relative_path, sha256_digest
-from omf.config import ProjectPaths, load_project
+from omf.config import ProjectPaths, load_project, local_actor
 from omf.data import DataService, DatasetSnapshot
 from omf.database import Database, ResourceRepository
 from omf.deployments import DeploymentService
@@ -74,10 +74,12 @@ from omf.stores.s3 import S3Store
 from omf.sync import SyncEngine
 from omf.workloads import (
     AdmittedWorkload,
+    DataUse,
     RunState,
     Stage,
     StateStore,
     WorkloadRunner,
+    dataset_uses,
     project_workload,
 )
 
@@ -245,6 +247,8 @@ def _training_stage(training: dict[str, Any], stages: list[Stage]) -> Stage:
     if training["stage"] not in workload_stages:
         raise ValidationError("ModelPackage trainingReference references an unknown workload stage")
     training_stage = workload_stages[training["stage"]]
+    if training_stage.data_use != "training":
+        raise ValidationError("ModelPackage trainingReference must declare training data use")
     if training["operation"] != training_stage.operation or any(
         training_stage.config.get(key) != value for key, value in training["config"].items()
     ):
@@ -280,7 +284,7 @@ class Factory:
         self,
         paths: ProjectPaths,
         *,
-        actor: str = "local-user",
+        actor: str | None = None,
         executors: ExecutorRegistry | None = None,
     ) -> None:
         if not paths.database.exists():
@@ -295,18 +299,17 @@ class Factory:
                 ],
             )
         self.paths = paths
-        self.actor = actor
         self.project = load_project(paths)
+        self.actor = local_actor(self.project) if actor is None else actor
         self.namespace = str(self.project["metadata"]["namespace"])
         self.db = Database(paths.database)
         self.identity = SigningIdentity(paths.signing_key)
         self.secrets = SecretStore(self.db, paths.secret_key)
         self.api_tokens = ApiTokenStore(self.db)
         local_token = self.secrets.get("local-api-token", "api-authentication").decode()
-        owners = self.project["spec"].get("owners", [])
         local_principal = self.api_tokens.register(
             local_token,
-            actor=str(owners[0]) if owners else "local-user",
+            actor=local_actor(self.project),
             scopes={"*"},
         )
         self.local_token_id = local_principal.token_id
@@ -1065,6 +1068,7 @@ class Factory:
         environment: dict[str, Any],
         recovering: bool = False,
         datasets: list[dict[str, Any]] | None = None,
+        data_use: DataUse = "training",
     ) -> ProtocolResult:
         validate_contract(manifest.schemas["input"], request.inputs, "input")
         validate_contract(manifest.schemas["config"], request.config, "config")
@@ -1090,7 +1094,7 @@ class Factory:
         )
         with self._dataset_rights_locks(datasets or []):
             for dataset in datasets or []:
-                self._require_training_rights(dataset)
+                self._require_data_rights(dataset, data_use)
             execution_id = _ensure_execution(executor, run_dir, plan, plan_digest, recovering)
         status = executor.status(execution_id)
         while status.state in {"pending", "running"}:
@@ -1582,7 +1586,7 @@ class Factory:
             stages, expected_resources.get("references", {})
         )
         if run_resource is not None:
-            self._readmit_run(run_resource, list(pinned_inputs.values()))
+            self._readmit_run(run_resource, stages, pinned_inputs)
         model_package = self._pin_model_package(
             admitted.model_package_ref,
             stages,
@@ -1718,10 +1722,11 @@ class Factory:
             raise IntegrityError("run desired state changed during admission")
         return None, workload, binding
 
-    def _readmit_run(self, run_resource: dict[str, Any], datasets: list[dict[str, Any]]) -> None:
-        with self._dataset_rights_locks(datasets):
-            for dataset in datasets:
-                self._require_training_rights(dataset)
+    def _readmit_run(
+        self, run_resource: dict[str, Any], stages: list[Stage], inputs: dict[str, dict[str, Any]]
+    ) -> None:
+        with self._dataset_rights_locks(list(inputs.values())):
+            self._require_input_rights(stages, inputs)
             self._record_run_admitted(run_resource)
 
     def _capture_run_sources(
@@ -1867,8 +1872,7 @@ class Factory:
         state_store.transition(RunState.DRAFT, RunState.VALIDATED)
         datasets = list(pinned_inputs.values())
         with self._dataset_rights_locks(datasets):
-            for dataset in datasets:
-                self._require_training_rights(dataset)
+            self._require_input_rights(spec.stages, pinned_inputs)
             state_store.transition(RunState.VALIDATED, RunState.ADMITTED)
             state_store.transition(RunState.ADMITTED, RunState.RUNNING)
             run_resource = self.apply_resource(
@@ -1957,6 +1961,7 @@ class Factory:
             executor_config=context.executor.config,
             environment=environment,
             recovering=context.recovering,
+            data_use=stage.data_use,
             datasets=[
                 context.pinned_inputs[reference]
                 for reference in stage.inputs.values()
@@ -2187,52 +2192,64 @@ class Factory:
         expected_revisions: dict[str, str] | None = None,
     ) -> dict[str, dict[str, Any]]:
         pinned: dict[str, dict[str, Any]] = {}
-        for stage in stages:
-            for reference in stage.inputs.values():
-                if reference in pinned or not reference.startswith("dataset/"):
-                    continue
-                if expected_revisions is not None and reference not in expected_revisions:
-                    raise IntegrityError("queued dataset reference was not pinned")
-                resource = (
-                    self._resource_by_uri("DatasetSnapshot", expected_revisions[reference])
-                    if expected_revisions is not None
-                    else self.find_resource("DatasetSnapshot", reference.removeprefix("dataset/"))
-                )
-                self._require_training_rights(resource)
-                snapshot = self._snapshot_from_resource(resource)
-                if snapshot.mode != "copy":
-                    raise CapabilityError(
-                        "only copied dataset snapshots can be executed reproducibly"
-                    )
-                if snapshot.artifact is None or not ArtifactBuilder(self.local_store).verify(
-                    snapshot.artifact
-                ):
-                    raise IntegrityError("admitted dataset artifact failed integrity verification")
-                pinned[reference] = resource
+        for reference, uses in dataset_uses(stages).items():
+            if expected_revisions is not None and reference not in expected_revisions:
+                raise IntegrityError("queued dataset reference was not pinned")
+            resource = (
+                self._resource_by_uri("DatasetSnapshot", expected_revisions[reference])
+                if expected_revisions is not None
+                else self.find_resource("DatasetSnapshot", reference.removeprefix("dataset/"))
+            )
+            for use in uses:
+                self._require_data_rights(resource, use)
+            snapshot = self._snapshot_from_resource(resource)
+            if snapshot.mode != "copy":
+                raise CapabilityError("only copied dataset snapshots can be executed reproducibly")
+            if snapshot.artifact is None or not ArtifactBuilder(self.local_store).verify(
+                snapshot.artifact
+            ):
+                raise IntegrityError("admitted dataset artifact failed integrity verification")
+            pinned[reference] = resource
         return pinned
 
     @staticmethod
-    def _training_rights_valid(resource: dict[str, Any]) -> bool:
+    def _data_rights_valid(resource: dict[str, Any], use: DataUse = "training") -> bool:
         rights = resource["spec"].get("rights")
         return bool(
             isinstance(rights, dict)
-            and rights.get("trainingAllowed") is True
+            and rights.get(f"{use}Allowed", use == "evaluation") is True
             and rights.get("revoked", False) is False
         )
 
-    def _current_training_rights_valid(self, resource: dict[str, Any]) -> bool:
+    def _current_data_rights_valid(
+        self, resource: dict[str, Any], use: DataUse = "training"
+    ) -> bool:
         return any(
             item["metadata"]["uid"] == resource["metadata"]["uid"]
-            and self._training_rights_valid(item)
+            and self._data_rights_valid(item, use)
             for item in self.resources.latest(kind="DatasetSnapshot")
         )
 
-    def _require_training_rights(self, resource: dict[str, Any]) -> None:
+    def _require_data_rights(self, resource: dict[str, Any], use: DataUse = "training") -> None:
         name = str(resource["metadata"]["name"])
-        if not self._training_rights_valid(resource):
-            raise ValidationError(f"dataset {name!r} pinned rights do not allow training")
-        if not self._current_training_rights_valid(resource):
-            raise ValidationError(f"dataset {name!r} current rights do not allow training")
+        if not self._data_rights_valid(resource, use):
+            raise ValidationError(f"dataset {name!r} pinned rights do not allow {use}")
+        if not self._current_data_rights_valid(resource, use):
+            raise ValidationError(f"dataset {name!r} current rights do not allow {use}")
+
+    def _require_input_rights(self, stages: list[Stage], inputs: dict[str, dict[str, Any]]) -> None:
+        for reference, uses in dataset_uses(stages).items():
+            for use in uses:
+                self._require_data_rights(inputs[reference], use)
+
+    def _input_rights_valid(
+        self, inputs: dict[str, dict[str, Any]], uses: dict[str, list[DataUse]]
+    ) -> bool:
+        return all(
+            self._data_rights_valid(item, use) and self._current_data_rights_valid(item, use)
+            for reference, item in inputs.items()
+            for use in uses.get(reference, ["training"])
+        )
 
     def _pin_model_package(
         self,

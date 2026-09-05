@@ -59,10 +59,19 @@ def discover_project(start: str | Path | None = None) -> ProjectPaths:
     current = Path(start or Path.cwd()).resolve()
     if current.is_file():
         current = current.parent
-    for candidate in (current, *current.parents):
+    for candidate in (current,) if start is not None else (current, *current.parents):
         if (candidate / "omf.yaml").is_file():
             return ProjectPaths(candidate)
-    raise ConfigurationError("no omf.yaml found in this directory or its parents")
+    raise ConfigurationError(
+        f"no omf.yaml in project directory {current}"
+        if start is not None
+        else "no omf.yaml found in this directory or its parents"
+    )
+
+
+def local_actor(project: dict[str, Any]) -> str:
+    owners = project["spec"].get("owners", [])
+    return str(owners[0]) if owners else "local-user"
 
 
 def load_project(paths: ProjectPaths) -> dict[str, Any]:
@@ -117,10 +126,9 @@ def bootstrap(
         except NotFoundError:
             local_token = secrets.token_urlsafe(32)
             secrets_store.put("local-api-token", local_token, "api-authentication")
-        owners = project["spec"].get("owners", [])
         ApiTokenStore(database).register(
             local_token,
-            actor=str(owners[0]) if owners else "local-user",
+            actor=local_actor(project),
             scopes={"*"},
         )
         database.close()

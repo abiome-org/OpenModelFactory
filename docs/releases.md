@@ -33,7 +33,7 @@ Promotion moves the alias only when every gate passes:
 
 - the run succeeded with exactly one aggregate model artifact;
 - its evaluation passed and its compatibility check passed;
-- every admitted dataset still allows training under its newest revision;
+- every admitted dataset still allows its training or evaluation uses under its newest revision;
 - lineage for the run is complete;
 - the factory signing identity is valid;
 - the vulnerability report covers every required subject with no blocking

@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Use the configured project owner for local commands, honor explicit project
+  directories, archive uncommitted work by default, and summarize reviews unless
+  details are requested. Capture a standalone script adapter and distinguish
+  inherited Python environments in the dependency cache.
+- Check dataset rights according to training or evaluation use, so held-out data
+  can be evaluated without granting training permission. Preserve revocation and
+  current-rights checks throughout admission, recovery, and promotion.
 - Add executable experiments for ordinary scripts: captured source and data,
   named candidates, metric criteria, limits, review reports, reproduction,
   artifact/source export, and optional MLflow tracking through CLI and HTTP.

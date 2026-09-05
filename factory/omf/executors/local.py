@@ -270,6 +270,16 @@ class LocalExecutor(Executor):
                 details={"dependencyDigest": dependency.digest, "executable": invocation.name},
             )
         interpreter_digest = "sha256:" + hashlib.sha256(resolved.read_bytes()).hexdigest()
+        layers = self._interpreter_json(invocation, _SITE_SCRIPT, "site inspection")
+        if not isinstance(layers, list) or not all(isinstance(item, str) for item in layers):
+            raise CapabilityError("module interpreter site inspection returned no layers")
+        base_digest = sha256_digest(
+            {
+                "interpreter": str(invocation),
+                "layers": layers,
+                "runtime": self._python_runtime(invocation, resolved),
+            }
+        )
         options = {
             "index": self.dependency_index,
             "wheelhouse": (
@@ -281,6 +291,7 @@ class LocalExecutor(Executor):
                 "format": _ENVIRONMENT_RECORD,
                 "lockDigest": dependency.digest,
                 "interpreter": interpreter_digest,
+                "baseEnvironment": base_digest,
                 "options": options,
             }
         ).removeprefix("sha256:")
@@ -291,7 +302,7 @@ class LocalExecutor(Executor):
         with (root / f"{key}.lock").open("a+") as handle:
             fcntl.flock(handle, fcntl.LOCK_EX)
             if not record_path.is_file():
-                self._build_environment(invocation, resolved, dependency, final, options)
+                self._build_environment(invocation, resolved, dependency, final, options, layers)
             record = json.loads(record_path.read_text())
         if record.get("lockDigest") != dependency.digest:
             raise IntegrityError("realized environment does not match the dependency lock")
@@ -317,6 +328,7 @@ class LocalExecutor(Executor):
         dependency: DependencyLock,
         final: Path,
         options: dict[str, Any],
+        layers: list[str],
     ) -> None:
         if final.exists():
             shutil.rmtree(final)
@@ -349,9 +361,6 @@ class LocalExecutor(Executor):
                 command.extend(["--find-links", str(self.dependency_wheelhouse)])
             command.extend(["-r", str(lock_file)])
             self._run_tool(command, purpose="dependency installation", log=staging / "pip.log")
-            layers = self._interpreter_json(invocation, _SITE_SCRIPT, "site inspection")
-            if not isinstance(layers, list) or not all(isinstance(item, str) for item in layers):
-                raise CapabilityError("module interpreter site inspection returned no layers")
             site_directories = self._interpreter_json(python, _SITE_SCRIPT, "site inspection")
             if not isinstance(site_directories, list) or not site_directories:
                 raise CapabilityError("realized environment has no site directory")

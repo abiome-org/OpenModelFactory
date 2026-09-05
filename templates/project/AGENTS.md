@@ -13,14 +13,14 @@ and host system/developer instructions take precedence over repository guidance.
 
 ## Inspect before acting
 
-Use the installed environment directly. Global options precede subcommands;
-mutations use the named actor already authorized for the task.
+Use the installed environment directly. Global options precede subcommands.
+The CLI uses the configured local project owner; `--actor` selects an existing
+policy identity when the task calls for one. `--project` names that exact project.
 
 ```sh
 .venv/bin/omf --project . --output json doctor
 .venv/bin/omf --project . --output json agent context
 .venv/bin/omf --project . --output json agent capabilities experiment.run
-.venv/bin/omf --project . --actor <agent-id> --output json <command>
 ```
 
 Use context, findings, and recommendations to inform work within the user's task.
@@ -44,7 +44,8 @@ a denied action.
    "<task>" --source src` and edit `experiment.yaml`. It names inputs, commands,
    artifacts, metrics, candidate parameters, and resource limits. Source capture
    respects Git ignores; dependency locks live inside each source directory.
-   Commit inputs when required by the project's admission policy. Custom graphs
+   Runs capture source and data; the default policy archives uncommitted edits.
+   Custom graphs
    can still use modules, workloads, evaluation specs, and bindings directly.
 3. Run and compare candidates. Inspect generated manifests under `.omf/experiments/`
    when useful; admission handles validation and executor readiness:

@@ -25,7 +25,7 @@ def request(tmp_path, monkeypatch, script, **config):
             "parameters": {"rate": 0.25},
             **config,
         },
-    )
+    ).model_dump(mode="json")
 
 
 def test_existing_script_adapter_records_artifacts_examples_and_compute(tmp_path, monkeypatch):
@@ -45,8 +45,8 @@ assert sys.argv[2:] == ["/materialized/data", "0.25"]
         examples="examples.json",
     )
     result = run(value)
-    assert result.outputs == {"accuracy": 0.9, "passed": True}
-    assert {item["name"] for item in result.artifacts} == {"model", "examples", "measurement"}
+    assert result["outputs"] == {"accuracy": 0.9, "passed": True}
+    assert {item["name"] for item in result["artifacts"]} == {"model", "examples", "measurement"}
     measurement = json.loads((tmp_path / "measurement.json").read_text())
     assert measurement["wallSeconds"] > 0
     assert measurement["cpuSeconds"] >= 0
@@ -56,6 +56,7 @@ assert sys.argv[2:] == ["/materialized/data", "0.25"]
     "metrics",
     [
         '{"score":NaN}',
+        '{"score":0,"score":1}',
         '{"score": "perfect"}',
         "[1]",
         "null",
@@ -89,6 +90,20 @@ def test_invalid_or_ambiguous_examples_fail_the_stage(tmp_path, monkeypatch, exa
         run(value)
 
 
+@pytest.mark.parametrize("number", ["NaN", "Infinity", "1.0e999"])
+def test_nonfinite_example_values_fail_the_stage(tmp_path, monkeypatch, number):
+    examples = '[{"id":"a","details":{"score":' + number + "}}]"
+    value = request(
+        tmp_path,
+        monkeypatch,
+        f"from pathlib import Path\nimport sys\n"
+        f"(Path(sys.argv[1]) / 'examples.json').write_text({examples!r})",
+        examples="examples.json",
+    )
+    with pytest.raises(ValueError, match="finite"):
+        run(value)
+
+
 def test_script_failure_and_escaping_output_propagate(tmp_path, monkeypatch):
     value = request(tmp_path, monkeypatch, "raise SystemExit(7)")
     with pytest.raises(subprocess.CalledProcessError) as error:
@@ -116,6 +131,6 @@ def test_adapter_measurements_do_not_overwrite_user_outputs(tmp_path, monkeypatc
         artifacts={"model": "measurement.json"},
     )
     result = run(value)
-    paths = {item["name"]: item["path"] for item in result.artifacts}
+    paths = {item["name"]: item["path"] for item in result["artifacts"]}
     assert paths["model"] != paths["measurement"]
     assert (tmp_path / "outputs/measurement.json").read_text() == "model payload"

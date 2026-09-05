@@ -18,6 +18,7 @@ from omf.errors import (
 from omf.lineage import LineageEdge
 from omf.policy import PolicyDecision, promotion_gate
 from omf.releases import ReleaseBuilder, promote_alias, verify_release
+from omf.workloads import DataUse, dataset_uses, project_workload
 
 if TYPE_CHECKING:
     from omf.factory import Factory
@@ -96,11 +97,11 @@ class PublishingService:
             self._load_vulnerability_report(vulnerability_report, required_scan_subjects)
         )
         datasets = self._release_datasets(admission)
-        rights_valid = all(
-            self.factory._training_rights_valid(item)
-            and self.factory._current_training_rights_valid(item)
-            for item in datasets
+        workload = self.factory._resource_by_uri(
+            "WorkloadSpec", run_resource["spec"]["workloadRef"]
         )
+        data_uses = dataset_uses(project_workload(workload).stages)
+        rights_valid = self.factory._input_rights_valid(datasets, data_uses)
         approval_list = approvals or []
         compatibility_passed = bool(evaluation["spec"]["extensions"].get("compatibilityPassed"))
         evidence = {
@@ -129,7 +130,7 @@ class PublishingService:
                     "revision": item["metadata"]["revision"],
                     "rights": item["spec"].get("rights", {}),
                 }
-                for item in datasets
+                for item in datasets.values()
             ],
             "evaluations": [evaluation["metadata"]["revision"]],
             "limitations": limitations or [],
@@ -147,7 +148,7 @@ class PublishingService:
             "vulnerabilities": vulnerability_summary,
             "deployment": {"compatible": ["batch", "service", "actor", "edge", "control"]},
             "rollback": {"compatible": True},
-            "licenses": [item["spec"].get("rights", {}) for item in datasets],
+            "licenses": [item["spec"].get("rights", {}) for item in datasets.values()],
         }
         signed = ReleaseBuilder(self.factory.identity).build(manifest)
         verify_release(signed, self.factory.identity.public_bytes)
@@ -181,7 +182,7 @@ class PublishingService:
             evaluation,
         )
         if promote:
-            self._promote_release(metadata, alias, datasets, evidence)
+            self._promote_release(metadata, alias, datasets, data_uses, evidence)
         self.factory.events.append(
             type="ReleasePublished",
             source=f"omf://{self.factory.namespace}",
@@ -235,14 +236,14 @@ class PublishingService:
             raise ValidationError("a failing evaluation cannot produce a release")
         return evaluation
 
-    def _release_datasets(self, admission: dict[str, Any]) -> list[dict[str, Any]]:
+    def _release_datasets(self, admission: dict[str, Any]) -> dict[str, dict[str, Any]]:
         admitted_inputs = admission.get("admittedInputs", {})
         if not isinstance(admitted_inputs, dict):
             raise IntegrityError("run has invalid admitted dataset references")
-        return [
-            self.factory._resource_by_uri("DatasetSnapshot", str(reference))
-            for reference in admitted_inputs.values()
-        ]
+        return {
+            name: self.factory._resource_by_uri("DatasetSnapshot", str(reference))
+            for name, reference in admitted_inputs.items()
+        }
 
     def _record_release_lineage(
         self,
@@ -271,15 +272,12 @@ class PublishingService:
         self,
         metadata: dict[str, Any],
         alias: str,
-        datasets: list[dict[str, Any]],
+        datasets: dict[str, dict[str, Any]],
+        data_uses: dict[str, list[DataUse]],
         evidence: dict[str, Any],
     ) -> None:
-        with self.factory._dataset_rights_locks(datasets):
-            current_rights = all(
-                self.factory._training_rights_valid(item)
-                and self.factory._current_training_rights_valid(item)
-                for item in datasets
-            )
+        with self.factory._dataset_rights_locks(list(datasets.values())):
+            current_rights = self.factory._input_rights_valid(datasets, data_uses)
             decision = promotion_gate(
                 {**evidence, "rights_valid": current_rights}, actor=self.factory.actor
             )

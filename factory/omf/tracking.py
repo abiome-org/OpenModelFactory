@@ -18,7 +18,7 @@ def track(service: ExperimentService, run_id: str, uri: str) -> dict[str, Any]:
     from omf.factory import _operation_lease
 
     service.factory._authorize("experiment.track")
-    report = review(service, run_id)
+    report = review(service, run_id, details=True)
     candidate = report["candidate"]
     try:
         tracking = importlib.import_module("mlflow.tracking")

@@ -135,7 +135,7 @@ and shared invariants; local comments explain decisions where they occur.
   its base and executing the target would drop the environment's site
   packages; the resolved bytes are attested by digest instead. A non-empty
   dependency lock is realized once into a cached environment keyed by lock,
-  interpreter, and options, with the interpreter's site directories appended
+  interpreter, inherited environment, and options, with the interpreter's site directories appended
   after the lock so `omf.sdk` stays importable while the lock shadows them.
 - `executors/local_worker.py` is the detached monitor: it re-hashes attested
   executables immediately before exec, bounds log tails, forwards stop
@@ -148,8 +148,9 @@ and shared invariants; local comments explain decisions where they occur.
 
 - `experiment_definition.py` validates the compact experiment format and captures
   chosen source files. `experiments.py` compiles it into existing resources and
-  owns run discovery, reproduction, and export. `script_runner.py` adapts ordinary
-  commands to the module protocol. `candidate_review.py` compares evidence and
+  owns run discovery, reproduction, and export. `script_runner.py` is a standalone
+  standard-library adapter captured with each script's source, so model environments
+  do not need OMF installed. `candidate_review.py` compares evidence and
   renders a standalone report; `tracking.py` exports it through the MLflow client.
 - `run_control.py` records cancellation intent outside the execution lease. The
   lease owner alone stops executors and settles run state. Atomic finalization

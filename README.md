@@ -46,7 +46,9 @@ Evaluation writes a JSON object of finite numeric metrics and explicit boolean
 `passed` and `compatibilityPassed` checks. Optional examples are JSON records with
 stable `id`, `input`, `expected`, `prediction`, and numeric `score` fields.
 
-Source capture respects Git ignore rules. `dependencies` names a hash-pinned
+Runs capture uncommitted source by default and respect Git ignore rules.
+Review prints a compact comparison; `--details` includes examples, diffs, and
+runtime evidence. `dependencies` names a hash-pinned
 binary requirements lock inside each script's source directory. Separate training
 and evaluation source directories when their code changes independently: changes
 to the evaluator's captured source, inputs, or protocol flag comparisons for review.

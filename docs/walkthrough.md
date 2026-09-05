@@ -70,12 +70,14 @@ the example is a two-parameter affine fit.
 
 ## Candidate
 
-Change one thing, commit it, and run again. The test suite does exactly this
+Change one thing and run again. The test suite does exactly this
 with the training step count:
 
 1. Edit `workloads/example-from-scratch.yaml` (for example raise `steps`).
-2. Commit; with `dirtyWorktree: deny` an uncommitted change is refused.
-3. `omf run workloads/example-from-scratch.yaml` and `omf evaluate run/<id>`.
+2. `omf run workloads/example-from-scratch.yaml` and `omf evaluate run/<id>`.
+
+The default policy archives uncommitted edits with the run. A site that explicitly
+sets `dirtyWorktree: deny` requires a commit first.
 
 Then compare on the metric the evaluation spec declared:
 

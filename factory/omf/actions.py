@@ -107,7 +107,7 @@ _ACTIONS = (
     ActionDefinition(
         "experiment.review",
         "Review quality, regressions, source changes, examples, and compute used.",
-        "omf experiment review <run-id> [--baseline <run-id>] [--html <path>]",
+        "omf experiment review <run-id> [--baseline <run-id>] [--html <path>] [--details]",
         path="/v1/experiment-runs/{run_id}/review",
     ),
     ActionDefinition(

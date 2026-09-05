@@ -3,6 +3,8 @@
 A project is a Git repository with an `omf.yaml` at its root. Everything OMF
 knows about the project lives either in versioned files next to it or in the
 untracked `.omf/` directory.
+Without `--project`, OMF finds the nearest parent `omf.yaml`. An explicit
+`--project` selects that directory exactly.
 
 ## The project manifest
 
@@ -45,8 +47,10 @@ reports each finding with a remediation. `omf admin backup` and
 
 ## Actors
 
-Every mutation is attributed to an actor: `omf --actor <identity> ...` on the
-CLI, or the token's actor on the HTTP API. Replace the scaffold's `local-user`
+Every mutation is attributed to an actor. The CLI and Python API default to the
+first configured project owner, or `local-user` when no owner is set. Use
+`omf --actor <identity> ...` to select an existing policy identity explicitly;
+HTTP uses the token's actor. Replace the scaffold's `local-user`
 before sharing a project, and never reuse one identity for an independent
 approval.
 
@@ -68,7 +72,7 @@ spec:
       effect: allow
       match: {actor: local-user, resource: local/my-model}
   config:
-    dirtyWorktree: deny
+    dirtyWorktree: archive
     unsignedModules: deny
     sync: {requirePlan: true, allowDelete: false}
     promotion: {requireEvaluationPass: true, requireCompleteLineage: true}
@@ -80,7 +84,8 @@ resource; `deny` overrides `allow`. `dirtyWorktree` governs admission: `deny`
 admits a workload only from a committed tree with no uncommitted or untracked
 files, `archive` admits a dirty tree and stores the patch as a
 `worktree-patch` artifact referenced by the run, and `allow` records the state
-without archiving. The other keys name behavior the factory always has and may
+without archiving. New projects use `archive`, so iteration does not require a
+commit before each run. The other keys name behavior the factory always has and may
 only carry the values shown; an unknown key is rejected when the policy loads.
 
 ## The model card

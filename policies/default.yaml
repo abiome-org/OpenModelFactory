@@ -15,7 +15,7 @@ spec:
         action: network.egress
         purpose: unapproved
   config:
-    dirtyWorktree: deny
+    dirtyWorktree: archive
     unsignedModules: deny
     sync:
       requirePlan: true

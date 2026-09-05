@@ -23,9 +23,13 @@ omf data list
 `verify` re-checks the stored or registered bytes against the recorded
 digests. The rights document declares at least `license` and
 `trainingAllowed`; add consent basis, redistribution, attribution, sensitivity,
-retention, residency, and export terms as they apply. A snapshot without
-`trainingAllowed: true` cannot be admitted, and rights are checked again from
-the newest revision whenever a run, a release, or a promotion uses the data.
+retention, residency, and export terms as they apply. Training inputs require
+`trainingAllowed: true`. Evaluation-only inputs can retain `trainingAllowed: false`;
+`evaluationAllowed: false` explicitly denies evaluation. Script experiments declare
+these uses from their train/evaluate stages. Lower-level workload stages default
+to `dataUse: training` and can declare `dataUse: evaluation`.
+Rights are checked against the pinned and newest revisions at admission, execution,
+recovery, release, and promotion. Revocation denies both uses.
 
 ```sh
 omf --actor data-steward data revoke example-affine --reason "consent withdrawn"

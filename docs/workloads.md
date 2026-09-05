@@ -88,7 +88,7 @@ result in the immutable `Run` resource:
 1. Loads the workload and binding, checks the policy for `workload.run`, and
    applies the dirty-worktree rule.
 2. Pins datasets, references, the model package, and evaluation specs to exact
-   revisions and checks training rights.
+   revisions and checks rights for each stage's training or evaluation use.
 3. Captures every stage module and the inference adapter as content-addressed
    packages and prepares their environments through the executor.
 4. Writes the run state under `.omf/runs/<run-id>/state.json` and transitions
