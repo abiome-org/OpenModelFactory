@@ -5,6 +5,8 @@ from pathlib import Path
 
 import yaml
 from omf.cli import app
+from omf.config import ProjectPaths
+from omf.factory import Factory
 from typer.testing import CliRunner
 
 
@@ -320,3 +322,78 @@ def test_cli_complete_local_lifecycle(tmp_path):
     )
     assert restoration.exit_code == 0, restoration.output
     assert json.loads(restoration.stdout)["keyId"] == backup["keyId"]
+
+
+def test_catalog_and_command_tree_match_and_support_focused_help():
+    from typer.main import get_command
+
+    def leaves(command, path=()):
+        children = getattr(command, "commands", {})
+        if children:
+            return {
+                leaf for name, child in children.items() for leaf in leaves(child, (*path, name))
+            }
+        return {path}
+
+    runner = CliRunner()
+    result = runner.invoke(app, ["--output", "json", "agent", "capabilities"])
+    assert result.exit_code == 0, result.output
+    catalog = json.loads(result.stdout)
+    advertised = set()
+    for action in catalog["actions"]:
+        words = action["interfaces"]["cli"].split()[1:]
+        path = []
+        for word in words:
+            if "<" in word or word.startswith(("[", "-")):
+                break
+            path.append(word)
+        advertised.add(tuple(path))
+        help_result = runner.invoke(app, [*path, "--help"])
+        assert help_result.exit_code == 0, (action["action"], help_result.output)
+    assert advertised == leaves(get_command(app))
+    focused = runner.invoke(app, ["--output", "json", "agent", "capabilities", "goal.status"])
+    assert focused.exit_code == 0, focused.output
+    action = json.loads(focused.stdout)["actions"]
+    assert len(action) == 1
+    assert "--reason" in action[0]["interfaces"]["cli"]
+    unknown = runner.invoke(app, ["--output", "json", "agent", "capabilities", "does-not-exist"])
+    assert unknown.exit_code == 1
+    assert json.loads(unknown.stdout)["error"]["code"] == "not_found"
+
+
+def test_cli_secret_stdin_and_nonfinite_budget_errors(tmp_path):
+    root = _full_project(tmp_path)
+    runner = CliRunner()
+    prefix = ["--project", str(root), "--output", "json"]
+    assert runner.invoke(app, [*prefix, "bootstrap"]).exit_code == 0
+    secret = runner.invoke(
+        app,
+        [*prefix, "admin", "secret", "set", "sample", "--purpose", "test", "--value-stdin"],
+        input="private-value\n",
+    )
+    assert secret.exit_code == 0, secret.output
+    assert "private-value" not in secret.output
+    with Factory(ProjectPaths(root)) as factory:
+        assert factory.secrets.get("sample", "test") == b"private-value"
+    for budget in ("hours=nan", "hours=inf", "hours=-1"):
+        invalid = runner.invoke(
+            app,
+            [
+                *prefix,
+                "goal",
+                "create",
+                "bad",
+                "--objective",
+                "Test",
+                "--success",
+                "pass",
+                "--budget",
+                budget,
+            ],
+        )
+        assert invalid.exit_code == 1
+        assert json.loads(invalid.stdout)["error"]["code"] == "validation_error"
+    assert json.loads(runner.invoke(app, [*prefix, "goal", "list"]).stdout)["total"] == 0
+    events = runner.invoke(app, [*prefix, "event", "list"])
+    assert events.exit_code == 0
+    assert isinstance(json.loads(events.stdout), list)

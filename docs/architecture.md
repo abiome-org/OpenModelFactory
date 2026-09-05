@@ -1,8 +1,9 @@
 # Architecture
 
-OMF is one application boundary, `Factory`, with replaceable modules, stores,
-and executors around it. This page is the documentation of the code: what each
-part owns and the decisions that are not obvious from reading it.
+OMF exposes one application boundary, `Factory`, with modules, stores, and
+executors around it. Internally, evaluation, publishing, deployment, and agent
+views each have a concrete owner. This page explains their responsibilities
+and shared invariants; local comments explain decisions where they occur.
 
 ## Lifecycle
 
@@ -145,26 +146,56 @@ part owns and the decisions that are not obvious from reading it.
 
 ### Application
 
+- `experiment_definition.py` validates the compact experiment format and captures
+  chosen source files. `experiments.py` compiles it into existing resources and
+  owns run discovery, reproduction, and export. `script_runner.py` adapts ordinary
+  commands to the module protocol. `candidate_review.py` compares evidence and
+  renders a standalone report; `tracking.py` exports it through the MLflow client.
+- `run_control.py` records cancellation intent outside the execution lease. The
+  lease owner alone stops executors and settles run state. Atomic finalization
+  prevents cancellation from racing a successful result; interrupted evaluation
+  publication remains resumable.
+
 - `factory.py` is the application boundary shared by the CLI and the API. It
   loads and enforces the project policy, stamps namespaces, authorizes
   actions, admits and executes runs in phases (desired state, pinning, source
   capture, environment admission, state initialization, stage execution,
-  result publication), reconciles interrupted operations only from immutable
-  results, evaluates runs, builds and promotes releases, and applies, cancels,
-  and rolls back deployments.
+  result publication), and reconciles interrupted operations from admitted
+  state and immutable evidence. Existing public methods delegate to the owned
+  lifecycle services, preserving Python callers and CLI/HTTP behavior.
+- `evaluation.py` owns metric thresholds, execution of admitted compatibility
+  vectors, evaluation evidence, and comparisons between evaluation revisions.
+- `publishing.py` assembles signed releases, verifies their evidence, and moves
+  aliases only through promotion gates under dataset-rights locks.
+- `deployments.py` owns release admission for serving, worker attachment,
+  lifecycle status, cancellation, and guarded rollback. Services share the
+  factory's repositories, actor, policy, and executor registry; they do not
+  create another database, registry, or control plane.
 - `policy.py` is the deny-overrides rule engine, the project policy loader
   that rejects any configuration the factory cannot enforce, and the
   promotion gate.
 - `releases.py` builds and verifies signed release manifests and moves aliases
   with a recorded policy decision.
-- `agent.py` assembles the bounded agent context, the digest-addressed action
-  catalog, fixed-rule recommendations, goals with guarded status, and
-  evidence-backed knowledge.
-- `cli.py` and `api.py` are two attributed interfaces over the same `Factory`;
-  neither carries interface-specific semantics.
+- `actions.py` defines action names, command templates, HTTP routes, scope,
+  effects, and cost/risk metadata. CLI registration and help, HTTP routing,
+  scope authorization, OpenAPI operation IDs, and the agent catalog consume
+  those same definitions. Request models remain the HTTP input schema.
+- `agent.py` assembles bounded context, advisory recommendations, guarded goal
+  status, and evidence-linked knowledge. Byte trimming preserves an event so
+  incremental cursors keep advancing, trims other detail as needed, and never
+  advances past an omitted incremental event. Operation summaries are projected
+  in SQL without selecting request/result/error payloads or searching them.
+- `cli.py` and `api.py` are attributed interfaces over the same `Factory`.
+  CLI invocation state has a context-local lifetime, including cleanup after
+  an error. Secret input can use a hidden prompt or stdin rather than argv.
 - `config.py` discovers the project, loads `omf.yaml`, and bootstraps `.omf/`.
 - `install_support.py` holds the installer's atomic file operations and the
-  starter copy; `install.sh` drives them.
+  starter copy; `install.sh` drives them. `tools/bootstrap.py` creates the
+  distribution's locked development environment; Make, CI, and agent setup
+  use it. It resolves interpreter symlinks before creating a venv so standalone
+  Python distributions retain a valid standard-library location. Hash-locked
+  dependencies are cached in `.venv/wheels` for network-free installation tests
+  that create fresh environments without inheriting system packages.
 
 ## Extension points
 

@@ -1,5 +1,6 @@
 from omf.executors.base import (
     DEPLOYMENT_PROTOCOL_CAPABILITIES,
+    MODULE_EXECUTION_CAPABILITIES,
     MODULE_PROTOCOL_CAPABILITIES,
     DependencyLock,
     ExecutionPlan,
@@ -20,6 +21,7 @@ from omf.executors.registry import (
 __all__ = [
     "DEPLOYMENT_PROTOCOL_CAPABILITIES",
     "EXECUTOR_API_VERSION",
+    "MODULE_EXECUTION_CAPABILITIES",
     "MODULE_PROTOCOL_CAPABILITIES",
     "DependencyLock",
     "ExecutionPlan",

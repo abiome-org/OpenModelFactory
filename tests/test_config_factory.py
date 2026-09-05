@@ -28,6 +28,7 @@ from omf.errors import (
     OMFError,
     ValidationError,
 )
+from omf.evaluation import EvaluationService
 from omf.executors import (
     EXECUTOR_API_VERSION,
     MODULE_PROTOCOL_CAPABILITIES,
@@ -1759,13 +1760,13 @@ def test_resource_pinning_and_resolution_fail_closed(paths):
         with pytest.raises(IntegrityError, match="identity is ambiguous"):
             factory._run_resource("missing")
 
-    assert Factory._compatibility_equal(True, True, {})
-    assert Factory._compatibility_equal(1.0, 1.001, {"absolute": 0.01})
-    assert Factory._compatibility_equal([1, 2], [1, 2], {})
-    assert not Factory._compatibility_equal([1], [1, 2], {})
-    assert Factory._compatibility_equal({"x": 1}, {"x": 1}, {})
-    assert not Factory._compatibility_equal({"x": 1}, {"y": 1}, {})
-    assert not Factory._compatibility_equal("left", "right", {})
+    assert EvaluationService._compatibility_equal(True, True, {})
+    assert EvaluationService._compatibility_equal(1.0, 1.001, {"absolute": 0.01})
+    assert EvaluationService._compatibility_equal([1, 2], [1, 2], {})
+    assert not EvaluationService._compatibility_equal([1], [1, 2], {})
+    assert EvaluationService._compatibility_equal({"x": 1}, {"x": 1}, {})
+    assert not EvaluationService._compatibility_equal({"x": 1}, {"y": 1}, {})
+    assert not EvaluationService._compatibility_equal("left", "right", {})
 
 
 def test_experiment_rejects_different_evaluation_revisions(paths):
@@ -2163,7 +2164,7 @@ def test_running_operation_reconciles_immutable_completed_result(paths, monkeypa
             patch.setattr(factory, "apply_resource", interrupt_completion)
             with pytest.raises(KeyboardInterrupt, match="controller stopped"):
                 factory.execute_run_operation(operation["id"])
-        assert factory.operations.get(operation["id"])["state"] == "running"
+        assert factory.operations.get(operation["id"])["state"] == "finalizing"
 
         completed = factory.execute_run_operation(operation["id"])
         status = factory.run_status(operation["id"])["status"]

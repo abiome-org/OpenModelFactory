@@ -126,9 +126,3 @@ fails with `promotion denied by gates` because no vulnerability report covers
 the model and module digests. `omf release evidence run/<run-id>` prints the
 subjects a scanner must cover; the [releases page](releases.md) describes the
 rest of the gate and the deployment forms.
-
-## Post-training
-
-Reinforcement learning with verifiable rewards is an integration outline, not
-a shipped workload; the [post-training page](post-training.md) describes the
-role separation it needs.

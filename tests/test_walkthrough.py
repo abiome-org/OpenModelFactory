@@ -17,12 +17,6 @@ from omf.install_support import copy_starter
 DOCS = Path("docs")
 
 
-def test_post_training_outline_does_not_invent_cli_commands():
-    outline = (DOCS / "post-training.md").read_text(encoding="utf-8")
-    assert not re.search(r"(?m)^\s*omf\b", outline)
-    assert "independent evaluation verifier" in outline
-
-
 def _walkthrough_project(tmp_path: Path) -> Path:
     root = tmp_path / "walkthrough-project"
     root.mkdir()

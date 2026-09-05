@@ -67,7 +67,12 @@ def test_capability_catalog_covers_every_versioned_http_operation(tmp_path):
         for action in capability_catalog()["actions"]
         if (interface := action["interfaces"].get("http")) is not None
     }
-    assert api_operations <= catalog_operations
+    assert api_operations == catalog_operations
+    for action in capability_catalog()["actions"]:
+        if interface := action["interfaces"].get("http"):
+            operation = openapi["paths"][interface["path"]][interface["method"].lower()]
+            assert operation["operationId"] == action["action"]
+            assert operation["x-omf-action"]["requiredScope"] == action["requiredScope"]
 
 
 def test_agent_boundaries_fail_closed_with_actionable_validation(tmp_path):
@@ -292,14 +297,14 @@ def test_knowledge_requires_evidence_and_preserves_supersession_expiry_and_histo
         assert len(factory.events.query(type="KnowledgeRecorded")) == before
 
 
-def test_recommendations_advance_from_data_gap_without_guessing_cost(tmp_path):
+def test_empty_inventory_does_not_invent_new_work(tmp_path):
     paths = _project(tmp_path)
     bootstrap(paths)
     payload = paths.root / "samples.jsonl"
     payload.write_text('{"value":1}\n')
     with Factory(paths) as factory:
         initial = factory.agent.context()
-        assert "data.add" in {item["action"] for item in initial["recommendations"]}
+        assert initial["recommendations"] == []
         factory.add_data(
             payload,
             name="samples",
@@ -307,9 +312,87 @@ def test_recommendations_advance_from_data_gap_without_guessing_cost(tmp_path):
             rights={"license": "CC0-1.0", "trainingAllowed": True},
         )
         advanced = factory.agent.context()
-        actions = {item["action"] for item in advanced["recommendations"]}
-        assert "data.add" not in actions
-        assert "workload.run" in actions
-        run = next(item for item in advanced["recommendations"] if item["action"] == "workload.run")
-        assert run["estimatedCost"]["class"] == "compute"
-        assert run["approvalRequired"]
+        assert advanced["recommendations"] == []
+        assert advanced["inventory"]["resources"] != initial["inventory"]["resources"]
+
+
+def test_incremental_context_preserves_events_and_makes_progress_under_byte_pressure(tmp_path):
+    paths = _project(tmp_path)
+    bootstrap(paths)
+    with Factory(paths) as factory:
+        factory.agent.create_goal("baseline", objective="Start", success_criteria=["ready"])
+        cursor = factory.agent.context()["recentEvents"]["cursor"]
+        for index in range(5):
+            factory.agent.create_goal(
+                f"large-{index}", objective="x" * 4096, success_criteria=["ready"]
+            )
+        expected = [event.id for event in factory.events.window(limit=100, after=cursor).items]
+        received = []
+        for _ in range(len(expected) + 1):
+            context = factory.agent.context(since=cursor, max_bytes=16_384)
+            assert len(canonical_json(context)) <= 16_384
+            page = context["recentEvents"]
+            received.extend(item["id"] for item in page["items"])
+            if not page["truncated"]:
+                break
+            assert page["items"], "a fitting event must advance an incremental cursor"
+            assert page["cursor"] == page["items"][-1]["id"]
+            assert page["cursor"] != cursor
+            cursor = page["cursor"]
+        assert received == expected
+
+
+def test_context_operation_focus_uses_only_metadata_and_reports_exact_totals(tmp_path):
+    paths = _project(tmp_path)
+    bootstrap(paths)
+    with Factory(paths) as factory:
+        oldest = factory.operations.create("matching", {"token": "private-needle"})
+        for _ in range(5):
+            factory.operations.create("other", {"token": "private-needle"})
+        focused = factory.agent.context(focus="matching", limit=1)["activity"]["operations"]
+        assert [item["id"] for item in focused["items"]] == [oldest["id"]]
+        assert focused["total"] == 1
+        assert factory.agent.context(focus="private-needle")["activity"]["operations"]["total"] == 0
+        page = factory.agent.context(limit=1)["activity"]["operations"]
+        assert page["total"] == 6
+        assert page["returned"] == 1
+        assert page["truncated"]
+
+
+def test_goal_status_respects_actor_policy_without_suggesting_a_bypass(tmp_path):
+    import yaml
+    from omf.errors import AuthorizationError
+
+    paths = _project(tmp_path)
+    bootstrap(paths)
+    with Factory(paths) as factory:
+        created = factory.agent.create_goal(
+            "quality", objective="Improve", success_criteria=["pass"]
+        )
+        policy_dir = paths.root / "policies"
+        policy_dir.mkdir()
+        (policy_dir / "default.yaml").write_text(
+            yaml.safe_dump(
+                {
+                    "apiVersion": "omf.dev/v1alpha1",
+                    "kind": "Policy",
+                    "metadata": {"name": "default"},
+                    "spec": {
+                        "rules": [
+                            {
+                                "name": "deny-transition",
+                                "effect": "deny",
+                                "match": {"action": "goal.status"},
+                            }
+                        ],
+                    },
+                }
+            )
+        )
+        with pytest.raises(AuthorizationError) as denied:
+            factory.agent.set_goal_status(
+                "quality", state="satisfied", expected_version=1, reason="done"
+            )
+        assert factory.agent.list_goals()["items"][0] == created
+        assert "project owner" in str(denied.value.remediation)
+        assert len(factory.events.query(type="PolicyDecisionRecorded")) == 1

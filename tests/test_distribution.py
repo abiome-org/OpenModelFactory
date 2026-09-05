@@ -6,12 +6,12 @@ import sqlite3
 import subprocess
 import sys
 import tarfile
-import venv
 import zipfile
 from email.parser import BytesParser
 from pathlib import Path
 
 import omf.database as database_module
+from _environments import create_environment
 
 SOURCE_DATE_EPOCH = "1700000000"
 
@@ -31,8 +31,7 @@ def _run(command, *, cwd=None, env=None, timeout=120):
 
 
 def _environment(path: Path) -> tuple[Path, Path]:
-    venv.EnvBuilder(with_pip=True, system_site_packages=True).create(path)
-    return path / "bin/python", path / "bin/omf"
+    return create_environment(path), path / "bin/omf"
 
 
 def test_release_bundle_and_candidate_install_upgrade_backup_restore(tmp_path):
@@ -145,7 +144,8 @@ source.with_name(source.name + ".sig").write_text(hashlib.sha256(source.read_byt
     _run([python, "-m", "pip", "check"], cwd=isolated, env=environment)
     installed_probe = (
         "import json,omf,pathlib,sys; print(json.dumps({'version':omf.__version__, "
-        "'isolated':pathlib.Path(omf.__file__).resolve().is_relative_to(pathlib.Path(sys.prefix))}))"
+        "'isolated':pathlib.Path(omf.__file__).resolve().is_relative_to("
+        "pathlib.Path(sys.prefix).resolve())}))"
     )
     installed = _run(
         [

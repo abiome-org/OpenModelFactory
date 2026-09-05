@@ -4,6 +4,20 @@ Evaluation turns a run into immutable evidence: metric thresholds from an
 `EvaluationSpec`, compatibility vectors from a `ModelPackage`, and boolean
 pass outputs from evaluator stages combine into one `EvaluationResult`.
 
+## Learning from results
+
+Use evaluation to build a better model: inspect failures, change training or
+data, tune rewards, and select candidates. Check whether gains translate to the
+behavior users need. When a score rewards a shortcut or a verifier accepts an
+incorrect answer, fix the evaluation and compare the baseline and candidate
+under the revised protocol.
+
+Results that guide training or selection are development evidence. Keep using
+them, and record that influence. For an independent estimate of generalization,
+measure on fresh or reserved cases that did not guide those decisions. Reusing
+a correct metric or verifier across splits is fine; document the data exposure
+and feedback that affect the claim.
+
 ## Model packages
 
 ```yaml
@@ -37,8 +51,8 @@ spec:
 that carries the trained state. Compatibility vectors are inputs and expected
 outputs, with optional finite non-negative tolerances and a seed. Both modules
 are captured at admission, so the compatibility check later runs the exact
-admitted serving module against the trained state; a training implementation
-cannot vouch for its own serving path.
+admitted serving module against the trained state. This checks the serving
+behavior directly instead of relying solely on the training stage's report.
 
 ## Evaluation specs
 
@@ -54,9 +68,10 @@ spec:
 ```
 
 Each metric names a run output and an optional `minimum` or `maximum`. Metric
-names must be unique and may not be `passed` or `compatibilityPassed`. Commit
-the spec before observing results; a changed spec is a new revision, and
-results under different revisions are not directly comparable.
+names must be unique and may not be `passed` or `compatibilityPassed`. Each run
+pins its evaluation spec at admission. Revise the spec when it needs improvement;
+compare candidates using the same revision so a protocol change is not mistaken
+for a model improvement.
 
 ## Evaluating a run
 

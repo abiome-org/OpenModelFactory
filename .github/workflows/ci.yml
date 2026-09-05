@@ -10,23 +10,6 @@ permissions:
   contents: read
 
 jobs:
-  quality:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-          cache: pip
-      - run: python -m pip install --upgrade pip
-      - run: "python -m pip install --only-binary=:all: --require-hashes -r requirements.lock"
-      - run: "python -m pip install --only-binary=:all: --require-hashes -r requirements.build.lock"
-      - run: python -m pip install --no-build-isolation --no-deps -e .
-      - run: python -m ruff check factory tests tools modules/examples
-      - run: python -m ruff format --check factory tests tools modules/examples
-      - run: python tools/check_no_comments.py factory tests tools modules/examples
-      - run: python -m mypy
-
   test:
     runs-on: ubuntu-latest
     strategy:
@@ -39,17 +22,27 @@ jobs:
         with:
           python-version: ${{ matrix.python }}
           cache: pip
-      - run: python -m pip install --upgrade pip
-      - run: "python -m pip install --only-binary=:all: --require-hashes -r requirements.lock"
-      - run: "python -m pip install --only-binary=:all: --require-hashes -r requirements.build.lock"
-      - run: python -m pip install --no-build-isolation --no-deps -e .
+          cache-dependency-path: requirements*.lock
+      - run: make setup
       - name: Allow unprivileged user namespaces for module network isolation
         run: |
           if sysctl -n kernel.apparmor_restrict_unprivileged_userns >/dev/null 2>&1; then
             sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
           fi
           unshare --user --map-root-user --net true
-      - run: python -m pytest --cov=omf --cov-report=term
+      - run: make test-all
+      - name: Train, compare, recover, reproduce, and export a real model
+        if: matrix.python == '3.12'
+        run: make example
+      - uses: actions/upload-artifact@v4
+        if: matrix.python == '3.12'
+        with:
+          name: model-experiment
+          path: |
+            .venv/text-classification/results.json
+            .venv/text-classification/review.html
+          include-hidden-files: true
+          if-no-files-found: error
 
   package:
     runs-on: ubuntu-latest
@@ -58,10 +51,9 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      - run: python -m pip install --upgrade pip
-      - run: "python -m pip install --only-binary=:all: --require-hashes -r requirements.lock"
-      - run: "python -m pip install --only-binary=:all: --require-hashes -r requirements.build.lock"
-      - run: python -m pip install --no-build-isolation --no-deps -e .
+          cache: pip
+          cache-dependency-path: requirements*.lock
+      - run: make setup
       - run: make release-candidate
       - uses: actions/upload-artifact@v4
         with:

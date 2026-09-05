@@ -123,6 +123,9 @@ def main() -> int:
         return 1
     signal.signal(signal.SIGTERM, _handle_stop)
     signal.signal(signal.SIGINT, _handle_stop)
+    if _stop_reason:
+        _write_completion(args.completion, exit_code=1, reason=_stop_reason, evidence=evidence)
+        return 1
     global _child
     _child = subprocess.Popen(
         command,
@@ -130,6 +133,8 @@ def main() -> int:
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
     )
+    if _stop_reason:
+        _signal_child(signal.SIGTERM)
     assert _child.stdout is not None
     assert _child.stderr is not None
     readers = [

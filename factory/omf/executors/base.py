@@ -15,6 +15,7 @@ MODULE_PROTOCOL_CAPABILITIES = frozenset(
         "transport:artifacts",
     }
 )
+MODULE_EXECUTION_CAPABILITIES = MODULE_PROTOCOL_CAPABILITIES | frozenset({"isolation:network-deny"})
 DEPLOYMENT_PROTOCOL_CAPABILITIES = frozenset({"protocol:omf.deployment/v1"})
 
 

@@ -1,35 +1,44 @@
-.PHONY: install format lint typecheck test test-all build release-candidate hooks
+.DEFAULT_GOAL := help
+PYTHON ?= .venv/bin/python
+export PATH := $(CURDIR)/.venv/bin:$(PATH)
+TEST_ARGS ?=
+SOURCES := factory tests tools modules/examples examples
+EXAMPLE_DIR ?= .venv/text-classification
 
-install:
-	python3 -m pip install --only-binary=:all: --require-hashes -r requirements.lock
-	python3 -m pip install --only-binary=:all: --require-hashes -r requirements.build.lock
-	python3 -m pip install --no-build-isolation --no-deps -e .
+.PHONY: help setup install format lint typecheck check test test-all build release-candidate example
+
+help:
+	@printf '%s\n' 'make setup       Create the locked development environment' 'make check       Check formatting, lint, and types' 'make test        Run tests; select with TEST_ARGS="tests/test_agent.py -q"' 'make test-all    Run checks and all tests with branch coverage' 'make format      Format code and apply safe lint fixes' 'make build       Build wheel and source distribution'
+
+setup install:
+	python3 tools/bootstrap.py
 
 format:
-	python3 -m ruff format factory tests modules/examples
-	python3 -m ruff check --fix factory tests modules/examples
+	$(PYTHON) -m ruff check --fix $(SOURCES)
+	$(PYTHON) -m ruff format $(SOURCES)
 
 lint:
-	python3 -m ruff check factory tests tools modules/examples
-	python3 -m ruff format --check factory tests tools modules/examples
-	python3 tools/check_no_comments.py factory tests tools modules/examples
-
-hooks:
-	printf '#!/bin/sh\nexec make lint\n' > .git/hooks/pre-commit
-	chmod +x .git/hooks/pre-commit
+	$(PYTHON) -m ruff check $(SOURCES)
+	$(PYTHON) -m ruff format --check $(SOURCES)
 
 typecheck:
-	python3 -m mypy
+	$(PYTHON) -m mypy
+
+check: lint typecheck
 
 test:
-	python3 -m pytest --cov=omf --cov-report=term
+	$(PYTHON) -m pytest $(TEST_ARGS)
 
-test-all: lint typecheck test
+test-all: check
+	$(PYTHON) -m pytest --cov=omf --cov-report=term $(TEST_ARGS)
 
 build:
-	python3 -m build --no-isolation
+	$(PYTHON) -m build --no-isolation
+
+example:
+	$(PYTHON) examples/text-classification/run.py $(EXAMPLE_DIR)
 
 release-candidate:
-	python3 tools/release.py --candidate --output dist \
+	$(PYTHON) tools/release.py --candidate --output dist \
 		--source-revision "$$(git rev-parse HEAD)" \
 		--source-date-epoch "$$(git show -s --format=%ct HEAD)"

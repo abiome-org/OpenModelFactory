@@ -9,6 +9,7 @@ import venv
 from pathlib import Path
 
 import pytest
+from _environments import create_environment, offline_environment
 from omf.errors import CapabilityError, ConfigurationError, IntegrityError, ValidationError
 from omf.executors import EXECUTOR_API_VERSION, ExecutorProvider, ExecutorRegistry
 from omf.executors.base import DependencyLock
@@ -180,7 +181,7 @@ def test_executor_plugin_wheel_is_discovered_in_an_isolated_environment(tmp_path
         assert built.returncode == 0, built.stdout + built.stderr
 
     environment = tmp_path / "venv"
-    venv.EnvBuilder(with_pip=True, system_site_packages=True).create(environment)
+    create_environment(environment)
     python = environment / "bin/python"
     wheels = sorted(distributions.glob("*.whl"))
     installed = subprocess.run(
@@ -197,7 +198,7 @@ def test_executor_plugin_wheel_is_discovered_in_an_isolated_environment(tmp_path
         text=True,
         check=False,
         timeout=60,
-        env=os.environ | {"PIP_NO_INDEX": "1"},
+        env=offline_environment(),
     )
     assert installed.returncode == 0, installed.stdout + installed.stderr
     checked = subprocess.run(
@@ -206,7 +207,7 @@ def test_executor_plugin_wheel_is_discovered_in_an_isolated_environment(tmp_path
         text=True,
         check=False,
         timeout=60,
-        env=os.environ | {"PIP_NO_INDEX": "1"},
+        env=offline_environment(),
     )
     assert checked.returncode == 0, checked.stdout + checked.stderr
 
