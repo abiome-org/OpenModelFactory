@@ -184,6 +184,15 @@ air-gapped; test the complete supported workflow with egress denied.
 
 ## Distribution release
 
+Documented CLI/HTTP operations, templates, persisted state, and `omf.executor/v1`
+follow semantic versioning. Existing `omf.dev/v1alpha1` resources remain accepted
+throughout 1.x; incompatible formats need a new API version and an upgrade path.
+Deprecations remain for one minor release and appear in the changelog, except
+urgent security removals with a migration or mitigation. The newest 1.x minor
+receives correctness and security fixes; its predecessor receives security fixes
+for six months. 1.x receives security fixes for twelve months after 2.0. Release
+notes record the dates when a successor starts either clock.
+
 `make release-candidate` builds the wheel and source archive twice, rejects
 non-reproducible bytes, and emits checksums, an SPDX SBOM, and SLSA provenance.
 Candidate provenance records the Git revision and a source-patch digest when the
@@ -209,11 +218,12 @@ the completed directory only through the repository's approved release process.
 - Preserve goal statuses and evidence-backed knowledge with metadata backups;
   never reconstruct them from chat logs.
 - A failed or incomplete checkpoint is never a restore target.
-- A stale running operation is reconciled only from an immutable `RunResult`.
-  Without one, OMF marks the outcome indeterminate and does not automatically
-  replay potentially non-idempotent module work. Inspect it with
-  `omf operation get <operation-id>`, then run
-  `omf operation reconcile <operation-id>` under the original actor identity.
+- Reconciliation attaches to admitted executor receipts or finalizes immutable
+  results. Unknown launch outcomes require inspection; OMF never blindly replays
+  them. Use `omf operation reconcile <operation-id>` under the original actor.
+  `omf operation cancel <operation-id>` durably records stop intent and confirms
+  executor termination before reporting cancellation. A finalizing run completes
+  its evidence publication; a late cancellation leaves that result intact.
 - Alias and deployment changes require a recorded passing policy decision.
 - State capacity limits only from reproducible benchmark runs on the actual
   hardware and topology being described.

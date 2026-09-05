@@ -9,7 +9,6 @@ import os
 import re
 import shutil
 import subprocess
-import sys
 import tempfile
 import time
 from collections.abc import Iterable, Iterator
@@ -19,14 +18,14 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from omf import __version__
 from omf.agent import AgentControl
 from omf.artifacts import ArtifactBuilder, ArtifactManifest, AtomicCheckpointPublisher
 from omf.backups import create_backup
 from omf.canonical import canonical_json, load_document, portable_relative_path, sha256_digest
 from omf.config import ProjectPaths, load_project
 from omf.data import DataService, DatasetSnapshot
-from omf.database import AliasRepository, Database, ResourceRepository
+from omf.database import Database, ResourceRepository
+from omf.deployments import DeploymentService
 from omf.errors import (
     AuthorizationError,
     CapabilityError,
@@ -35,11 +34,13 @@ from omf.errors import (
     IntegrityError,
     NotFoundError,
     OMFError,
+    OperationCanceled,
     ValidationError,
 )
+from omf.evaluation import EvaluationService
 from omf.events import EventStore
 from omf.executors import (
-    DEPLOYMENT_PROTOCOL_CAPABILITIES,
+    MODULE_EXECUTION_CAPABILITIES,
     MODULE_PROTOCOL_CAPABILITIES,
     ExecutionPlan,
     Executor,
@@ -47,6 +48,7 @@ from omf.executors import (
     ResolvedExecutor,
     default_executor_registry,
 )
+from omf.experiments import ExperimentService
 from omf.ids import uuid7
 from omf.lineage import LineageEdge, LineageStore
 from omf.modules import (
@@ -60,8 +62,9 @@ from omf.modules import (
     worktree_state,
 )
 from omf.operations import OperationStore
-from omf.policy import PolicyDecision, ProjectPolicy, promotion_gate
-from omf.releases import Release, ReleaseBuilder, promote_alias, verify_release
+from omf.policy import PolicyDecision, ProjectPolicy
+from omf.publishing import PublishingService
+from omf.run_control import RunControl
 from omf.schema_registry import default_registry
 from omf.sdk import ProtocolRequest, ProtocolResult
 from omf.security import ApiPrincipal, ApiTokenStore, SecretStore, SigningIdentity
@@ -272,13 +275,6 @@ def _check_metric_names(evaluation_specs: list[dict[str, Any]]) -> None:
         raise ValidationError("evaluation metric names must be unique and not reserved")
 
 
-def _denied_rules(decision: PolicyDecision) -> str:
-    return ", ".join(item["rule"] for item in decision.explanations if item.get("effect") == "deny")
-
-
-MODULE_EXECUTION_CAPABILITIES = MODULE_PROTOCOL_CAPABILITIES | frozenset({"isolation:network-deny"})
-
-
 class Factory:
     def __init__(
         self,
@@ -322,6 +318,11 @@ class Factory:
         self.executors = executors or default_executor_registry()
         self._policy_cache: tuple[tuple[tuple[str, int, int], ...], ProjectPolicy] | None = None
         self.agent = AgentControl(self)
+        self.evaluation = EvaluationService(self)
+        self.publishing = PublishingService(self)
+        self.deployments = DeploymentService(self)
+        self.experiments = ExperimentService(self)
+        self.run_control = RunControl(self)
 
     def close(self) -> None:
         self.db.close()
@@ -391,8 +392,8 @@ class Factory:
                     "action": "project.doctor",
                     "command": "omf doctor",
                     "description": (
-                        f"Add an allow rule for this actor to a policy document under "
-                        f"{policy.directory!r}, or act as an authorized actor."
+                        "Ask the project owner to review the denied action and policy decision. "
+                        "Continue work that is already authorized."
                     ),
                 }
             ],
@@ -980,7 +981,7 @@ class Factory:
             manifest_resource_path = manifest_path
             if extract_to is not None:
                 bundle_root = extract_module_package(package_path, extract_to)
-                manifest_resource_path = bundle_root / "module.yaml"
+                manifest_resource_path = bundle_root / manifest_path.name
                 manifest, code_root = load_manifest(manifest_resource_path, bundle_root)
             module_resource = self._load_resource(manifest_resource_path, kind="Module")
             module_digest = sha256_digest(
@@ -1068,6 +1069,9 @@ class Factory:
         validate_contract(manifest.schemas["input"], request.inputs, "input")
         validate_contract(manifest.schemas["config"], request.config, "config")
         validate_contract(manifest.schemas["state"], request.state, "state input")
+        run_id = request.context.get("runId")
+        if run_id and request.context.get("stage"):
+            self.run_control.check(str(run_id))
         run_dir.mkdir(parents=True, exist_ok=True)
         _write_module_request(run_dir, request, recovering)
         plan = executor.plan(
@@ -1090,6 +1094,8 @@ class Factory:
             execution_id = _ensure_execution(executor, run_dir, plan, plan_digest, recovering)
         status = executor.status(execution_id)
         while status.state in {"pending", "running"}:
+            if run_id and request.context.get("stage"):
+                self.run_control.check(str(run_id))
             time.sleep(0.05)
             status = executor.status(execution_id)
         result_path = run_dir / "result.json"
@@ -1285,6 +1291,7 @@ class Factory:
                 "bindingDigest": sha256_digest(binding_raw),
                 "modulePackages": module_packages,
                 "adapterPackages": adapter_packages,
+                "experiment": workload_raw["spec"].get("extensions", {}).get("experiment"),
                 "resources": {
                     "datasets": {
                         reference: self._resource_uri(resource)
@@ -1333,27 +1340,42 @@ class Factory:
         lease = self.paths.state / "operations" / f"{operation_id}.lock"
         with _operation_lease(lease):
             operation = self.operations.get(operation_id)
+            if operation["kind"] == "run" and operation["request"]["actor"] != self.actor:
+                raise ValidationError("run operation actor does not match the executing controller")
+            if (
+                operation["kind"] == "run"
+                and operation["state"] == "succeeded"
+                and self.experiments.metadata(operation_id)
+            ):
+                self.experiments.complete(operation)
+                return operation
             if operation["kind"] != "run" or operation["state"] not in {
                 "pending",
                 "running",
                 "recovering",
+                "finalizing",
             }:
                 raise ValidationError("operation is not an executable pending run")
-            if operation["request"]["actor"] != self.actor:
-                raise ValidationError("run operation actor does not match the executing controller")
-            if operation["state"] != "pending":
-                return self._resume_run_operation(operation)
-            self._admit_run_operation(operation)
-            return self._continue_run_operation(operation, recovering=False)
+            try:
+                self.run_control.check(operation_id)
+                if operation["state"] != "pending":
+                    result = self._resume_run_operation(operation)
+                else:
+                    self._admit_run_operation(operation)
+                    self.run_control.check(operation_id)
+                    result = self._continue_run_operation(operation, recovering=False)
+            except OperationCanceled:
+                return self.run_control.stop(operation_id)
+            self.experiments.complete(result)
+            return self.operations.advance(operation_id, state="succeeded", result=result["result"])
 
     def _resume_run_operation(self, operation: dict[str, Any]) -> dict[str, Any]:
         operation_id = str(operation["id"])
         reconciled = self._reconcile_completed_run(operation_id)
         if reconciled is not None:
-            return self.operations.update(
+            return self.operations.advance(
                 operation_id,
-                expected_version=operation["version"],
-                state="succeeded",
+                state="finalizing",
                 result=reconciled,
             )
         try:
@@ -1386,9 +1408,8 @@ class Factory:
     def _fail_operation(
         self, operation: dict[str, Any], code: str, message: str, retryable: bool = False
     ) -> None:
-        self.operations.update(
+        self.operations.advance(
             str(operation["id"]),
-            expected_version=operation["version"],
             state="failed",
             error={"code": code, "message": message, "retryable": retryable},
         )
@@ -1398,10 +1419,13 @@ class Factory:
     ) -> dict[str, Any]:
         operation_id = str(operation["id"])
         request = operation["request"]
-        active = self.operations.update(
+        active = self.operations.advance(
             operation_id,
-            expected_version=operation["version"],
-            state="recovering" if recovering else "running",
+            state="finalizing"
+            if operation["state"] == "finalizing"
+            else "recovering"
+            if recovering
+            else "running",
             result={
                 "phase": "recovery" if recovering else "admission",
                 "runId": operation_id,
@@ -1419,6 +1443,8 @@ class Factory:
                 expected_resources=request["resources"],
                 recovering=recovering,
             )
+        except OperationCanceled:
+            raise
         except OMFError as exc:
             error = exc.as_dict()["error"]
             if recovering:
@@ -1430,10 +1456,9 @@ class Factory:
                 self._fail_recovered_run(operation_id, "run worker failed during recovery")
             self._fail_operation(active, "run_worker_error", "run worker failed")
             raise
-        return self.operations.update(
+        return self.operations.advance(
             operation_id,
-            expected_version=active["version"],
-            state="succeeded",
+            state="finalizing",
             result=result,
         )
 
@@ -1734,7 +1759,7 @@ class Factory:
         self, run_dir: Path, stage: Stage, is_inference: bool, run_resource: dict[str, Any]
     ) -> _CapturedSource:
         source_root = run_dir / "sources" / stage.name
-        manifest, code_root = load_manifest(source_root / "module.yaml", source_root)
+        manifest, code_root = load_manifest(source_root / Path(stage.module).name, source_root)
         with tempfile.NamedTemporaryFile(dir=self.paths.packages, suffix=".tar") as package:
             package_digest = package_module(source_root, package.name)
         extensions = run_resource["spec"]["extensions"]
@@ -1896,6 +1921,11 @@ class Factory:
             )
         )
         stage_dir = context.run_dir / "stages" / stage.name
+        for reference in stage.inputs.values():
+            if reference.partition(".")[0] in stage.needs:
+                value = self._resolve_output_reference(reference, context.outputs, context.stages)
+                if isinstance(value, str) and self._is_reference_input(value):
+                    context.pinned_references[value] = self._pin_reference(value, None)
         stage_inputs = {
             name: self._resolve_stage_input(
                 self._resolve_output_reference(reference, context.outputs, context.stages),
@@ -2086,7 +2116,10 @@ class Factory:
                     lambda stage: self._execute_stage(context, stage),
                     verify=self._verify_stage_outputs,
                 )
+                self.operations.advance(run_id, state="finalizing", result={"runId": run_id})
                 state_store.transition(RunState.RUNNING, RunState.SUCCEEDED)
+            except OperationCanceled:
+                raise
             except Exception as exc:
                 state_store.transition(RunState.RUNNING, RunState.FAILED, str(exc))
                 self.resources.set_status(
@@ -2538,43 +2571,14 @@ class Factory:
             for resource in self.resources.latest(kind="Run")
         ]
 
-    def _release_aliases(self, release: dict[str, Any]) -> list[str]:
-        metadata = release["metadata"]
-        return [
-            alias["name"]
-            for alias in AliasRepository(self.db).list()
-            if alias["uid"] == metadata["uid"] and alias["revision"] == metadata["revision"]
-        ]
-
     def list_releases(self) -> list[dict[str, Any]]:
-        return [
-            {
-                "name": release["metadata"]["name"],
-                "revision": release["metadata"]["revision"],
-                "promotion": release["spec"]
-                .get("extensions", {})
-                .get("promotionDecision", {})
-                .get("outcome"),
-                "aliases": self._release_aliases(release),
-                "createdAt": release["metadata"]["createdAt"],
-            }
-            for release in self.resources.latest(kind="Release")
-        ]
+        return self.publishing.list_releases()
 
     def show_release(self, name: str) -> dict[str, Any]:
-        release = self.find_resource("Release", name)
-        return {"release": release, "aliases": self._release_aliases(release)}
+        return self.publishing.show_release(name)
 
     def list_deployments(self) -> list[dict[str, Any]]:
-        return [
-            {
-                "name": resource["metadata"]["name"],
-                "release": resource["spec"]["releaseRef"],
-                "state": self._status_state(resource["metadata"]["uid"]),
-                "revision": resource["metadata"]["revision"],
-            }
-            for resource in self.resources.latest(kind="DeploymentSpec")
-        ]
+        return self.deployments.list_deployments()
 
     def run_status(self, run_id: str) -> dict[str, Any]:
         status, version = self.resources.get_status(run_id)
@@ -2611,234 +2615,8 @@ class Factory:
             raise IntegrityError("run result does not identify the admitted run")
         return result
 
-    @staticmethod
-    def _compatibility_equal(expected: Any, actual: Any, tolerance: dict[str, Any]) -> bool:
-        if isinstance(expected, bool) or isinstance(actual, bool):
-            return bool(expected == actual)
-        if isinstance(expected, (int, float)) and isinstance(actual, (int, float)):
-            return math.isclose(
-                float(expected),
-                float(actual),
-                abs_tol=float(tolerance.get("absolute", 0.0)),
-                rel_tol=float(tolerance.get("relative", 0.0)),
-            )
-        if isinstance(expected, list) and isinstance(actual, list):
-            return len(expected) == len(actual) and all(
-                Factory._compatibility_equal(left, right, tolerance)
-                for left, right in zip(expected, actual, strict=True)
-            )
-        if isinstance(expected, dict) and isinstance(actual, dict):
-            return expected.keys() == actual.keys() and all(
-                Factory._compatibility_equal(expected[key], actual[key], tolerance)
-                for key in expected
-            )
-        return bool(expected == actual)
-
-    def _evaluate_model_compatibility(
-        self,
-        run_id: str,
-        run_resource: dict[str, Any],
-        run_result: dict[str, Any],
-        model_package: dict[str, Any],
-    ) -> tuple[bool, list[dict[str, Any]], int]:
-        package_spec = model_package["spec"]
-        adapter = package_spec["adapters"]["inferenceReference"]
-        admission = run_resource["spec"]["extensions"]
-        try:
-            adapter_admission = admission["inferenceAdapter"]
-            source_digest = adapter_admission["sourceDigest"]
-            state = run_result["spec"]["outputs"][adapter["stateOutput"]]
-        except (KeyError, TypeError) as exc:
-            raise IntegrityError(
-                "model package adapter does not match admitted run outputs"
-            ) from exc
-        binding = self._resource_by_uri("Binding", run_resource["spec"]["bindingRef"])
-        resolved = self._resolve_executor(
-            str(binding["spec"]["executor"]), binding, self._executor_config(binding)
-        )
-        self._require_executor(resolved, MODULE_EXECUTION_CAPABILITIES)
-        source_manifest = self.local_store.read_manifest(source_digest)
-        if not ArtifactBuilder(self.local_store).verify(source_manifest):
-            raise IntegrityError("admitted compatibility adapter source failed verification")
-        if source_manifest.digest != adapter_admission.get("packageDigest"):
-            raise IntegrityError("compatibility adapter source differs from run admission")
-        self.lineage.add(
-            LineageEdge(
-                f"artifact:{source_digest}",
-                f"run:{run_id}/compatibility",
-                "used",
-                "entity",
-                "activity",
-                run_id=run_id,
-            )
-        )
-        failures: list[dict[str, Any]] = []
-        vectors = package_spec["compatibilityVectors"]
-        with tempfile.TemporaryDirectory(dir=self.paths.packages) as temporary_name:
-            temporary = Path(temporary_name)
-            archive = temporary / "archive"
-            ArtifactBuilder(self.local_store).restore(source_manifest, archive)
-            code_root = extract_module_package(archive / "payload", temporary / "source")
-            manifest, code_root = load_manifest(code_root / "module.yaml", code_root)
-            environment = self._prepare_module_environment(resolved.executor, manifest, code_root)
-            if environment["digest"] != adapter_admission["environment"]["digest"]:
-                raise IntegrityError("compatibility adapter environment differs from run admission")
-            signatures = package_spec["signatures"]
-            validate_contract(signatures["state"], state, "model package state")
-            for index, vector in enumerate(vectors):
-                validate_contract(signatures["input"], vector["inputs"], "model package input")
-                request = ProtocolRequest.model_validate(
-                    {
-                        "operation": adapter["operation"],
-                        "inputs": vector["inputs"],
-                        "state": state,
-                        "config": adapter["config"],
-                        "context": {
-                            "runId": run_id,
-                            "compatibilityVector": vector["name"],
-                            "inference": {
-                                "method": vector["method"],
-                                "seed": vector.get("seed"),
-                            },
-                        },
-                    }
-                )
-                result = self._execute_module(
-                    manifest,
-                    code_root,
-                    request,
-                    self.paths.runs / run_id / "evaluations" / "compatibility" / str(index),
-                    executor=resolved.executor,
-                    executor_config=resolved.config,
-                    environment=environment,
-                )
-                validate_contract(signatures["output"], result.outputs, "model package output")
-                for output, expected in vector["expected"].items():
-                    if output not in result.outputs or not self._compatibility_equal(
-                        expected,
-                        result.outputs.get(output),
-                        vector.get("tolerances", {}).get(output, {}),
-                    ):
-                        failures.append(
-                            {"kind": "compatibility", "vector": vector["name"], "output": output}
-                        )
-        return not failures, failures, len(vectors)
-
     def evaluate(self, subject: str) -> dict[str, Any]:
-        run_id = subject.removeprefix("run/")
-        run_status = self.run_status(run_id)
-        run_resource = self._run_resource(run_id)
-        run_result = self._run_result(run_id, run_status["status"])
-        outputs = run_result["spec"]["outputs"]
-        passing = {
-            key: value
-            for key, value in outputs.items()
-            if key.lower().endswith((".passed", ".pass")) and isinstance(value, bool)
-        }
-        failures = []
-        if run_status["status"].get("state") != "Succeeded":
-            failures.append({"kind": "run", "message": "source run did not succeed"})
-        if not passing:
-            failures.append({"kind": "protocol", "message": "no evaluator pass result found"})
-        metric_scores: dict[str, Any] = {}
-        for reference in run_resource["spec"]["extensions"].get("evaluationRefs", []):
-            suite = self._resource_by_uri("EvaluationSpec", reference)
-            for metric in suite["spec"]["metrics"]:
-                value = outputs.get(metric["output"])
-                metric_scores[metric["name"]] = value
-                if isinstance(value, (bool, int, float)):
-                    numeric = float(value)
-                else:
-                    failures.append(
-                        {"kind": "metric", "metric": metric["name"], "message": "missing value"}
-                    )
-                    continue
-                if "minimum" in metric and numeric < float(metric["minimum"]):
-                    failures.append({"kind": "threshold", "metric": metric["name"]})
-                if "maximum" in metric and numeric > float(metric["maximum"]):
-                    failures.append({"kind": "threshold", "metric": metric["name"]})
-        model_package_ref = run_resource["spec"]["extensions"].get("modelPackageRef")
-        if model_package_ref:
-            model_package = self._resource_by_uri("ModelPackage", model_package_ref)
-            compatibility_passed, compatibility_failures, vector_count = (
-                self._evaluate_model_compatibility(run_id, run_resource, run_result, model_package)
-            )
-            failures.extend(compatibility_failures)
-        else:
-            explicit = {
-                key: value
-                for key, value in outputs.items()
-                if key.lower().endswith((".compatibilitypassed", ".compatibility_passed"))
-                and isinstance(value, bool)
-            }
-            compatibility_passed = bool(explicit) and all(explicit.values())
-            vector_count = 0
-            if not compatibility_passed:
-                failures.append(
-                    {"kind": "compatibility", "message": "no model compatibility evidence found"}
-                )
-        passed = not failures and all(passing.values()) and compatibility_passed
-        resource = self.apply_resource(
-            {
-                "apiVersion": "omf.dev/v1alpha1",
-                "kind": "EvaluationResult",
-                "metadata": {
-                    "name": f"evaluation-{run_id}",
-                    "namespace": self.namespace,
-                },
-                "spec": {
-                    "evaluationRef": f"run/{run_id}",
-                    "scores": {
-                        **passing,
-                        **metric_scores,
-                        "compatibilityPassed": compatibility_passed,
-                        "passed": passed,
-                    },
-                    "provenance": {
-                        "runId": run_id,
-                        "runRef": self._resource_uri(run_resource),
-                        "runResultRef": self._resource_uri(run_result),
-                        "runStatusVersion": run_status["statusVersion"],
-                    },
-                    "uncertainty": {},
-                    "failures": failures,
-                    "extensions": {
-                        "passed": passed,
-                        "compatibilityPassed": compatibility_passed,
-                        "compatibilityVectors": vector_count,
-                        "evaluationRefs": run_resource["spec"]["extensions"].get(
-                            "evaluationRefs", []
-                        ),
-                        "modelPackageRef": model_package_ref,
-                        "runId": run_id,
-                    },
-                },
-            },
-            _system=True,
-        )
-        metadata = resource["metadata"]
-        self.events.append(
-            type="EvaluationCompleted",
-            source=f"omf://{self.namespace}",
-            subject=f"run/{run_id}",
-            resource_uid=metadata["uid"],
-            revision=metadata["revision"],
-            actor=self.actor,
-            run_id=run_id,
-            data={"passed": passed, "failures": len(failures)},
-            dataschema="https://schemas.omf.dev/events/evaluation-completed/v1",
-        )
-        self.lineage.add(
-            LineageEdge(
-                f"run:{run_id}",
-                self._resource_uri(resource),
-                "generated",
-                "activity",
-                "entity",
-                run_id=run_id,
-            )
-        )
-        return resource
+        return self.evaluation.evaluate(subject)
 
     def create_release(
         self,
@@ -2853,126 +2631,17 @@ class Factory:
         vulnerability_report: str | Path | None = None,
         evaluation_ref: str | None = None,
     ) -> dict[str, Any]:
-        self._authorize("release.create")
-        if promote:
-            self._authorize("release.promote")
-        run_id = run_id.removeprefix("run/")
-        run = self.run_status(run_id)
-        status = run["status"]
-        if status.get("state") != "Succeeded":
-            raise ValidationError("only a succeeded run can produce a release")
-        run_resource = self._run_resource(run_id)
-        run_result = self._run_result(run_id, status)
-        model_package_ref = run_resource["spec"]["extensions"].get("modelPackageRef")
-        evaluation = self._release_evaluation(
-            run_id, run_resource, run_result, model_package_ref, evaluation_ref
-        )
-        artifact_digests, model_digest, state_digest = self._release_artifacts(run_result)
-        admission = run_resource["spec"]["extensions"]
-        source_digests = self._release_sources(run_resource, model_package_ref)
-        release_artifacts = sorted({*artifact_digests, *source_digests.values()})
-        required_scan_subjects = {model_digest, *source_digests.values()}
-        vulnerability_summary, vulnerability_artifact, vulnerabilities_valid = (
-            self._load_vulnerability_report(vulnerability_report, required_scan_subjects)
-        )
-        datasets = self._release_datasets(admission)
-        rights_valid = all(
-            self._training_rights_valid(item) and self._current_training_rights_valid(item)
-            for item in datasets
-        )
-        approval_list = approvals or []
-        compatibility_passed = bool(evaluation["spec"]["extensions"].get("compatibilityPassed"))
-        evidence = {
-            "evaluation_passed": True,
-            "lineage_complete": bool(self.lineage.by_run(run_id)),
-            "rights_valid": rights_valid,
-            "signatures_valid": self._signing_identity_valid(),
-            "compatibility_passed": compatibility_passed,
-            "vulnerabilities_valid": vulnerabilities_valid,
-            "approvals_valid": bool(approval_list),
-            "separation_of_duties": any(actor != self.actor for actor in approval_list),
-        }
-        decision = promotion_gate(evidence, actor=self.actor)
-        if promote and decision.outcome == "deny":
-            raise IntegrityError(f"promotion denied by gates: {_denied_rules(decision)}")
-        manifest = {
-            "model": {"digest": model_digest},
-            "modelPackage": {"ref": model_package_ref},
-            "state": {"digest": state_digest},
-            "runtime": {"name": "omf.module/v1", "sources": source_digests},
-            "workload": {"runId": run_id},
-            "binding": {"digest": admission["bindingDigest"]},
-            "dataSummary": [
-                {
-                    "name": item["metadata"]["name"],
-                    "revision": item["metadata"]["revision"],
-                    "rights": item["spec"].get("rights", {}),
-                }
-                for item in datasets
-            ],
-            "evaluations": [evaluation["metadata"]["revision"]],
-            "limitations": limitations or [],
-            "risk": {"promotionDecision": asdict(decision)},
-            "intendedUse": intended_use,
-            "prohibitedUse": ["uses not authorized by data and release policy"],
-            "compatibility": {
-                "moduleProtocol": "omf.module/v1",
-                "passed": compatibility_passed,
-                "evaluationRevision": evaluation["metadata"]["revision"],
-                "vectors": evaluation["spec"]["extensions"].get("compatibilityVectors", 0),
-            },
-            "sbom": self._release_sbom(run_id, source_digests),
-            "provenance": {"runId": run_id, "lineageComplete": evidence["lineage_complete"]},
-            "vulnerabilities": vulnerability_summary,
-            "deployment": {"compatible": ["batch", "service", "actor", "edge", "control"]},
-            "rollback": {"compatible": True},
-            "licenses": [item["spec"].get("rights", {}) for item in datasets],
-        }
-        signed = ReleaseBuilder(self.identity).build(manifest)
-        verify_release(signed, self.identity.public_bytes)
-        resource = self.apply_resource(
-            {
-                "apiVersion": "omf.dev/v1alpha1",
-                "kind": "Release",
-                "metadata": {"name": name, "namespace": self.namespace},
-                "spec": {
-                    "artifacts": release_artifacts,
-                    "evidence": [
-                        evaluation["metadata"]["revision"],
-                        *([vulnerability_artifact] if vulnerability_artifact else []),
-                    ],
-                    "signatures": [signed.signature],
-                    "extensions": {
-                        "manifest": signed.manifest,
-                        "digest": signed.digest,
-                        "keyId": signed.key_id,
-                        "promotionDecision": asdict(decision),
-                    },
-                },
-            },
-            _system=True,
-        )
-        metadata = resource["metadata"]
-        self._record_release_lineage(
-            resource,
+        return self.publishing.create_release(
             run_id,
-            [*release_artifacts, *filter(None, [vulnerability_artifact])],
-            evaluation,
+            name=name,
+            intended_use=intended_use,
+            limitations=limitations,
+            promote=promote,
+            alias=alias,
+            approvals=approvals,
+            vulnerability_report=vulnerability_report,
+            evaluation_ref=evaluation_ref,
         )
-        if promote:
-            self._promote_release(metadata, alias, datasets, evidence)
-        self.events.append(
-            type="ReleasePublished",
-            source=f"omf://{self.namespace}",
-            subject=f"Release/{name}",
-            resource_uid=metadata["uid"],
-            revision=metadata["revision"],
-            actor=self.actor,
-            run_id=run_id,
-            data={"releaseDigest": signed.digest, "promoted": promote},
-            dataschema="https://schemas.omf.dev/events/release-published/v1",
-        )
-        return resource
 
     def create_experiment(
         self,
@@ -2983,231 +2652,16 @@ class Factory:
         metric: str,
         direction: str,
     ) -> dict[str, Any]:
-        if direction not in {"maximize", "minimize"}:
-            raise ValidationError("experiment direction must be maximize or minimize")
-        baseline = self._evaluation_result(baseline_ref)
-        candidate = self._evaluation_result(candidate_ref)
-        baseline_evaluations = baseline["spec"].get("extensions", {}).get("evaluationRefs", [])
-        candidate_evaluations = candidate["spec"].get("extensions", {}).get("evaluationRefs", [])
-        if baseline_evaluations != candidate_evaluations:
-            raise ValidationError("experiment subjects use different evaluation revisions")
-        try:
-            baseline_score = baseline["spec"]["scores"][metric]
-            candidate_score = candidate["spec"]["scores"][metric]
-        except KeyError as exc:
-            raise ValidationError("experiment metric is missing or non-numeric") from exc
-        if (
-            not isinstance(baseline_score, (int, float))
-            or isinstance(baseline_score, bool)
-            or not math.isfinite(float(baseline_score))
-            or not isinstance(candidate_score, (int, float))
-            or isinstance(candidate_score, bool)
-            or not math.isfinite(float(candidate_score))
-        ):
-            raise ValidationError("experiment metric is missing or non-numeric")
-        baseline_value = float(baseline_score)
-        candidate_value = float(candidate_score)
-        delta = candidate_value - baseline_value
-        decision = (
-            "tie"
-            if delta == 0
-            else "candidate"
-            if (delta > 0) == (direction == "maximize")
-            else "baseline"
+        return self.evaluation.create_experiment(
+            name=name,
+            baseline_ref=baseline_ref,
+            candidate_ref=candidate_ref,
+            metric=metric,
+            direction=direction,
         )
-        return self.apply_resource(
-            {
-                "apiVersion": "omf.dev/v1alpha1",
-                "kind": "Experiment",
-                "metadata": {"name": name, "namespace": self.namespace},
-                "spec": {
-                    "baselineRef": self._resource_uri(baseline),
-                    "candidateRef": self._resource_uri(candidate),
-                    "evaluationRefs": baseline_evaluations,
-                    "metric": metric,
-                    "direction": direction,
-                    "decision": decision,
-                    "delta": delta,
-                    "extensions": {},
-                },
-            },
-            _system=True,
-        )
-
-    def _release_evaluation(
-        self,
-        run_id: str,
-        run_resource: dict[str, Any],
-        run_result: dict[str, Any],
-        model_package_ref: str | None,
-        evaluation_ref: str | None,
-    ) -> dict[str, Any]:
-        evaluations = [
-            item
-            for item in self.resources.list(kind="EvaluationResult")
-            if item["spec"].get("evaluationRef") == f"run/{run_id}"
-            and item["spec"].get("provenance", {}).get("runId") == run_id
-            and item["spec"].get("provenance", {}).get("runRef") == self._resource_uri(run_resource)
-            and item["spec"].get("provenance", {}).get("runResultRef")
-            == self._resource_uri(run_result)
-            and item["spec"].get("extensions", {}).get("runId") == run_id
-            and item["spec"].get("extensions", {}).get("modelPackageRef") == model_package_ref
-            and item["spec"].get("extensions", {}).get("evaluationRefs")
-            == run_resource["spec"]["extensions"].get("evaluationRefs", [])
-        ]
-        if not evaluations:
-            raise ValidationError("evaluate the run before creating a release")
-        if evaluation_ref is not None:
-            evaluations = [
-                item
-                for item in evaluations
-                if evaluation_ref in {item["metadata"]["revision"], self._resource_uri(item)}
-            ]
-            if not evaluations:
-                raise ValidationError("requested evaluation revision is not eligible for this run")
-        if len(evaluations) != 1:
-            raise ValidationError("multiple evaluations exist; select an exact evaluation revision")
-        evaluation = evaluations[0]
-        if not evaluation["spec"]["extensions"]["passed"]:
-            raise ValidationError("a failing evaluation cannot produce a release")
-        return evaluation
-
-    def _release_datasets(self, admission: dict[str, Any]) -> list[dict[str, Any]]:
-        admitted_inputs = admission.get("admittedInputs", {})
-        if not isinstance(admitted_inputs, dict):
-            raise IntegrityError("run has invalid admitted dataset references")
-        return [
-            self._resource_by_uri("DatasetSnapshot", str(reference))
-            for reference in admitted_inputs.values()
-        ]
-
-    def _record_release_lineage(
-        self,
-        resource: dict[str, Any],
-        run_id: str,
-        artifacts: list[str],
-        evaluation: dict[str, Any],
-    ) -> None:
-        release_uri = self._resource_uri(resource)
-        self.lineage.add(
-            LineageEdge(
-                f"run:{run_id}", release_uri, "generated", "activity", "entity", run_id=run_id
-            )
-        )
-        for source in [
-            *(f"artifact:{digest}" for digest in artifacts),
-            self._resource_uri(evaluation),
-        ]:
-            self.lineage.add(
-                LineageEdge(
-                    source, release_uri, "wasDerivedFrom", "entity", "entity", run_id=run_id
-                )
-            )
-
-    def _promote_release(
-        self,
-        metadata: dict[str, Any],
-        alias: str,
-        datasets: list[dict[str, Any]],
-        evidence: dict[str, Any],
-    ) -> None:
-        with self._dataset_rights_locks(datasets):
-            current_rights = all(
-                self._training_rights_valid(item) and self._current_training_rights_valid(item)
-                for item in datasets
-            )
-            decision = promotion_gate(
-                {**evidence, "rights_valid": current_rights}, actor=self.actor
-            )
-            if decision.outcome == "deny":
-                raise IntegrityError(f"promotion denied by gates: {_denied_rules(decision)}")
-            try:
-                current_alias_version: int | None = AliasRepository(self.db).get(alias)[2]
-            except NotFoundError:
-                current_alias_version = None
-            promote_alias(
-                self.db,
-                self.events,
-                name=alias,
-                uid=metadata["uid"],
-                revision=metadata["revision"],
-                expected_version=current_alias_version,
-                actor=self.actor,
-                policy_decision=decision,
-            )
-
-    def _release_artifacts(self, run_result: dict[str, Any]) -> tuple[list[str], str, str]:
-        artifacts = [
-            (output_name, value, self.local_store.read_manifest(value))
-            for output_name, value in run_result["spec"]["outputs"].items()
-            if isinstance(value, str) and value.startswith("sha256:")
-        ]
-        artifact_digests = sorted({digest for _name, digest, _manifest in artifacts})
-        if not artifact_digests:
-            raise ValidationError("a release requires at least one model or output artifact")
-        model_candidates = sorted(
-            {
-                digest
-                for output_name, digest, artifact in artifacts
-                if artifact.logical_kind in {"model", "model-package", "weights"}
-                or output_name.lower().endswith((".model", ".modelpackage", ".weights"))
-            }
-        )
-        if len(model_candidates) != 1:
-            raise ValidationError(
-                "a release requires exactly one aggregate model artifact with role model, "
-                "model-package, or weights"
-            )
-        state_candidates = sorted(
-            {
-                digest
-                for output_name, digest, artifact in artifacts
-                if artifact.logical_kind in {"checkpoint", "model-state", "state"}
-                or output_name.lower().endswith((".checkpoint", ".state"))
-            }
-        )
-        if len(state_candidates) > 1:
-            raise ValidationError("a release may reference only one aggregate state artifact")
-        return artifact_digests, model_candidates[0], (state_candidates or model_candidates)[0]
-
-    @staticmethod
-    def _release_sources(
-        run_resource: dict[str, Any], model_package_ref: str | None
-    ) -> dict[str, str]:
-        admission = run_resource["spec"]["extensions"]
-        source_digests: dict[str, str] = dict(admission["moduleDigests"])
-        if model_package_ref is not None:
-            inference_admission = admission.get("inferenceAdapter")
-            if not isinstance(inference_admission, dict) or not isinstance(
-                inference_admission.get("sourceDigest"), str
-            ):
-                raise IntegrityError(
-                    "legacy model compatibility evidence is ineligible for release; run again "
-                    "with an independently admitted inference adapter"
-                )
-            source_digests["inference"] = inference_admission["sourceDigest"]
-        return source_digests
 
     def release_evidence(self, run_id: str) -> dict[str, Any]:
-        run_id = run_id.removeprefix("run/")
-        status = self.run_status(run_id)["status"]
-        if status.get("state") != "Succeeded":
-            raise ValidationError("only a succeeded run can produce release evidence")
-        run_resource = self._run_resource(run_id)
-        _artifacts, model_digest, _state_digest = self._release_artifacts(
-            self._run_result(run_id, status)
-        )
-        sources = self._release_sources(
-            run_resource, run_resource["spec"]["extensions"].get("modelPackageRef")
-        )
-        return {
-            "scanner": {"name": "", "version": ""},
-            "databaseRevision": "",
-            "generatedAt": _utc_now(),
-            "subjects": sorted({model_digest, *sources.values()}),
-            "findings": [],
-            "waivers": [],
-        }
+        return self.publishing.release_evidence(run_id)
 
     def _evaluation_result(self, reference: str) -> dict[str, Any]:
         if reference.startswith("omf://"):
@@ -3216,443 +2670,17 @@ class Factory:
             return self.find_resource("EvaluationResult", f"evaluation-{reference[4:]}")
         return self.find_resource("EvaluationResult", reference)
 
-    def _load_vulnerability_report(
-        self, report_path: str | Path | None, required_subjects: set[str]
-    ) -> tuple[dict[str, Any], str | None, bool]:
-        if report_path is None:
-            return {"status": "not-scanned", "gate": "deny-promotion"}, None, False
-        path = Path(report_path)
-        report = load_document(path.read_bytes())
-        if not isinstance(report, dict):
-            raise ValidationError("vulnerability report must be an object")
-        for field, kind in {
-            "scanner": dict,
-            "databaseRevision": str,
-            "generatedAt": str,
-            "subjects": list,
-            "findings": list,
-            "waivers": list,
-        }.items():
-            if not isinstance(report.get(field), kind):
-                raise ValidationError(f"vulnerability report requires {field}")
-        generated = datetime.fromisoformat(str(report["generatedAt"]).replace("Z", "+00:00"))
-        if generated.tzinfo is None or generated.utcoffset() is None:
-            raise ValidationError("vulnerability report time must include a timezone")
-        covered = {str(item) for item in report["subjects"]}
-        missing = sorted(required_subjects - covered)
-        waived = {str(item) for item in report["waivers"]}
-        blocking: list[str] = []
-        for finding in report["findings"]:
-            if not isinstance(finding, dict):
-                raise ValidationError("vulnerability findings must be objects")
-            identifier = str(finding.get("id", ""))
-            severity = str(finding.get("severity", "unknown")).lower()
-            status = str(finding.get("status", "open")).lower()
-            if severity in {"critical", "high"} and status != "fixed" and identifier not in waived:
-                blocking.append(identifier or "unnamed-finding")
-        passed = bool(report["databaseRevision"]) and not missing and not blocking
-        artifact = ArtifactBuilder(self.local_store).import_path(
-            path,
-            logical_kind="vulnerability-report",
-            provenance={
-                "scanner": report["scanner"],
-                "databaseRevision": report["databaseRevision"],
-            },
-        )
-        return (
-            {
-                "status": "passed" if passed else "failed",
-                "scanner": report["scanner"],
-                "databaseRevision": report["databaseRevision"],
-                "generatedAt": report["generatedAt"],
-                "reportArtifact": artifact.manifest_digest,
-                "missingSubjects": missing,
-                "blockingFindings": sorted(blocking),
-            },
-            artifact.manifest_digest,
-            passed,
-        )
-
-    def _release_sbom(self, run_id: str, modules: dict[str, str]) -> dict[str, Any]:
-        lock = self.paths.root / "requirements.runtime.lock"
-        dependencies: list[tuple[str, str]] = []
-        if lock.exists():
-            for line in lock.read_text().splitlines():
-                match = re.match(r"^([A-Za-z0-9_.-]+)==([^ \\]+)", line)
-                if match:
-                    dependencies.append((match.group(1), match.group(2)))
-        packages = [
-            {
-                "name": name,
-                "SPDXID": f"SPDXRef-Package-{index}",
-                "versionInfo": version,
-                "downloadLocation": "NOASSERTION",
-                "filesAnalyzed": False,
-                "licenseConcluded": "NOASSERTION",
-                "copyrightText": "NOASSERTION",
-            }
-            for index, (name, version) in enumerate(dependencies)
-        ]
-        packages.extend(
-            {
-                "name": f"omf-module-{name}",
-                "SPDXID": f"SPDXRef-Module-{index}",
-                "versionInfo": digest,
-                "downloadLocation": "NOASSERTION",
-                "filesAnalyzed": False,
-                "licenseConcluded": "NOASSERTION",
-                "copyrightText": "NOASSERTION",
-                "externalRefs": [
-                    {
-                        "referenceCategory": "OTHER",
-                        "referenceType": "omf-artifact",
-                        "referenceLocator": digest,
-                    }
-                ],
-            }
-            for index, (name, digest) in enumerate(sorted(modules.items()))
-        )
-        namespace_digest = sha256_digest({"runId": run_id, "packages": packages}).removeprefix(
-            "sha256:"
-        )
-        return {
-            "spdxVersion": "SPDX-2.3",
-            "dataLicense": "CC0-1.0",
-            "SPDXID": "SPDXRef-DOCUMENT",
-            "name": f"omf-release-{run_id}",
-            "documentNamespace": f"https://omf.dev/spdx/{namespace_digest}",
-            "creationInfo": {
-                "created": _utc_now(),
-                "creators": [f"Tool: Open Model Factory {__version__}"],
-            },
-            "packages": packages,
-        }
-
-    def _signing_identity_valid(self) -> bool:
-        probe = {"purpose": "release-gate", "time": _utc_now()}
-        try:
-            self.identity.verify(probe, self.identity.sign(probe))
-        except IntegrityError:
-            return False
-        return True
-
     def deploy(self, deployment_path: str | Path) -> dict[str, Any]:
-        self._authorize("deployment.apply")
-        raw = self._load_resource(deployment_path, kind="DeploymentSpec")
-        release_name = str(raw["spec"]["releaseRef"]).removeprefix("release/")
-        release = self.find_resource("Release", release_name)
-        release_extensions = release["spec"].get("extensions", {})
-        signatures = release["spec"].get("signatures", [])
-        if len(signatures) != 1 or release_extensions.get("keyId") != self.identity.key_id:
-            raise IntegrityError("deployment release signing identity mismatch")
-        verify_release(
-            Release(
-                manifest=release_extensions.get("manifest", {}),
-                digest=str(release_extensions.get("digest", "")),
-                key_id=str(release_extensions.get("keyId", "")),
-                signature=str(signatures[0]),
-            ),
-            self.identity.public_bytes,
-        )
-        if release_extensions.get("promotionDecision", {}).get("outcome") != "allow":
-            raise IntegrityError("deployment release has no passing promotion policy decision")
-        extension = raw["spec"].get("extensions", {})
-        form = extension.get("form", "service")
-        command = extension.get("command")
-        if form not in {"edge", "service"} and not command:
-            raise ValidationError(f"{form} deployments require extensions.command argv")
-        if command:
-            resolved = self._deployment_executor(raw)
-            required = DEPLOYMENT_PROTOCOL_CAPABILITIES
-            if bool(extension.get("denyNetwork", False)):
-                required |= frozenset({"isolation:network-deny"})
-            self._require_executor(resolved, required)
-        name = str(raw["metadata"]["name"])
-        desired_revision = default_registry.normalize(raw, actor=self.actor)["metadata"]["revision"]
-        expected_version: int | None = None
-        previous_status: dict[str, Any] | None = None
-        try:
-            existing = self.find_resource("DeploymentSpec", name)
-            previous_status, expected_version = self.resources.get_status(
-                existing["metadata"]["uid"]
-            )
-            if previous_status.get("deploymentRevision") == desired_revision:
-                current = self.deployment_status(name)
-                return {
-                    "deployment": current["deployment"],
-                    "state": current["status"]["state"],
-                    "executionId": current["status"].get("executionId"),
-                }
-            if previous_status.get("state") == "running":
-                canceled = self.cancel_deployment(name)
-                previous_status = canceled["status"]
-                expected_version = int(canceled["statusVersion"])
-        except NotFoundError:
-            pass
-        resource = self.apply_resource(raw)
-        state, execution_id, run_dir, executor_name, endpoint = self._launch_deployment(resource)
-        self.resources.set_status(
-            resource["metadata"]["uid"],
-            {
-                "state": state,
-                "releaseRevision": release["metadata"]["revision"],
-                "deploymentRevision": resource["metadata"]["revision"],
-                "previousDeploymentRevision": (
-                    previous_status.get("deploymentRevision") if previous_status else None
-                ),
-                "executionId": execution_id,
-                "executor": executor_name,
-                "runDirectory": str(run_dir) if run_dir else None,
-                "endpoint": endpoint,
-            },
-            expected_version=expected_version,
-        )
-        self.lineage.add(
-            LineageEdge(
-                self._resource_uri(release),
-                self._resource_uri(resource),
-                "wasDerivedFrom",
-                "entity",
-                "entity",
-            )
-        )
-        self.events.append(
-            type="DeploymentChanged",
-            source=f"omf://{self.namespace}",
-            subject=f"Deployment/{resource['metadata']['name']}",
-            resource_uid=resource["metadata"]["uid"],
-            revision=resource["metadata"]["revision"],
-            actor=self.actor,
-            data={"state": state, "release": release["metadata"]["revision"]},
-            dataschema="https://schemas.omf.dev/events/deployment-changed/v1",
-        )
-        return {"deployment": resource, "state": state, "executionId": execution_id}
-
-    def _attach_deployment(
-        self, resource: dict[str, Any], status: dict[str, Any], execution_id: str
-    ) -> Executor:
-        resolved = self._deployment_executor(resource)
-        if str(status.get("executor", resolved.provider.name)) != resolved.provider.name:
-            raise IntegrityError("deployment executor does not match its immutable revision")
-        default_dir = self.paths.runs / "deployments" / resource["metadata"]["uid"]
-        resolved.executor.attach(execution_id, Path(str(status.get("runDirectory") or default_dir)))
-        return resolved.executor
-
-    def _deployment_executor(self, resource: dict[str, Any]) -> ResolvedExecutor:
-        extension = resource["spec"].get("extensions", {})
-        name = str(extension.get("executor", "local"))
-        config = extension.get("executorConfig", {})
-        if not isinstance(config, dict):
-            raise ValidationError("deployment extensions.executorConfig must be an object")
-        return self._resolve_executor(name, resource, config)
-
-    def _prepare_serving(self, resource: dict[str, Any], run_dir: Path) -> tuple[list[str], str]:
-        extension = resource["spec"].get("extensions", {})
-        release_name = str(resource["spec"]["releaseRef"]).removeprefix("release/")
-        release = self.find_resource("Release", release_name)
-        manifest = release["spec"].get("extensions", {}).get("manifest", {})
-        package_ref = manifest.get("modelPackage", {}).get("ref")
-        adapter_digest = manifest.get("runtime", {}).get("sources", {}).get("inference")
-        run_id = manifest.get("workload", {}).get("runId")
-        if not isinstance(package_ref, str) or not isinstance(adapter_digest, str):
-            raise ValidationError(
-                "a service deployment without a command requires a release built from a model "
-                "package with an admitted inference adapter"
-            )
-        model_package = self._resource_by_uri("ModelPackage", package_ref)
-        adapter = model_package["spec"]["adapters"]["inferenceReference"]
-        signatures = model_package["spec"]["signatures"]
-        run_resource = self._run_resource(str(run_id))
-        run_result = self._run_result(str(run_id), self.run_status(str(run_id))["status"])
-        try:
-            state = run_result["spec"]["outputs"][adapter["stateOutput"]]
-            admission = run_resource["spec"]["extensions"]["inferenceAdapter"]
-            admitted_environment = str(admission["environment"]["digest"])
-        except (KeyError, TypeError) as exc:
-            raise IntegrityError("release run has no admitted inference adapter state") from exc
-        validate_contract(signatures["state"], state, "model package state")
-        source_manifest = self.local_store.read_manifest(adapter_digest)
-        builder = ArtifactBuilder(self.local_store)
-        if not builder.verify(source_manifest):
-            raise IntegrityError("admitted serving adapter source failed verification")
-        run_dir.mkdir(parents=True, exist_ok=True)
-        archive = run_dir / "adapter-archive"
-        builder.restore(source_manifest, archive)
-        code_root = extract_module_package(archive / "payload", run_dir / "adapter")
-        adapter_manifest, code_root = load_manifest(code_root / "module.yaml", code_root)
-        resolved = self._deployment_executor(resource)
-        self._require_executor(resolved, MODULE_EXECUTION_CAPABILITIES)
-        environment = self._prepare_module_environment(
-            resolved.executor, adapter_manifest, code_root
-        )
-        if environment["digest"] != admitted_environment:
-            raise IntegrityError("serving adapter environment differs from run admission")
-        host = str(extension.get("host", "127.0.0.1"))
-        port = extension.get("port", 8090)
-        if not isinstance(port, int) or isinstance(port, bool) or not 1 <= port <= 65535:
-            raise ValidationError("deployment extensions.port must be an integer port number")
-        timeout = extension.get("requestTimeoutSeconds", 60)
-        if not isinstance(timeout, (int, float)) or isinstance(timeout, bool) or timeout <= 0:
-            raise ValidationError("deployment extensions.requestTimeoutSeconds must be positive")
-        serving = {
-            "deployment": resource["metadata"]["name"],
-            "release": release["metadata"]["revision"],
-            "modelPackageRef": package_ref,
-            "operation": adapter["operation"],
-            "method": "predict",
-            "config": adapter.get("config", {}),
-            "state": state,
-            "signatures": {"input": signatures["input"], "output": signatures["output"]},
-            "command": [str(item) for item in environment["command"]],
-            "wrapper": [str(item) for item in environment.get("wrapper", [])],
-            "cwd": str(code_root),
-            "host": host,
-            "port": port,
-            "timeoutSeconds": float(timeout),
-        }
-        config_path = run_dir / "serving.json"
-        config_path.write_bytes(canonical_json(serving))
-        return (
-            [sys.executable, "-m", "omf.serve_worker", "--config", str(config_path)],
-            f"http://{host}:{port}",
-        )
-
-    def _launch_deployment(
-        self, resource: dict[str, Any], *, instance: str | None = None
-    ) -> tuple[str, str | None, Path | None, str | None, str | None]:
-        extension = resource["spec"].get("extensions", {})
-        command = extension.get("command")
-        run_dir = (
-            self.paths.runs
-            / "deployments"
-            / resource["metadata"]["uid"]
-            / resource["metadata"]["revision"]
-        )
-        if instance:
-            run_dir /= instance
-        endpoint: str | None = None
-        if not command and extension.get("form", "service") == "service":
-            command, endpoint = self._prepare_serving(resource, run_dir)
-        if not command:
-            return "packaged", None, None, None, None
-        if not isinstance(command, list) or not all(isinstance(item, str) for item in command):
-            raise ValidationError("deployment command must be an argv string array")
-        resolved = self._deployment_executor(resource)
-        required = DEPLOYMENT_PROTOCOL_CAPABILITIES
-        if bool(extension.get("denyNetwork", False)):
-            required |= frozenset({"isolation:network-deny"})
-        self._require_executor(resolved, required)
-        plan = resolved.executor.plan(
-            argv=command,
-            run_dir=run_dir,
-            cwd=self.paths.root,
-            resources=extension.get("resources", {}),
-            timeout=float(extension.get("timeoutSeconds", 0)) or None,
-            deny_network=bool(extension.get("denyNetwork", False)),
-            requires_result=False,
-            **resolved.config,
-        )
-        return "running", resolved.executor.submit(plan), run_dir, resolved.provider.name, endpoint
+        return self.deployments.deploy(deployment_path)
 
     def deployment_status(self, name: str) -> dict[str, Any]:
-        resource = self.find_resource("DeploymentSpec", name)
-        uid = resource["metadata"]["uid"]
-        status, version = self.resources.get_status(uid)
-        desired_revision = status.get("deploymentRevision")
-        if desired_revision and desired_revision != resource["metadata"]["revision"]:
-            resource = self.resources.get(uid, str(desired_revision))
-        execution_id = status.get("executionId")
-        if status.get("state") == "running" and execution_id:
-            executor = self._attach_deployment(resource, status, str(execution_id))
-            observed = executor.status(str(execution_id))
-            if observed.state != "running":
-                updated = {
-                    **status,
-                    "state": observed.state,
-                    "reason": observed.reason,
-                    "exitCode": observed.exit_code,
-                }
-                try:
-                    version = self.resources.set_status(uid, updated, expected_version=version)
-                    status = updated
-                    self._deployment_event(resource, status)
-                except ConflictError:
-                    status, version = self.resources.get_status(uid)
-        return {"deployment": resource, "status": status, "statusVersion": version}
+        return self.deployments.deployment_status(name)
 
     def cancel_deployment(self, name: str) -> dict[str, Any]:
-        self._authorize("deployment.cancel")
-        current = self.deployment_status(name)
-        resource = current["deployment"]
-        status = current["status"]
-        version = int(current["statusVersion"])
-        if status.get("state") != "running":
-            return current
-        execution_id = status.get("executionId")
-        if not execution_id:
-            raise IntegrityError("running deployment has no execution identity")
-        executor = self._attach_deployment(resource, status, str(execution_id))
-        executor.cancel(str(execution_id))
-        observed = executor.status(str(execution_id))
-        updated = {
-            **status,
-            "state": observed.state,
-            "reason": observed.reason,
-            "exitCode": observed.exit_code,
-        }
-        new_version = self.resources.set_status(
-            resource["metadata"]["uid"], updated, expected_version=version
-        )
-        self._deployment_event(resource, updated)
-        return {"deployment": resource, "status": updated, "statusVersion": new_version}
+        return self.deployments.cancel_deployment(name)
 
     def rollback_deployment(self, name: str, *, expected_version: int) -> dict[str, Any]:
-        self._authorize("deployment.rollback")
-        current = self.deployment_status(name)
-        if int(current["statusVersion"]) != expected_version:
-            raise ConflictError("deployment status version mismatch")
-        if current["status"].get("state") == "running":
-            current = self.cancel_deployment(name)
-            expected_version = int(current["statusVersion"])
-        resource = current["deployment"]
-        status = current["status"]
-        previous = status.get("previousDeploymentRevision")
-        if not previous:
-            raise ConflictError("deployment has no previous revision to roll back")
-        target = self.resources.get(resource["metadata"]["uid"], str(previous))
-        release_name = str(target["spec"]["releaseRef"]).removeprefix("release/")
-        release = self.find_resource("Release", release_name)
-        state, execution_id, run_dir, executor_name, endpoint = self._launch_deployment(
-            target, instance=f"rollback-{expected_version + 1}"
-        )
-        updated = {
-            "state": state,
-            "releaseRevision": release["metadata"]["revision"],
-            "deploymentRevision": target["metadata"]["revision"],
-            "previousDeploymentRevision": status["deploymentRevision"],
-            "executionId": execution_id,
-            "executor": executor_name,
-            "runDirectory": str(run_dir) if run_dir else None,
-            "endpoint": endpoint,
-            "reason": "rollback",
-        }
-        new_version = self.resources.set_status(
-            target["metadata"]["uid"], updated, expected_version=expected_version
-        )
-        self._deployment_event(target, updated)
-        return {"deployment": target, "status": updated, "statusVersion": new_version}
-
-    def _deployment_event(self, resource: dict[str, Any], status: dict[str, Any]) -> None:
-        self.events.append(
-            type="DeploymentChanged",
-            source=f"omf://{self.namespace}",
-            subject=f"Deployment/{resource['metadata']['name']}",
-            resource_uid=resource["metadata"]["uid"],
-            revision=resource["metadata"]["revision"],
-            actor=self.actor,
-            data={"state": status["state"], "release": status["releaseRevision"]},
-            dataschema="https://schemas.omf.dev/events/deployment-changed/v1",
-        )
+        return self.deployments.rollback_deployment(name, expected_version=expected_version)
 
     def lineage_query(
         self, subject: str, *, direction: str = "upstream", max_depth: int = 100

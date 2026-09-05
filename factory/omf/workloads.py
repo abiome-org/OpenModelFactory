@@ -11,7 +11,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 from pydantic import ValidationError as PydanticValidationError
 
 from omf.canonical import portable_relative_path, sha256_digest
-from omf.errors import IntegrityError, ValidationError
+from omf.errors import IntegrityError, OperationCanceled, ValidationError
 from omf.schema_registry import default_registry
 
 
@@ -259,6 +259,8 @@ class WorkloadRunner:
                 )
             try:
                 outputs = execute(stage)
+            except OperationCanceled:
+                raise
             except Exception:
                 value["stages"][name] = {"status": "failed", "attempt": 1}
                 self.store._write(value)

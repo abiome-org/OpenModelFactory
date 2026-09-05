@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import fcntl
 import hashlib
 import importlib.metadata
@@ -699,7 +700,8 @@ class LocalExecutor(Executor):
         if self._identity(record["pid"]) != record["identity"]:
             return
         completion = directory / "completion.json"
-        os.killpg(record["pid"], signal.SIGTERM)
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(record["pid"], signal.SIGTERM)
         deadline = time.monotonic() + 6.0
         while time.monotonic() < deadline:
             if completion.exists():
@@ -708,7 +710,8 @@ class LocalExecutor(Executor):
                 break
             time.sleep(0.05)
         if self._identity(record["pid"]) == record["identity"]:
-            os.killpg(record["pid"], signal.SIGKILL)
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(record["pid"], signal.SIGKILL)
         if not completion.exists():
             temporary = completion.with_suffix(".json.tmp")
             temporary.write_text(

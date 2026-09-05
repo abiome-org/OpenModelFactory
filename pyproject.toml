@@ -34,6 +34,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+tracking = ["mlflow-skinny>=3,<4", "sqlalchemy>=2,<3", "alembic>=1.13,<2"]
 s3 = ["boto3>=1.40,<2"]
 telemetry = [
   "opentelemetry-api>=1.36,<2",
@@ -67,6 +68,9 @@ packages = ["factory/omf"]
 [tool.hatch.build.targets.sdist]
 include = [
   "/AGENTS.md",
+  "/CONTRIBUTING.md",
+  "/Makefile",
+  "/tools/bootstrap.py",
   "/CHANGELOG.md",
   "/bindings",
   "/data/fixtures",
@@ -74,13 +78,13 @@ include = [
   "/factory",
   "/docs",
   "/evaluations",
+  "/examples",
   "/install.sh",
   "/model-packages",
   "/modules/examples",
   "/omf.yaml",
   "/policies",
   "/README.md",
-  "/ROADMAP.md",
   "/requirements.build.in",
   "/requirements.build.lock",
   "/requirements.lock",

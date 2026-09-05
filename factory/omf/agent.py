@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
+from omf.actions import ACTION_BY_NAME, capability_catalog
 from omf.canonical import canonical_json, sha256_digest
 from omf.errors import CapabilityError, ConflictError, NotFoundError, ValidationError
 from omf.lineage import LineageEdge
@@ -34,730 +34,6 @@ def _instant(value: datetime | None = None) -> datetime:
     if instant.tzinfo is None or instant.utcoffset() is None:
         raise ValidationError("context time must include a timezone")
     return instant.astimezone(UTC)
-
-
-@dataclass(frozen=True)
-class ActionDefinition:
-    action: str
-    description: str
-    command: str
-    method: str | None
-    path: str | None
-    scope: str
-    mutates: bool
-    plan_supported: bool
-    idempotency: str
-    risk: str
-    cost_class: str
-    preconditions: tuple[str, ...]
-    effects: tuple[str, ...]
-    approval_required: bool = False
-    destructive: bool = False
-
-    def as_dict(self) -> dict[str, Any]:
-        interfaces: dict[str, Any] = {"cli": self.command}
-        if self.method is not None and self.path is not None:
-            interfaces["http"] = {"method": self.method, "path": self.path}
-        return {
-            "action": self.action,
-            "description": self.description,
-            "interfaces": interfaces,
-            "requiredScope": self.scope,
-            "mutates": self.mutates,
-            "planSupported": self.plan_supported,
-            "idempotency": self.idempotency,
-            "risk": self.risk,
-            "costClass": self.cost_class,
-            "preconditions": list(self.preconditions),
-            "effects": list(self.effects),
-            "approvalRequired": self.approval_required,
-            "destructive": self.destructive,
-        }
-
-
-_ACTIONS: tuple[ActionDefinition, ...] = (
-    ActionDefinition(
-        "project.bootstrap",
-        "Plan and initialize repository-scoped local factory state.",
-        "omf bootstrap --plan && omf bootstrap",
-        None,
-        None,
-        "admin",
-        True,
-        True,
-        "content-idempotent",
-        "medium",
-        "io",
-        ("project.manifest-valid",),
-        ("Local database, identity, secrets, and artifact store initialized.",),
-        approval_required=True,
-    ),
-    ActionDefinition(
-        "agent.context",
-        "Read a bounded decision context and incremental event cursor.",
-        "omf agent context",
-        "GET",
-        "/v1/agent/context",
-        "read",
-        False,
-        False,
-        "read-only",
-        "low",
-        "negligible",
-        ("project.manifest-valid",),
-        ("No state change.",),
-    ),
-    ActionDefinition(
-        "agent.capabilities",
-        "Discover action contracts, effects, risk, and cost classes.",
-        "omf agent capabilities",
-        "GET",
-        "/v1/agent/capabilities",
-        "read",
-        False,
-        False,
-        "read-only",
-        "low",
-        "negligible",
-        (),
-        ("No state change.",),
-    ),
-    ActionDefinition(
-        "project.doctor",
-        "Run non-mutating repository and factory readiness checks.",
-        "omf doctor",
-        "GET",
-        "/v1/doctor",
-        "read",
-        False,
-        False,
-        "read-only",
-        "low",
-        "negligible",
-        ("factory.bootstrapped",),
-        ("No state change.",),
-    ),
-    ActionDefinition(
-        "executor.list",
-        "Discover built-in and trusted plugin executor providers and configuration contracts.",
-        "omf executor list",
-        "GET",
-        "/v1/executors",
-        "read",
-        False,
-        False,
-        "read-only",
-        "low",
-        "negligible",
-        ("factory.bootstrapped",),
-        ("No state change.",),
-    ),
-    ActionDefinition(
-        "executor.preflight",
-        "Check a binding provider and workload transport contract without allocating a run.",
-        "omf executor preflight <binding> [--workload <workload>]",
-        "POST",
-        "/v1/executors/preflight",
-        "read",
-        False,
-        False,
-        "read-only",
-        "low",
-        "io",
-        ("binding.valid", "provider.installed"),
-        ("No run, event, or resource is allocated.",),
-    ),
-    ActionDefinition(
-        "goal.create",
-        "Persist an objective, measurable success criteria, constraints, and budget.",
-        "omf goal create <name> --objective <text> --success <criterion>",
-        "POST",
-        "/v1/goals",
-        "write",
-        True,
-        False,
-        "content-idempotent",
-        "low",
-        "metadata",
-        ("factory.ready",),
-        ("Goal revision committed.", "Goal status initialized.", "Signed events emitted."),
-    ),
-    ActionDefinition(
-        "goal.status",
-        "Guard a goal lifecycle transition with its observed status version.",
-        "omf goal status <name> --state <state> --expected-version <version>",
-        "PATCH",
-        "/v1/goals/{name}/status",
-        "write",
-        True,
-        False,
-        "guarded-compare-and-set",
-        "low",
-        "metadata",
-        ("goal.exists", "expectedVersion.current"),
-        ("Goal status advanced.", "Signed status event emitted."),
-    ),
-    ActionDefinition(
-        "goal.list",
-        "Read bounded current goal revisions and guarded statuses.",
-        "omf goal list",
-        "GET",
-        "/v1/goals",
-        "read",
-        False,
-        False,
-        "read-only",
-        "low",
-        "negligible",
-        ("factory.bootstrapped",),
-        ("No state change.",),
-    ),
-    ActionDefinition(
-        "knowledge.record",
-        "Record an evidence-backed claim, decision, constraint, or lesson.",
-        "omf knowledge record <name> --category <category> --claim <text> --evidence <ref>",
-        "POST",
-        "/v1/knowledge",
-        "write",
-        True,
-        False,
-        "content-idempotent",
-        "low",
-        "metadata",
-        ("factory.ready", "evidence.nonempty"),
-        ("Knowledge revision committed.", "Evidence lineage linked.", "Signed event emitted."),
-    ),
-    ActionDefinition(
-        "knowledge.list",
-        "Read active or historical evidence-backed knowledge revisions.",
-        "omf knowledge list",
-        "GET",
-        "/v1/knowledge",
-        "read",
-        False,
-        False,
-        "read-only",
-        "low",
-        "negligible",
-        ("factory.bootstrapped",),
-        ("No state change.",),
-    ),
-    ActionDefinition(
-        "resource.apply",
-        "Validate and commit an immutable resource revision.",
-        "omf resource apply <manifest>",
-        "POST",
-        "/v1/resources",
-        "write",
-        True,
-        False,
-        "content-idempotent",
-        "low",
-        "metadata",
-        ("factory.ready", "resource.schema-valid", "resource.namespace-matches"),
-        ("Immutable resource revision committed.", "SpecValidated event emitted."),
-    ),
-    ActionDefinition(
-        "module.validate",
-        "Package and validate an exact module source revision and contract.",
-        "omf module validate [manifest]",
-        "POST",
-        "/v1/modules/validate",
-        "write",
-        True,
-        False,
-        "content-idempotent",
-        "low",
-        "io",
-        ("module.manifest-exists",),
-        ("Module source artifact committed.", "Contract result returned."),
-    ),
-    ActionDefinition(
-        "module.test",
-        "Execute module compatibility fixtures in the local isolation boundary.",
-        "omf module test [manifest]",
-        "POST",
-        "/v1/modules/test",
-        "write",
-        True,
-        False,
-        "not-guaranteed",
-        "medium",
-        "compute",
-        ("module.contract-valid",),
-        ("Fixture executions performed.", "Contract evidence returned."),
-    ),
-    ActionDefinition(
-        "data.add",
-        "Create an immutable rights-declared dataset snapshot.",
-        "omf data add <source> --name <name> --rights <manifest>",
-        "POST",
-        "/v1/data",
-        "write",
-        True,
-        False,
-        "resource-content-idempotent-events-repeat",
-        "medium",
-        "io",
-        ("source.readable", "rights.declared"),
-        (
-            "DatasetSnapshot committed.",
-            "Payload imported when copy mode is selected.",
-        ),
-    ),
-    ActionDefinition(
-        "store.add",
-        "Declare a user-selected artifact holding site by symbolic secret reference.",
-        "omf store add <name> --driver <driver> --endpoint <endpoint> [--plan]",
-        "POST",
-        "/v1/stores",
-        "write",
-        True,
-        True,
-        "content-idempotent",
-        "medium",
-        "metadata",
-        ("driver.supported",),
-        ("ArtifactStore revision committed when not planning.",),
-    ),
-    ActionDefinition(
-        "sync.execute",
-        "Plan or transfer only missing verified artifact chunks.",
-        "omf sync <push|pull> <asset> <store-options> [--plan]",
-        "POST",
-        "/v1/sync",
-        "write",
-        True,
-        True,
-        "transfer-convergent-events-repeat",
-        "medium",
-        "io",
-        ("asset.exists", "stores.reachable", "transfer.policy-allows"),
-        ("Missing chunks transferred when not planning.", "Replica event emitted."),
-    ),
-    ActionDefinition(
-        "workload.run",
-        "Admit and execute a model-neutral workload through an explicit binding.",
-        "omf run <workload> --binding <binding>",
-        "POST",
-        "/v1/runs",
-        "write",
-        True,
-        False,
-        "new-run-identity",
-        "high",
-        "compute",
-        ("factory.ready", "workload.valid", "binding.supported", "inputs.available"),
-        ("Unique Run committed.", "Stages executed.", "Outputs, events, and lineage recorded."),
-        approval_required=True,
-    ),
-    ActionDefinition(
-        "run.status",
-        "Read observed run state and exact admitted execution digests.",
-        "omf runs status <run-id>",
-        "GET",
-        "/v1/runs/{run_id}",
-        "read",
-        False,
-        False,
-        "read-only",
-        "low",
-        "negligible",
-        ("run.exists",),
-        ("No state change.",),
-    ),
-    ActionDefinition(
-        "evaluation.create",
-        "Materialize immutable evaluation evidence for a completed run.",
-        "omf evaluate run/<run-id>",
-        "POST",
-        "/v1/evaluations",
-        "write",
-        True,
-        False,
-        "resource-content-idempotent-events-repeat",
-        "medium",
-        "compute",
-        ("run.succeeded", "evaluation.outputs-present"),
-        ("EvaluationResult committed.", "Evaluation event and lineage emitted."),
-    ),
-    ActionDefinition(
-        "experiment.create",
-        "Compare one numeric metric under identical immutable evaluation revisions.",
-        "omf experiment create <name> --baseline <ref> --candidate <ref> --metric <name>",
-        "POST",
-        "/v1/experiments",
-        "write",
-        True,
-        False,
-        "content-idempotent",
-        "low",
-        "metadata",
-        ("evaluation.baseline-exists", "evaluation.candidate-exists", "protocol.same"),
-        ("Immutable Experiment decision committed.",),
-    ),
-    ActionDefinition(
-        "release.create",
-        "Build and optionally promote a signed complete release through fail-closed gates.",
-        "omf release create <run-id> --name <name> --intended-use <use>",
-        "POST",
-        "/v1/releases",
-        "write",
-        True,
-        False,
-        "not-guaranteed",
-        "high",
-        "external",
-        ("run.succeeded", "evaluation.passed", "promotion.evidence-complete"),
-        ("Signed Release committed.", "Alias may move only when promotion gates allow."),
-        approval_required=True,
-    ),
-    ActionDefinition(
-        "deployment.apply",
-        "Policy-check and apply an explicit deployment revision.",
-        "omf deploy <manifest>",
-        "POST",
-        "/v1/deployments",
-        "write",
-        True,
-        False,
-        "not-guaranteed",
-        "high",
-        "compute",
-        ("release.signed", "promotion.allowed", "deployment.valid"),
-        ("Deployment status changed.", "Execution may be started.", "Lineage emitted."),
-        approval_required=True,
-    ),
-    ActionDefinition(
-        "deployment.status",
-        "Reconcile and read observed deployment state.",
-        "omf deployment status <name>",
-        "GET",
-        "/v1/deployments/{name}",
-        "read",
-        True,
-        False,
-        "convergent-reconciliation",
-        "low",
-        "negligible",
-        ("deployment.exists",),
-        ("Terminal worker state may be reconciled into status.",),
-    ),
-    ActionDefinition(
-        "deployment.rollback",
-        "Guard and restore the previous immutable deployment revision.",
-        "omf deployment rollback <name> --expected-version <version>",
-        "POST",
-        "/v1/deployments/{name}/rollback",
-        "write",
-        True,
-        False,
-        "guarded-compare-and-set",
-        "high",
-        "compute",
-        ("deployment.previous-revision-exists", "expectedVersion.current"),
-        ("Current execution may stop.", "Previous deployment revision starts."),
-        approval_required=True,
-        destructive=True,
-    ),
-    ActionDefinition(
-        "lineage.query",
-        "Trace upstream derivation or downstream impact.",
-        "omf lineage show <subject> --direction <upstream|downstream>",
-        "GET",
-        "/v1/lineage",
-        "read",
-        False,
-        False,
-        "read-only",
-        "low",
-        "negligible",
-        ("subject.identified",),
-        ("No state change.",),
-    ),
-    ActionDefinition(
-        "backup.create",
-        "Archive and verify the complete durable local state.",
-        "omf admin backup <destination>",
-        "POST",
-        "/v1/backups",
-        "admin",
-        True,
-        False,
-        "not-guaranteed",
-        "medium",
-        "io",
-        ("destination.writable",),
-        ("Metadata, identity, encrypted secrets, and local artifacts are archived and verified.",),
-        approval_required=True,
-    ),
-)
-
-_ACTIONS += (
-    ActionDefinition(
-        "schema.list",
-        "List installed resource kinds and schema contracts.",
-        "omf schema list",
-        "GET",
-        "/v1/schemas",
-        "read",
-        False,
-        False,
-        "read-only",
-        "low",
-        "negligible",
-        (),
-        ("No state change.",),
-    ),
-    ActionDefinition(
-        "schema.show",
-        "Read the exact JSON Schema for one resource kind.",
-        "omf schema show <kind>",
-        "GET",
-        "/v1/schemas/{kind}",
-        "read",
-        False,
-        False,
-        "read-only",
-        "low",
-        "negligible",
-        ("schema.kind-installed",),
-        ("No state change.",),
-    ),
-    ActionDefinition(
-        "schema.validate",
-        "Validate a local desired-state document without committing it.",
-        "omf schema validate <manifest>",
-        None,
-        None,
-        "read",
-        False,
-        False,
-        "read-only",
-        "low",
-        "negligible",
-        ("manifest.readable",),
-        ("No state change.",),
-    ),
-    ActionDefinition(
-        "resource.list",
-        "Read immutable resource revisions with an optional kind filter.",
-        "omf resource list [--kind <kind>]",
-        "GET",
-        "/v1/resources",
-        "read",
-        False,
-        False,
-        "read-only",
-        "low",
-        "metadata",
-        ("factory.bootstrapped",),
-        ("No state change.",),
-    ),
-    ActionDefinition(
-        "event.list",
-        "Read signed event records, including governed event payloads.",
-        "omf --output json event list [--run-id <run-id>]",
-        "GET",
-        "/v1/events",
-        "read",
-        False,
-        False,
-        "read-only",
-        "medium",
-        "metadata",
-        ("factory.bootstrapped", "caller.authorized-for-event-payloads"),
-        ("No state change; response may contain sensitive event payloads.",),
-    ),
-    ActionDefinition(
-        "data.verify",
-        "Verify a dataset snapshot and locally held content by digest.",
-        "omf data verify <name>",
-        "GET",
-        "/v1/data/{name}/verify",
-        "read",
-        False,
-        False,
-        "read-only",
-        "low",
-        "io",
-        ("dataset.exists", "referenced-content.available"),
-        ("No state change.",),
-    ),
-    ActionDefinition(
-        "data.revoke",
-        "Stop future and resumed training from a dataset without rewriting its history.",
-        "omf data revoke <name> --reason <reason>",
-        "POST",
-        "/v1/data/{name}/revoke",
-        "write",
-        True,
-        False,
-        "resource-content-idempotent-events-repeat",
-        "high",
-        "metadata",
-        ("dataset.exists", "operator.approved"),
-        ("New revoked DatasetSnapshot revision committed.", "Future coordinator use denied."),
-        approval_required=True,
-        destructive=True,
-    ),
-    ActionDefinition(
-        "deployment.cancel",
-        "Stop a deployment and record its terminal status.",
-        "omf deployment cancel <name>",
-        "POST",
-        "/v1/deployments/{name}/cancel",
-        "write",
-        True,
-        False,
-        "convergent-reconciliation",
-        "high",
-        "compute",
-        ("deployment.exists",),
-        ("Current execution stops.", "Deployment status and event advance."),
-        approval_required=True,
-        destructive=True,
-    ),
-    ActionDefinition(
-        "token.create",
-        "Create an attributable scoped API credential returned exactly once.",
-        "omf admin token create --actor <actor> --scope <scope>",
-        "POST",
-        "/v1/tokens",
-        "admin",
-        True,
-        False,
-        "new-credential-identity",
-        "high",
-        "metadata",
-        ("actor.identified", "scopes.valid"),
-        ("API credential created; plaintext token returned once.",),
-        approval_required=True,
-    ),
-    ActionDefinition(
-        "token.list",
-        "List API credential metadata without plaintext token values.",
-        "omf admin token list",
-        "GET",
-        "/v1/tokens",
-        "admin",
-        False,
-        False,
-        "read-only",
-        "medium",
-        "metadata",
-        ("factory.bootstrapped",),
-        ("No state change.",),
-    ),
-    ActionDefinition(
-        "token.revoke",
-        "Irreversibly revoke one API credential by stable token ID.",
-        "omf admin token revoke <token-id>",
-        "DELETE",
-        "/v1/tokens/{token_id}",
-        "admin",
-        True,
-        False,
-        "content-idempotent",
-        "high",
-        "metadata",
-        ("token.exists",),
-        ("Credential can no longer authenticate.",),
-        approval_required=True,
-        destructive=True,
-    ),
-    ActionDefinition(
-        "operation.list",
-        "Read operation lifecycle metadata with an optional state filter.",
-        "omf operation list [--state <state>]",
-        "GET",
-        "/v1/operations",
-        "read",
-        False,
-        False,
-        "read-only",
-        "low",
-        "metadata",
-        ("factory.bootstrapped",),
-        ("No state change; full operation records may include request or result data.",),
-    ),
-    ActionDefinition(
-        "operation.get",
-        "Read one exact operation lifecycle record.",
-        "omf operation get <operation-id>",
-        "GET",
-        "/v1/operations/{operation_id}",
-        "read",
-        False,
-        False,
-        "read-only",
-        "medium",
-        "metadata",
-        ("operation.exists", "caller.authorized-for-operation-payloads"),
-        ("No state change; response may include request or result data.",),
-    ),
-    ActionDefinition(
-        "operation.reconcile",
-        "Execute a pending run or safely reconcile a stale running operation.",
-        "omf operation reconcile <operation-id>",
-        "POST",
-        "/v1/operations/{operation_id}/reconcile",
-        "write",
-        True,
-        False,
-        "operation-keyed-no-replay",
-        "high",
-        "compute",
-        ("operation.exists", "operation.kind=run", "operation.actor=caller"),
-        (
-            (
-                "Pending work executes once under an exclusive lease; stale work reconciles from "
-                "an immutable result or fails indeterminate without replay."
-            ),
-        ),
-    ),
-    ActionDefinition(
-        "secret.set",
-        "Encrypt and create or replace a purpose-bound local secret.",
-        "omf admin secret set <name> --purpose <purpose> --value <value> "
-        "[--expected-version <version>]",
-        None,
-        None,
-        "admin",
-        True,
-        False,
-        "guarded-compare-and-set",
-        "high",
-        "metadata",
-        ("operator.approved", "purpose.explicit"),
-        ("Encrypted secret version advances; plaintext is not logged or listed.",),
-        approval_required=True,
-        destructive=True,
-    ),
-    ActionDefinition(
-        "secret.list",
-        "List secret names, purposes, and versions without plaintext values.",
-        "omf admin secret list",
-        None,
-        None,
-        "admin",
-        False,
-        False,
-        "read-only",
-        "medium",
-        "metadata",
-        ("factory.bootstrapped",),
-        ("No state change; no plaintext values are returned.",),
-    ),
-)
-
-_ACTION_BY_NAME = {item.action: item for item in _ACTIONS}
-
-
-def capability_catalog() -> dict[str, Any]:
-    actions = [item.as_dict() for item in _ACTIONS]
-    body = {"apiVersion": "omf.agent/v1alpha1", "catalogVersion": 1, "actions": actions}
-    return {**body, "catalogDigest": sha256_digest(body)}
 
 
 def initial_context(
@@ -796,6 +72,11 @@ def initial_context(
     context: dict[str, Any] = {
         "apiVersion": "omf.agent/v1alpha1",
         "kind": "AgentContext",
+        "trust": {
+            "metadata": "untrusted-data",
+            "recommendations": "advisory-not-authorization",
+            "budgets": "declared-not-enforced",
+        },
         "generatedAt": generated_at,
         "project": {
             "name": project["metadata"]["name"],
@@ -850,8 +131,8 @@ class AgentControl:
     def __init__(self, factory: Factory) -> None:
         self.factory = factory
 
-    def capabilities(self) -> dict[str, Any]:
-        return capability_catalog()
+    def capabilities(self, action: str | None = None) -> dict[str, Any]:
+        return capability_catalog(action)
 
     def create_goal(
         self,
@@ -944,6 +225,7 @@ class AgentControl:
     def set_goal_status(
         self, name: str, *, state: str, expected_version: int, reason: str
     ) -> dict[str, Any]:
+        self.factory._authorize("goal.status")
         if state not in _GOAL_STATES:
             raise ValidationError(
                 f"invalid goal state: {state}", details={"allowed": sorted(_GOAL_STATES)}
@@ -1195,43 +477,12 @@ class AgentControl:
         events.update({"cursor": event_window.cursor, "since": since})
         recent_runs = self._recent_resource_status("Run", limit, focus)
         deployments = self._recent_resource_status("DeploymentSpec", limit, focus)
-        operations_all = self.factory.operations.recent(limit=limit + 1)
-        operations = self._page(
-            [
-                {
-                    "id": item["id"],
-                    "kind": item["kind"],
-                    "state": item["state"],
-                    "createdAt": item["createdAt"],
-                    "updatedAt": item["updatedAt"],
-                    "version": item["version"],
-                    "hasError": item.get("error") is not None,
-                }
-                for item in operations_all
-                if not focus or self._matches(item, focus)
-            ],
-            limit,
-        )
+        operations = self.factory.operations.summaries(limit=limit, focus=focus)
         global_goal_items = self._goal_items()
         global_goals = self._page(global_goal_items, max(len(global_goal_items), 1))
         global_runs = self._recent_resource_status("Run", 1, None)
         global_deployments = self._recent_resource_status("DeploymentSpec", 100, None)
-        failed_operations = self.factory.operations.recent(states={"failed", "error"}, limit=100)
-        global_operations = self._page(
-            [
-                {
-                    "id": item["id"],
-                    "kind": item["kind"],
-                    "state": item["state"],
-                    "createdAt": item["createdAt"],
-                    "updatedAt": item["updatedAt"],
-                    "version": item["version"],
-                    "hasError": item.get("error") is not None,
-                }
-                for item in failed_operations
-            ],
-            100,
-        )
+        global_operations = self.factory.operations.summaries(states={"failed", "error"}, limit=100)
         blockers = self._blockers(
             readiness,
             global_goals,
@@ -1240,11 +491,27 @@ class AgentControl:
             global_operations,
             limit,
         )
-        recommendations = self._recommendations(instant)
+        recommendations = (
+            self._recommendations()
+            if readiness["ready"]
+            else [
+                self._recommend(
+                    "project.doctor",
+                    100,
+                    "readiness_failed",
+                    "Resolve the reported readiness failure before allocating work.",
+                )
+            ]
+        )
         catalog = self.capabilities()
         context: dict[str, Any] = {
             "apiVersion": "omf.agent/v1alpha1",
             "kind": "AgentContext",
+            "trust": {
+                "metadata": "untrusted-data",
+                "recommendations": "advisory-not-authorization",
+                "budgets": "declared-not-enforced",
+            },
             "generatedAt": generated_at,
             "project": {
                 "name": self.factory.project["metadata"]["name"],
@@ -1416,76 +683,9 @@ class AgentControl:
             )
         ]
 
-    def _recommendations(self, at: datetime | None = None) -> list[dict[str, Any]]:
-        recommendations: list[dict[str, Any]] = []
-        active_goals = [
-            item for item in self._goal_items() if item["status"].get("state") == "active"
-        ]
-        if not active_goals:
-            recommendations.append(
-                self._recommend(
-                    "goal.create",
-                    100,
-                    "intent_missing",
-                    "No active goal defines success, constraints, or budget.",
-                )
-            )
-        inventory = {item["kind"]: item["objects"] for item in self.factory.resources.inventory()}
-        if not inventory.get("DatasetSnapshot"):
-            recommendations.append(
-                self._recommend(
-                    "data.add",
-                    80,
-                    "dataset_missing",
-                    "No immutable dataset snapshot is available to a workload.",
-                )
-            )
-        run_items = self._recent_resource_status("Run", 1, None)["items"]
-        if not run_items:
-            recommendations.extend(
-                [
-                    self._recommend(
-                        "module.validate",
-                        70,
-                        "module_admission_needed",
-                        "Validate exact module source and contracts before allocating compute.",
-                    ),
-                    self._recommend(
-                        "module.test",
-                        65,
-                        "module_evidence_needed",
-                        "Exercise module fixtures before a workload run.",
-                    ),
-                    self._recommend(
-                        "workload.run",
-                        60,
-                        "run_missing",
-                        "No workload run has been recorded.",
-                    ),
-                ]
-            )
-        else:
-            recommendations.extend(self._run_recommendations(run_items[0]))
-        deployments = self._recent_resource_status("DeploymentSpec", 1, None)
-        if inventory.get("Release") and not deployments["items"]:
-            recommendations.append(
-                self._recommend(
-                    "deployment.apply",
-                    40,
-                    "deployment_missing",
-                    "A release exists but no deployment has been applied.",
-                )
-            )
-        if not self.list_knowledge(limit=1, at=at)["items"]:
-            recommendations.append(
-                self._recommend(
-                    "knowledge.record",
-                    20,
-                    "knowledge_missing",
-                    "No active evidence-backed project knowledge has been retained.",
-                )
-            )
-        return sorted(recommendations, key=lambda item: (-int(item["priority"]), item["action"]))
+    def _recommendations(self) -> list[dict[str, Any]]:
+        runs = self._recent_resource_status("Run", 1, None)["items"]
+        return self._run_recommendations(runs[0]) if runs else []
 
     @staticmethod
     def _recommend(
@@ -1497,7 +697,7 @@ class AgentControl:
         command: str | None = None,
         parameters: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        definition = _ACTION_BY_NAME[action]
+        definition = ACTION_BY_NAME[action]
         identity = {
             "action": action,
             "reasonCode": reason_code,
@@ -1522,7 +722,6 @@ class AgentControl:
             "destructive": definition.destructive,
             "planSupported": definition.plan_supported,
             "idempotency": definition.idempotency,
-            "idempotencyKey": sha256_digest({**identity, "contract": 1}),
         }
 
     @staticmethod
@@ -1598,10 +797,18 @@ class AgentControl:
             context["goals"],
         ]
         for page in pages:
+            if page is context["recentEvents"] and len(page["items"]) == 1:
+                continue
             if page["items"]:
                 page["items"].pop()
                 page["returned"] = len(page["items"])
                 page["truncated"] = True
+                if page is context["recentEvents"]:
+                    items = page["items"]
+                    if page["since"] is not None:
+                        page["cursor"] = items[-1]["id"] if items else page["since"]
+                    else:
+                        page["cursor"] = items[0]["id"] if items else None
                 return True
         blockers = context["blockers"]
         if len(blockers["items"]) > 1:

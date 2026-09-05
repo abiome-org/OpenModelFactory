@@ -55,6 +55,10 @@ class NotFoundError(OMFError):
     status_code = 404
 
 
+class OperationCanceled(OMFError):
+    code = "operation_canceled"
+
+
 class ConflictError(OMFError):
     code = "conflict"
     status_code = 409

@@ -36,11 +36,20 @@ admission and promotions are denied; existing evidence is never rewritten.
 
 ## Roles and separation
 
-Keep training, development, reward, and final-holdout data as distinct
-snapshots with distinct access boundaries. A metric or verifier used to shape
-training is development evidence, not independent evaluation. Never tune on
-the final holdout, and never place hidden tests, verifier logic, or credentials
-where an actor's module can read them.
+Use training data, test failures, reward signals, and evaluation results to
+improve the model. Record which snapshots supplied training examples, feedback,
+or candidate-selection evidence so later comparisons have the right context.
+
+If a reserved test reveals a useful failure, learn from it and record that it
+influenced development. The result remains useful evidence; an independent
+measurement then needs fresh or still-reserved cases. The same scoring code can
+serve training and evaluation when it measures the intended behavior correctly.
+
+Choose data splits and access boundaries for the experiment. Where a measurement
+depends on unseen answers, keep those answers out of model-visible inputs.
+Protect credentials and score records from modification by evaluated code.
+Separate snapshots make data use traceable; they do not by themselves enforce
+blind evaluation.
 
 ## Stores and sync
 

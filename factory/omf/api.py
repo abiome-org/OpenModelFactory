@@ -11,15 +11,44 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field
 
 from omf import __version__
+from omf.actions import action_definition
+from omf.candidate_review import review
 from omf.config import ProjectPaths
 from omf.errors import AuthorizationError, OMFError
 from omf.executors import ExecutorRegistry
+from omf.experiment_definition import ExperimentDefinition
 from omf.factory import Factory
 from omf.schema_registry import default_registry
+from omf.tracking import track
 
 
-class StoreRequest(BaseModel):
+class RequestModel(BaseModel):
     model_config = ConfigDict(extra="forbid")
+
+
+class ScriptExperimentRequest(RequestModel):
+    definition: str
+    candidate: str
+    detach: bool = True
+
+
+class ReproduceRequest(RequestModel):
+    detach: bool = True
+
+
+class ExportRequest(RequestModel):
+    destination: str
+
+
+class TrackingRequest(RequestModel):
+    uri: str
+
+
+class CancellationRequest(RequestModel):
+    reason: str = Field(default="Requested by the operator", min_length=1, max_length=1024)
+
+
+class StoreRequest(RequestModel):
     name: str
     driver: str
     endpoint: str
@@ -27,8 +56,7 @@ class StoreRequest(BaseModel):
     plan: bool = False
 
 
-class DataRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+class DataRequest(RequestModel):
     source: str
     name: str
     mode: str = "copy"
@@ -37,13 +65,11 @@ class DataRequest(BaseModel):
     cursor_policy: dict[str, Any] = Field(default_factory=dict)
 
 
-class DataRevocationRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+class DataRevocationRequest(RequestModel):
     reason: str = Field(min_length=1, max_length=1024)
 
 
-class SyncRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+class SyncRequest(RequestModel):
     asset: str
     source: str = "local"
     destination: str
@@ -52,37 +78,31 @@ class SyncRequest(BaseModel):
     plan: bool = False
 
 
-class ModuleRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+class ModuleRequest(RequestModel):
     manifest: str
     binding: str | None = None
 
 
-class RunRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+class RunRequest(RequestModel):
     workload: str
     binding: str = "bindings/local.yaml"
     detach: bool = False
 
 
-class ExecutorPreflightRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+class ExecutorPreflightRequest(RequestModel):
     binding: str
     workload: str | None = None
 
 
-class BackupRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+class BackupRequest(RequestModel):
     destination: str
 
 
-class EvaluationRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+class EvaluationRequest(RequestModel):
     subject: str
 
 
-class ReleaseRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+class ReleaseRequest(RequestModel):
     run_id: str
     name: str
     intended_use: str
@@ -94,8 +114,7 @@ class ReleaseRequest(BaseModel):
     evaluation_ref: str | None = None
 
 
-class ExperimentRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+class ExperimentRequest(RequestModel):
     name: str
     baseline_ref: str
     candidate_ref: str
@@ -103,31 +122,26 @@ class ExperimentRequest(BaseModel):
     direction: str = "maximize"
 
 
-class DeploymentRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+class DeploymentRequest(RequestModel):
     manifest: str
 
 
-class DeploymentRollbackRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+class DeploymentRollbackRequest(RequestModel):
     expected_version: int = Field(ge=1)
 
 
-class ApiTokenRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+class ApiTokenRequest(RequestModel):
     actor: str = Field(min_length=1)
     scopes: set[str]
     expires_at: str | None = None
 
 
-class GoalScopeRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+class GoalScopeRequest(RequestModel):
     resource_refs: list[str] = Field(default_factory=list)
     run_ids: list[str] = Field(default_factory=list)
 
 
-class GoalRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+class GoalRequest(RequestModel):
     name: str
     objective: str
     success_criteria: list[str]
@@ -138,29 +152,25 @@ class GoalRequest(BaseModel):
     scope: GoalScopeRequest = Field(default_factory=GoalScopeRequest)
 
 
-class GoalStatusRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+class GoalStatusRequest(RequestModel):
     state: str
     expected_version: int = Field(ge=0)
     reason: str = Field(min_length=1, max_length=2048)
 
 
-class KnowledgeEvidenceRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+class KnowledgeEvidenceRequest(RequestModel):
     ref: str = Field(min_length=1)
     digest: str | None = None
 
 
-class KnowledgeScopeRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+class KnowledgeScopeRequest(RequestModel):
     goal_refs: list[str] = Field(default_factory=list)
     resource_refs: list[str] = Field(default_factory=list)
     run_ids: list[str] = Field(default_factory=list)
     tags: list[str] = Field(default_factory=list)
 
 
-class KnowledgeRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+class KnowledgeRequest(RequestModel):
     name: str
     category: str
     claim: str
@@ -214,21 +224,26 @@ def _error_handlers(app: FastAPI) -> None:
         )
 
 
+def _action_route(app: FastAPI, action: str) -> Callable[[Callable[..., Any]], Any]:
+    definition = action_definition(action)
+    if definition.path is None or definition.method is None:
+        raise ValueError(f"action has no HTTP interface: {action}")
+    return app.api_route(
+        definition.path,
+        methods=[definition.method],
+        operation_id=action,
+        summary=definition.description,
+        openapi_extra={"x-omf-action": definition.as_dict()},
+    )
+
+
 def _authorizer(paths: ProjectPaths, factory: Factory) -> Authorized:
     def authorized(request: Request, authorization: str = Header(default="")) -> Iterator[Factory]:
         scheme, _, token = authorization.partition(" ")
         principal = factory.authenticate_principal(token) if scheme.lower() == "bearer" else None
         if principal is None:
             raise AuthorizationError("valid Bearer authentication is required")
-        admin_paths = {"/v1/backups"}
-        read_post_paths = {"/v1/executors/preflight"}
-        required_scope = (
-            "admin"
-            if request.url.path in admin_paths or request.url.path.startswith("/v1/tokens")
-            else "read"
-            if request.method == "GET" or request.url.path in read_post_paths
-            else "write"
-        )
+        required_scope = action_definition(request.scope["route"].operation_id).scope
         if not principal.allows(required_scope):
             raise AuthorizationError(f"API token lacks {required_scope} scope")
         service = Factory(paths, actor=principal.actor, executors=factory.executors)
@@ -247,15 +262,15 @@ def _core_routes(
     def health() -> dict[str, Any]:
         return {"status": "ok", "project": factory.project["metadata"]["name"]}
 
-    @app.get("/v1/doctor")
+    @_action_route(app, "project.doctor")
     def doctor(service: Factory = Depends(authorized)) -> dict[str, Any]:
         return service.doctor()
 
-    @app.get("/v1/executors")
+    @_action_route(app, "executor.list")
     def executors_catalog(service: Factory = Depends(authorized)) -> dict[str, Any]:
         return service.executor_catalog()
 
-    @app.post("/v1/executors/preflight")
+    @_action_route(app, "executor.preflight")
     def executor_preflight(
         request: ExecutorPreflightRequest, service: Factory = Depends(authorized)
     ) -> dict[str, Any]:
@@ -264,11 +279,11 @@ def _core_routes(
             workload_path=paths.root / request.workload if request.workload else None,
         )
 
-    @app.get("/v1/schemas")
+    @_action_route(app, "schema.list")
     def schemas(_service: Factory = Depends(authorized)) -> dict[str, Any]:
         return {"apiVersion": "omf.dev/v1alpha1", "kinds": default_registry.kinds}
 
-    @app.get("/v1/schemas/{kind}")
+    @_action_route(app, "schema.show")
     def schema(kind: str, _service: Factory = Depends(authorized)) -> dict[str, Any]:
         return default_registry.schema_for(kind)
 
@@ -283,15 +298,16 @@ def _cached(response: Response, value: dict[str, Any], key: str, if_none_match: 
 
 
 def _agent_routes(app: FastAPI, authorized: Authorized) -> None:
-    @app.get("/v1/agent/capabilities")
+    @_action_route(app, "agent.capabilities")
     def agent_capabilities(
         response: Response,
+        action: str | None = None,
         if_none_match: str | None = Header(default=None),
         service: Factory = Depends(authorized),
     ) -> Any:
-        return _cached(response, service.agent.capabilities(), "catalogDigest", if_none_match)
+        return _cached(response, service.agent.capabilities(action), "catalogDigest", if_none_match)
 
-    @app.get("/v1/agent/context")
+    @_action_route(app, "agent.context")
     def agent_context(
         response: Response,
         focus: str | None = None,
@@ -304,7 +320,7 @@ def _agent_routes(app: FastAPI, authorized: Authorized) -> None:
         value = service.agent.context(focus=focus, limit=limit, since=since, max_bytes=max_bytes)
         return _cached(response, value, "viewDigest", if_none_match)
 
-    @app.post("/v1/goals")
+    @_action_route(app, "goal.create")
     def goal_create(request: GoalRequest, service: Factory = Depends(authorized)) -> dict[str, Any]:
         scope = request.scope.model_dump()
         return service.agent.create_goal(
@@ -321,7 +337,7 @@ def _agent_routes(app: FastAPI, authorized: Authorized) -> None:
             },
         )
 
-    @app.get("/v1/goals")
+    @_action_route(app, "goal.list")
     def goals(
         state: str | None = None,
         focus: str | None = None,
@@ -330,18 +346,13 @@ def _agent_routes(app: FastAPI, authorized: Authorized) -> None:
     ) -> dict[str, Any]:
         return service.agent.list_goals(state=state, focus=focus, limit=limit)
 
-    @app.patch("/v1/goals/{name}/status")
+    @_action_route(app, "goal.status")
     def goal_status(
         name: str, request: GoalStatusRequest, service: Factory = Depends(authorized)
     ) -> dict[str, Any]:
-        return service.agent.set_goal_status(
-            name,
-            state=request.state,
-            expected_version=request.expected_version,
-            reason=request.reason,
-        )
+        return service.agent.set_goal_status(name, **request.model_dump())
 
-    @app.post("/v1/knowledge")
+    @_action_route(app, "knowledge.record")
     def knowledge_record(
         request: KnowledgeRequest, service: Factory = Depends(authorized)
     ) -> dict[str, Any]:
@@ -362,7 +373,7 @@ def _agent_routes(app: FastAPI, authorized: Authorized) -> None:
             expires_at=request.expires_at,
         )
 
-    @app.get("/v1/knowledge")
+    @_action_route(app, "knowledge.list")
     def knowledge(
         active_only: bool = True,
         focus: str | None = None,
@@ -373,7 +384,7 @@ def _agent_routes(app: FastAPI, authorized: Authorized) -> None:
 
 
 def _data_routes(app: FastAPI, authorized: Authorized) -> None:
-    @app.get("/v1/resources")
+    @_action_route(app, "resource.list")
     def resources(
         kind: str | None = Query(default=None),
         limit: int = Query(default=100, ge=1, le=1000),
@@ -382,13 +393,13 @@ def _data_routes(app: FastAPI, authorized: Authorized) -> None:
     ) -> list[dict[str, Any]]:
         return service.list_resources(kind=kind)[offset : offset + limit]
 
-    @app.post("/v1/resources")
+    @_action_route(app, "resource.apply")
     def apply_resource(
         resource: dict[str, Any], service: Factory = Depends(authorized)
     ) -> dict[str, Any]:
         return service.apply_resource(resource)
 
-    @app.get("/v1/events")
+    @_action_route(app, "event.list")
     def events(
         run_id: str | None = None,
         resource_uid: str | None = None,
@@ -405,32 +416,19 @@ def _data_routes(app: FastAPI, authorized: Authorized) -> None:
         ]
         return values[offset : offset + limit]
 
-    @app.post("/v1/stores")
+    @_action_route(app, "store.add")
     def add_store(request: StoreRequest, service: Factory = Depends(authorized)) -> dict[str, Any]:
-        return service.add_store(
-            request.name,
-            driver=request.driver,
-            endpoint=request.endpoint,
-            secret_ref=request.secret_ref,
-            plan=request.plan,
-        )
+        return service.add_store(**request.model_dump())
 
-    @app.post("/v1/data")
+    @_action_route(app, "data.add")
     def add_data(request: DataRequest, service: Factory = Depends(authorized)) -> dict[str, Any]:
-        return service.add_data(
-            request.source,
-            name=request.name,
-            mode=request.mode,
-            rights=request.rights,
-            sample_schema=request.sample_schema,
-            cursor_policy=request.cursor_policy,
-        )
+        return service.add_data(**request.model_dump())
 
-    @app.get("/v1/data/{name}/verify")
+    @_action_route(app, "data.verify")
     def verify_data(name: str, service: Factory = Depends(authorized)) -> dict[str, Any]:
         return {"name": name, "valid": service.verify_data(name)}
 
-    @app.post("/v1/data/{name}/revoke")
+    @_action_route(app, "data.revoke")
     def revoke_data(
         name: str,
         request: DataRevocationRequest,
@@ -438,28 +436,21 @@ def _data_routes(app: FastAPI, authorized: Authorized) -> None:
     ) -> dict[str, Any]:
         return service.revoke_data(name, reason=request.reason)
 
-    @app.post("/v1/sync")
+    @_action_route(app, "sync.execute")
     def sync(request: SyncRequest, service: Factory = Depends(authorized)) -> dict[str, Any]:
-        return service.sync(
-            request.asset,
-            source=request.source,
-            destination=request.destination,
-            direction=request.direction,
-            concurrency=request.concurrency,
-            plan=request.plan,
-        )
+        return service.sync(**request.model_dump())
 
 
 def _run_routes(
     app: FastAPI, factory: Factory, paths: ProjectPaths, authorized: Authorized
 ) -> None:
-    @app.post("/v1/modules/validate")
+    @_action_route(app, "module.validate")
     def validate_module(
         request: ModuleRequest, service: Factory = Depends(authorized)
     ) -> dict[str, Any]:
         return service.validate_module(paths.root / request.manifest)
 
-    @app.post("/v1/modules/test")
+    @_action_route(app, "module.test")
     def test_module(
         request: ModuleRequest, service: Factory = Depends(authorized)
     ) -> dict[str, Any]:
@@ -474,7 +465,7 @@ def _run_routes(
         with Factory(paths, actor=actor, executors=factory.executors) as service:
             service.execute_run_operation(operation_id)
 
-    @app.post("/v1/runs")
+    @_action_route(app, "workload.run")
     def run(
         request: RunRequest,
         background: BackgroundTasks,
@@ -488,11 +479,11 @@ def _run_routes(
             return operation
         return service.run(paths.root / request.workload, paths.root / request.binding)
 
-    @app.get("/v1/runs/{run_id}")
+    @_action_route(app, "run.status")
     def run_status(run_id: str, service: Factory = Depends(authorized)) -> dict[str, Any]:
         return service.run_status(run_id)
 
-    @app.post("/v1/evaluations")
+    @_action_route(app, "evaluation.create")
     def evaluate(
         request: EvaluationRequest, service: Factory = Depends(authorized)
     ) -> dict[str, Any]:
@@ -500,7 +491,7 @@ def _run_routes(
 
 
 def _release_routes(app: FastAPI, paths: ProjectPaths, authorized: Authorized) -> None:
-    @app.post("/v1/releases")
+    @_action_route(app, "release.create")
     def release(request: ReleaseRequest, service: Factory = Depends(authorized)) -> dict[str, Any]:
         return service.create_release(
             request.run_id,
@@ -516,33 +507,27 @@ def _release_routes(app: FastAPI, paths: ProjectPaths, authorized: Authorized) -
             evaluation_ref=request.evaluation_ref,
         )
 
-    @app.post("/v1/experiments")
+    @_action_route(app, "experiment.create")
     def experiment(
         request: ExperimentRequest, service: Factory = Depends(authorized)
     ) -> dict[str, Any]:
-        return service.create_experiment(
-            name=request.name,
-            baseline_ref=request.baseline_ref,
-            candidate_ref=request.candidate_ref,
-            metric=request.metric,
-            direction=request.direction,
-        )
+        return service.create_experiment(**request.model_dump())
 
-    @app.post("/v1/deployments")
+    @_action_route(app, "deployment.apply")
     def deploy(
         request: DeploymentRequest, service: Factory = Depends(authorized)
     ) -> dict[str, Any]:
         return service.deploy(paths.root / request.manifest)
 
-    @app.get("/v1/deployments/{name}")
+    @_action_route(app, "deployment.status")
     def deployment_status(name: str, service: Factory = Depends(authorized)) -> dict[str, Any]:
         return service.deployment_status(name)
 
-    @app.post("/v1/deployments/{name}/cancel")
+    @_action_route(app, "deployment.cancel")
     def deployment_cancel(name: str, service: Factory = Depends(authorized)) -> dict[str, Any]:
         return service.cancel_deployment(name)
 
-    @app.post("/v1/deployments/{name}/rollback")
+    @_action_route(app, "deployment.rollback")
     def deployment_rollback(
         name: str,
         request: DeploymentRollbackRequest,
@@ -550,7 +535,7 @@ def _release_routes(app: FastAPI, paths: ProjectPaths, authorized: Authorized) -
     ) -> dict[str, Any]:
         return service.rollback_deployment(name, expected_version=request.expected_version)
 
-    @app.get("/v1/lineage")
+    @_action_route(app, "lineage.query")
     def lineage(
         subject: str,
         direction: str = "upstream",
@@ -560,28 +545,56 @@ def _release_routes(app: FastAPI, paths: ProjectPaths, authorized: Authorized) -
         return service.lineage_query(subject, direction=direction, max_depth=max_depth)
 
 
+def _read_routes(app: FastAPI, authorized: Authorized) -> None:
+    @_action_route(app, "run.list")
+    def runs(service: Factory = Depends(authorized)) -> list[dict[str, Any]]:
+        return service.list_runs()
+
+    @_action_route(app, "release.list")
+    def releases(service: Factory = Depends(authorized)) -> list[dict[str, Any]]:
+        return service.list_releases()
+
+    @_action_route(app, "release.show")
+    def release(name: str, service: Factory = Depends(authorized)) -> dict[str, Any]:
+        return service.show_release(name)
+
+    @_action_route(app, "release.evidence")
+    def release_evidence(run_id: str, service: Factory = Depends(authorized)) -> dict[str, Any]:
+        return service.release_evidence(run_id)
+
+    @_action_route(app, "deployment.list")
+    def deployments(service: Factory = Depends(authorized)) -> list[dict[str, Any]]:
+        return service.list_deployments()
+
+    @_action_route(app, "store.list")
+    def stores(service: Factory = Depends(authorized)) -> list[dict[str, Any]]:
+        return service.list_resources(kind="ArtifactStore")
+
+    @_action_route(app, "data.list")
+    def datasets(service: Factory = Depends(authorized)) -> list[dict[str, Any]]:
+        return service.list_resources(kind="DatasetSnapshot")
+
+
 def _admin_routes(app: FastAPI, authorized: Authorized) -> None:
-    @app.post("/v1/backups")
+    @_action_route(app, "backup.create")
     def backup(request: BackupRequest, service: Factory = Depends(authorized)) -> dict[str, Any]:
         return service.backup(request.destination)
 
-    @app.post("/v1/tokens")
+    @_action_route(app, "token.create")
     def token_create(
         request: ApiTokenRequest, service: Factory = Depends(authorized)
     ) -> dict[str, Any]:
-        return service.create_api_token(
-            actor=request.actor, scopes=request.scopes, expires_at=request.expires_at
-        )
+        return service.create_api_token(**request.model_dump())
 
-    @app.get("/v1/tokens")
+    @_action_route(app, "token.list")
     def token_list(service: Factory = Depends(authorized)) -> list[dict[str, Any]]:
         return service.api_tokens.list()
 
-    @app.delete("/v1/tokens/{token_id}")
+    @_action_route(app, "token.revoke")
     def token_revoke(token_id: str, service: Factory = Depends(authorized)) -> dict[str, Any]:
         return service.revoke_api_token(token_id)
 
-    @app.get("/v1/operations")
+    @_action_route(app, "operation.list")
     def operations(
         state: str | None = None,
         limit: int = Query(default=100, ge=1, le=1000),
@@ -590,15 +603,67 @@ def _admin_routes(app: FastAPI, authorized: Authorized) -> None:
     ) -> list[dict[str, Any]]:
         return service.operations.list(state=state)[offset : offset + limit]
 
-    @app.get("/v1/operations/{operation_id}")
+    @_action_route(app, "operation.get")
     def operation(operation_id: str, service: Factory = Depends(authorized)) -> dict[str, Any]:
         return service.operations.get(operation_id)
 
-    @app.post("/v1/operations/{operation_id}/reconcile")
+    @_action_route(app, "operation.reconcile")
     def operation_reconcile(
         operation_id: str, service: Factory = Depends(authorized)
     ) -> dict[str, Any]:
         return service.execute_run_operation(operation_id)
+
+
+def _experiment_routes(app: FastAPI, authorized: Authorized) -> None:
+    @_action_route(app, "experiment.schema")
+    def experiment_schema(_service: Factory = Depends(authorized)) -> dict[str, Any]:
+        return ExperimentDefinition.model_json_schema()
+
+    @_action_route(app, "experiment.run")
+    def experiment_run(
+        request: ScriptExperimentRequest, service: Factory = Depends(authorized)
+    ) -> dict[str, Any]:
+        return service.experiments.run(request.definition, request.candidate, detach=request.detach)
+
+    @_action_route(app, "experiment.list")
+    def experiments(
+        name: str | None = None, service: Factory = Depends(authorized)
+    ) -> list[dict[str, Any]]:
+        return service.experiments.list(name)
+
+    @_action_route(app, "experiment.status")
+    def status(run_id: str, service: Factory = Depends(authorized)) -> dict[str, Any]:
+        return service.experiments.status(run_id)
+
+    @_action_route(app, "experiment.review")
+    def experiment_review(
+        run_id: str, baseline: str | None = None, service: Factory = Depends(authorized)
+    ) -> dict[str, Any]:
+        return review(service.experiments, run_id, baseline)
+
+    @_action_route(app, "experiment.reproduce")
+    def reproduce(
+        run_id: str, request: ReproduceRequest, service: Factory = Depends(authorized)
+    ) -> dict[str, Any]:
+        return service.experiments.reproduce(run_id, detach=request.detach)
+
+    @_action_route(app, "experiment.export")
+    def export(
+        run_id: str, request: ExportRequest, service: Factory = Depends(authorized)
+    ) -> dict[str, Any]:
+        return service.experiments.export(run_id, Path(request.destination))
+
+    @_action_route(app, "experiment.track")
+    def tracking(
+        run_id: str, request: TrackingRequest, service: Factory = Depends(authorized)
+    ) -> dict[str, Any]:
+        return track(service.experiments, run_id, request.uri)
+
+    @_action_route(app, "operation.cancel")
+    def cancel(
+        operation_id: str, request: CancellationRequest, service: Factory = Depends(authorized)
+    ) -> dict[str, Any]:
+        return service.run_control.request(operation_id, request.reason)
 
 
 def create_app(paths: ProjectPaths, *, executors: ExecutorRegistry | None = None) -> FastAPI:
@@ -626,8 +691,10 @@ def create_app(paths: ProjectPaths, *, executors: ExecutorRegistry | None = None
     _agent_routes(app, authorized)
     _data_routes(app, authorized)
     _run_routes(app, factory, paths, authorized)
+    _read_routes(app, authorized)
     _release_routes(app, paths, authorized)
     _admin_routes(app, authorized)
+    _experiment_routes(app, authorized)
     return app
 
 

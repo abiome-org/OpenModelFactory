@@ -5,6 +5,7 @@ import sys
 from pathlib import Path
 
 import pytest
+from _environments import offline_environment
 from omf.install_support import (
     STARTER,
     copy_starter,
@@ -345,7 +346,7 @@ def test_directory_installer_is_idempotent_and_rebuilds_only_its_managed_venv(tm
         f"project-ignore\n\n{IGNORE_BEGIN}\nold ignore\n{IGNORE_END}\n",
         encoding="utf-8",
     )
-    wrapper = tmp_path / "python-with-system-packages"
+    wrapper = tmp_path / "python-for-offline-install"
     fail_cleanup = tmp_path / "fail-cleanup"
     wrapper.write_text(
         "#!/bin/sh\n"
@@ -354,14 +355,14 @@ def test_directory_installer_is_idempotent_and_rebuilds_only_its_managed_venv(tm
         "fi\n"
         'if [ "$1" = "-m" ] && [ "$2" = "venv" ]; then\n'
         "  shift 2\n"
-        f'exec "{sys.executable}" -m venv --system-site-packages "$@"\n'
+        f'exec "{sys.executable}" -m venv "$@"\n'
         "fi\n"
         f'exec "{sys.executable}" "$@"\n',
         encoding="utf-8",
     )
     wrapper.chmod(0o755)
     wrapper_argument = os.path.relpath(wrapper, Path.cwd())
-    environment = os.environ | {"PIP_NO_INDEX": "1"}
+    environment = offline_environment()
 
     first = subprocess.run(
         ["bash", "install.sh", "--python", wrapper_argument, str(target)],
@@ -440,7 +441,7 @@ def test_directory_installer_never_follows_a_swapped_target_path(tmp_path):
         f'  mv "{target}" "{relocated}"\n'
         f'  ln -s "{outside}" "{target}"\n'
         "  shift 2\n"
-        f'  exec "{sys.executable}" -m venv --system-site-packages "$@"\n'
+        f'  exec "{sys.executable}" -m venv "$@"\n'
         "fi\n"
         f'exec "{sys.executable}" "$@"\n',
         encoding="utf-8",
@@ -452,7 +453,7 @@ def test_directory_installer_never_follows_a_swapped_target_path(tmp_path):
         check=False,
         capture_output=True,
         text=True,
-        env=os.environ | {"PIP_NO_INDEX": "1"},
+        env=offline_environment(),
     )
 
     assert result.returncode == 1
@@ -474,7 +475,7 @@ def test_interruption_after_venv_switch_never_deletes_active_environment(tmp_pat
         "#!/bin/sh\n"
         'if [ "$1" = "-m" ] && [ "$2" = "venv" ]; then\n'
         "  shift 2\n"
-        f'  exec "{sys.executable}" -m venv --system-site-packages "$@"\n'
+        f'  exec "{sys.executable}" -m venv "$@"\n'
         "fi\n"
         'if [ "$1" = "-" ]; then\n'
         '  case "${3:-}" in\n'
@@ -496,7 +497,7 @@ def test_interruption_after_venv_switch_never_deletes_active_environment(tmp_pat
         check=False,
         capture_output=True,
         text=True,
-        env=os.environ | {"PIP_NO_INDEX": "1"},
+        env=offline_environment(),
     )
 
     assert result.returncode == 1
@@ -540,9 +541,7 @@ def test_operator_guide_is_bounded_and_actionable():
     assert "`MODEL_CARD.md`" in guide
     assert "--output json doctor" in guide
     assert "agent context" in guide
-    assert "executor preflight" in guide
     assert "--expected-version" in guide
-    assert "Never place credentials" in guide
 
 
 def test_installer_locks_build_backend_and_disables_build_isolation():

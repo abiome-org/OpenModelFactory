@@ -174,7 +174,9 @@ _EXCLUDED = {
 }
 
 
-def package_module(code_root: str | Path, output: str | Path) -> str:
+def package_module(
+    code_root: str | Path, output: str | Path, *, included_paths: set[str] | None = None
+) -> str:
     root, destination = Path(code_root).resolve(), Path(output)
     with (
         destination.open("wb") as raw,
@@ -183,6 +185,8 @@ def package_module(code_root: str | Path, output: str | Path) -> str:
         for path in sorted(root.rglob("*"), key=lambda p: p.relative_to(root).as_posix()):
             relative = path.relative_to(root)
             if any(part in _EXCLUDED for part in relative.parts):
+                continue
+            if included_paths is not None and relative.as_posix() not in included_paths:
                 continue
             mode = path.lstat().st_mode
             if stat.S_ISLNK(mode) or not (stat.S_ISDIR(mode) or stat.S_ISREG(mode)):

@@ -1,0 +1,44 @@
+name: sms-spam
+objective: Detect SMS spam while preserving legitimate messages.
+modelCard: MODEL_CARD.md
+data:
+  training:
+    source: data/train.json
+    rights: {license: CC-BY-4.0, trainingAllowed: true}
+  development:
+    source: data/dev.json
+    rights: {license: CC-BY-4.0, trainingAllowed: true}
+train:
+  source: src
+  inputs: [training]
+  dependencies: requirements.lock
+  command: [python3, train.py, --data, "{inputs[training]}", --output, "{output}/model.joblib", --features, "{parameters[features]}", --classifier, "{parameters[classifier]}"]
+  artifacts: {model: model.joblib}
+evaluate:
+  source: src
+  inputs: [development, model]
+  dependencies: requirements.lock
+  command: [python3, evaluate.py, --data, "{inputs[development]}", --model, "{inputs[model]}", --output, "{output}"]
+  metrics: metrics.json
+  examples: examples.json
+metrics:
+  spam_f1: {minimum: 0.90}
+  spam_precision: {minimum: 0.95, maxRegression: 0.01}
+  spam_recall: {minimum: 0.85}
+  accuracy: {minimum: 0.97}
+primaryMetric: spam_f1
+baseline: baseline
+candidates:
+  baseline:
+    rationale: Establish a word-feature naive Bayes baseline.
+    parameters: {features: word, classifier: nb}
+  word-svm:
+    rationale: Try a discriminative classifier to reduce false alarms.
+    parameters: {features: word, classifier: svm}
+  character-svm:
+    rationale: Character features may recognize spelling variants and repeated spam phrases.
+    parameters: {features: char, classifier: svm}
+limits:
+  timeoutSeconds: 120
+  cpuSeconds: 60
+executor: local

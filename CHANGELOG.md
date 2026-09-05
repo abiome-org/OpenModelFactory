@@ -2,6 +2,30 @@
 
 ## Unreleased
 
+- Add executable experiments for ordinary scripts: captured source and data,
+  named candidates, metric criteria, limits, review reports, reproduction,
+  artifact/source export, and optional MLflow tracking through CLI and HTTP.
+- Add durable run cancellation and recoverable evaluation publication; support
+  directory model outputs and materialize artifacts between dependent stages.
+- Ship a real scikit-learn classifier loop with controller interruption,
+  reproduction, and fresh-environment inference. Remove completed planning docs.
+
+- Encourage using evaluation feedback to improve training, rewards, and candidate
+  selection. Replace blanket separation rules with accurate reporting of data
+  use and independent measurement when needed.
+- Share action contracts across CLI help, HTTP routes, authorization scopes,
+  OpenAPI, and focused agent discovery; fill missing CLI/HTTP read interfaces.
+- Separate evaluation, publishing, and deployment ownership while preserving
+  public Factory methods and persisted resource formats.
+- Preserve event continuity and progress under context byte limits; query
+  operation metadata directly with correct totals and payload-free focus.
+- Enforce project policy on goal status transitions, clarify metadata trust,
+  and remove policy-bypass remediation and speculative workflow instructions.
+- Use one locked local development setup for contributors and agents. Remove
+  duplicate CI runs, the comment ban, and automatic edit hooks; retain complexity,
+  types, coverage, and isolated offline installation tests.
+- Accept secret input through stdin or a hidden prompt, reject nonfinite CLI
+  budgets, and isolate CLI invocation state.
 - Removed everything no run path used: the federation, capacity, telemetry,
   sampler, feedback, environment, inference, evaluation, and deployment-plan
   modules with their schemas; `MixSpec`; the preview Slurm and Kubernetes

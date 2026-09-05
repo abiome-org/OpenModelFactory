@@ -94,11 +94,13 @@ class StableTestExecutor(Executor):
             raise RuntimeError("test provider accepts only the empty test dependency lock")
         executable = shutil.which(argv[0])
         if executable is None:
-            candidate = (cwd / argv[0]).resolve()
+            candidate = cwd / argv[0]
             executable = str(candidate) if candidate.is_file() else None
         if executable is None:
             raise RuntimeError(f"module executable is unavailable: {argv[0]}")
-        command = [str(Path(executable).resolve()), *argv[1:]]
+        invocation = Path(executable)
+        # Resolving the final symlink would discard a Python virtual environment.
+        command = [str(invocation.parent.resolve() / invocation.name), *argv[1:]]
         if deny_network:
             unshare = shutil.which("unshare")
             if unshare is None or not _network_namespace_available():

@@ -7,7 +7,7 @@ from typing import Any
 
 from omf.canonical import canonical_json
 from omf.database import Database
-from omf.errors import ConflictError, NotFoundError
+from omf.errors import ConflictError, NotFoundError, OperationCanceled
 from omf.ids import uuid7
 
 
@@ -92,17 +92,90 @@ class OperationStore:
         query += " ORDER BY id"
         return [self.get(str(row[0])) for row in self.db.connection.execute(query, args)]
 
-    def recent(
-        self, *, states: set[str] | None = None, limit: int = 20
-    ) -> builtins.list[dict[str, Any]]:
-        if limit < 1:
-            return []
-        query = "SELECT id FROM operations"
+    def advance(
+        self,
+        operation_id: str,
+        *,
+        state: str,
+        result: Any = None,
+        error: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        # The execution lease owns transitions; a concurrent cancellation only adds intent.
+        with self.db.transaction(immediate=True) as connection:
+            value = self.get(operation_id)
+            if value.get("cancelRequest") and state in {"running", "recovering", "finalizing"}:
+                raise OperationCanceled("run cancellation requested")
+            version = value.pop("version")
+            value.update(state=state, result=result, error=error, updatedAt=_now())
+            connection.execute(
+                "UPDATE operations SET state=?,data=?,version=? WHERE id=? AND version=?",
+                (state, canonical_json(value), version + 1, operation_id, version),
+            )
+        return self.get(operation_id)
+
+    def request_cancel(self, operation_id: str, *, actor: str, reason: str) -> dict[str, Any]:
+        with self.db.transaction(immediate=True) as connection:
+            value = self.get(operation_id)
+            if value.get("cancelRequest") or value["state"] in {
+                "succeeded",
+                "failed",
+                "canceled",
+                "error",
+                "finalizing",
+            }:
+                return value
+            version = value.pop("version")
+            value["cancelRequest"] = {"actor": actor, "reason": reason, "requestedAt": _now()}
+            value["updatedAt"] = _now()
+            connection.execute(
+                "UPDATE operations SET data=?,version=? WHERE id=? AND version=?",
+                (canonical_json(value), version + 1, operation_id, version),
+            )
+        return self.get(operation_id)
+
+    def summaries(
+        self, *, states: set[str] | None = None, focus: str | None = None, limit: int = 20
+    ) -> dict[str, Any]:
+        clauses: builtins.list[str] = []
         args: builtins.list[Any] = []
         if states:
-            placeholders = ",".join("?" for _ in states)
-            query += f" WHERE state IN ({placeholders})"
+            clauses.append("state IN (" + ",".join("?" for _ in states) + ")")
             args.extend(sorted(states))
-        query += " ORDER BY id DESC LIMIT ?"
-        args.append(limit)
-        return [self.get(str(row[0])) for row in self.db.connection.execute(query, args)]
+        if focus:
+            escaped = focus.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+            clauses.append(
+                "(id LIKE ? ESCAPE '\\' OR kind LIKE ? ESCAPE '\\' OR state LIKE ? ESCAPE '\\')"
+            )
+            args.extend([f"%{escaped}%"] * 3)
+        where = " WHERE " + " AND ".join(clauses) if clauses else ""
+        total = int(
+            self.db.connection.execute("SELECT count(*) FROM operations" + where, args).fetchone()[
+                0
+            ]
+        )
+        rows = self.db.connection.execute(
+            "SELECT id,kind,state,version,"
+            "json_extract(CAST(data AS TEXT),'$.createdAt') AS created_at,"
+            "json_extract(CAST(data AS TEXT),'$.updatedAt') AS updated_at,"
+            "json_type(CAST(data AS TEXT),'$.error') != 'null' AS has_error "
+            "FROM operations" + where + " ORDER BY id DESC LIMIT ?",
+            [*args, limit],
+        )
+        items = [
+            {
+                "id": row["id"],
+                "kind": row["kind"],
+                "state": row["state"],
+                "version": row["version"],
+                "createdAt": row["created_at"],
+                "updatedAt": row["updated_at"],
+                "hasError": bool(row["has_error"]),
+            }
+            for row in rows
+        ]
+        return {
+            "items": items,
+            "returned": len(items),
+            "total": total,
+            "truncated": total > len(items),
+        }

@@ -29,7 +29,7 @@ Link to versioned OMF resources and immutable results instead of copying them.
 ## Data
 
 - Sources and rights: TBD
-- Training, development, and holdout split: TBD
+- Data used for training, feedback, and reserved measurement: TBD
 - Sensitive or prohibited data: TBD
 
 ## Evaluation
@@ -37,6 +37,7 @@ Link to versioned OMF resources and immutable results instead of copying them.
 - Evaluation resource: TBD
 - Candidate comparison rule: TBD
 - Required slices and failure cases: TBD
+- How evaluation feedback influenced training or selection: TBD
 
 ## Risks and release
 

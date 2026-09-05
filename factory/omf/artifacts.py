@@ -147,6 +147,8 @@ class ArtifactBuilder:
                 "application/octet-stream", size, digest, chunks, **metadata
             )
         elif source.is_dir():
+            # Directory is a storage format: tree restoration depends on this kind.
+            metadata.pop("logical_kind", None)
             for candidate in sorted(source.rglob("*")):
                 relative = candidate.relative_to(source).as_posix()
                 mode = candidate.lstat().st_mode
