@@ -110,7 +110,7 @@ omf doctor
 2. retain the failed `.omf` directory for forensics;
 3. run `omf admin restore` with the separately recorded key ID;
 4. reconnect any external artifact stores;
-5. run `omf doctor`, verify dataset snapshots, list active goals/knowledge, and
+5. run `omf doctor`, verify dataset snapshots, inspect runs and releases, and
    inspect signed event tails;
 6. resume deployments only after policy review.
 
@@ -139,16 +139,11 @@ content and publishes the manifest only after every chunk verifies.
 
 ## Vulnerability evidence and release promotion
 
-Promotion is denied when vulnerability evidence is absent, invalid, does not
-cover the aggregate model and admitted training and inference sources, or
-contains an unwaived open high/critical finding. Import a scanner's YAML/JSON
-report with `omf release create --vulnerability-report <path>`. The report must
-contain `scanner` (name/version object), `databaseRevision`, timezone-aware
-`generatedAt`, `subjects` (OMF artifact digests), `findings`, and `waivers`.
-Each finding contains `id`, `severity`, and `status`. OMF commits the report as
-an immutable artifact and binds its summary into the signed release. A site is
-responsible for obtaining and signing scanner databases in its connected or
-air-gapped supply-chain process.
+Projects can require vulnerability scanning with `promotion.requireVulnerabilityScan`.
+Without that requirement, scanning is optional. A supplied report must cover the
+model and admitted sources and contain no unwaived open high/critical findings.
+OMF stores imported evidence; it does not run a scanner. See
+[releases](releases.md#optional-vulnerability-evidence) for the report format.
 
 ## Deployment lifecycle and rollback
 
@@ -164,8 +159,8 @@ omf deployment rollback <name> --expected-version <status-version>
 ```
 
 A stale version is rejected rather than overwriting a concurrent deployment
-change. Before starting any deployment, OMF verifies the release signature and
-requires its recorded promotion policy decision to be `allow`.
+change. Deployment and rollback verify the pinned release signature and check
+current data rights and project requirements before launch.
 
 ## Air-gapped installation
 
@@ -184,14 +179,14 @@ air-gapped; test the complete supported workflow with egress denied.
 
 ## Distribution release
 
-Documented CLI/HTTP operations, templates, persisted state, and `omf.executor/v1`
-follow semantic versioning. Existing `omf.dev/v1alpha1` resources remain accepted
-throughout 1.x; incompatible formats need a new API version and an upgrade path.
-Deprecations remain for one minor release and appear in the changelog, except
-urgent security removals with a migration or mitigation. The newest 1.x minor
-receives correctness and security fixes; its predecessor receives security fixes
-for six months. 1.x receives security fixes for twelve months after 2.0. Release
-notes record the dates when a successor starts either clock.
+CLI/HTTP contracts and persisted formats are versioned. OMF 2 removes generic
+agent planning APIs and uses `omf.release/v2` manifests. Existing run, dataset,
+and artifact history remains intact. Back up before upgrading; remove legacy
+`unsignedModules`, `sync`, and `promotion.requireCompleteLineage` policy keys,
+and recreate releases from their recorded runs before promoting or deploying
+with version 2, then reapply deployment manifests to pin those releases. Old
+releases remain available for historical inspection. Executor providers still use
+`omf.executor/v1`; their package dependency must permit OMF 2.
 
 `make release-candidate` builds the wheel and source archive twice, rejects
 non-reproducible bytes, and emits checksums, an SPDX SBOM, and SLSA provenance.
@@ -215,8 +210,6 @@ the completed directory only through the repository's approved release process.
 - Revoke compromised credentials and rotate site trust deliberately; historical
   signatures remain bound to the old key.
 - Preserve event, lineage, scheduler, and ingress logs under retention policy.
-- Preserve goal statuses and evidence-backed knowledge with metadata backups;
-  never reconstruct them from chat logs.
 - A failed or incomplete checkpoint is never a restore target.
 - Reconciliation attaches to admitted executor receipts or finalizes immutable
   results. Unknown launch outcomes require inspection; OMF never blindly replays

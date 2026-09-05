@@ -1,51 +1,47 @@
 # Releases and deployments
 
-A `Release` is a signed manifest binding a run's model artifact, state,
-admitted sources, data rights, evaluation, vulnerability evidence, SBOM, and
-promotion decision. Deployments consume releases; aliases point at them.
-
-## Evidence
-
-```sh
-omf release evidence run/<run-id> > vulnerability-report.yaml
-```
-
-The skeleton lists every artifact digest the release must have scanned: the
-aggregate model artifact and each admitted module source. Fill `scanner`
-(`name` and `version`), `databaseRevision`, `findings`, and `waivers` from the
-site's scanner. Each finding carries `id`, `severity`, and `status`; an open
-`high` or `critical` finding blocks promotion unless its id is waived.
-`generatedAt` must carry a timezone. OMF stores the report as an immutable
-artifact and binds its summary into the release.
-
-## Creating and promoting
+A release names an immutable model version: artifacts, the captured recipe and
+runtime, exact data revisions, and measured evidence. Its signed manifest points
+to the admitted run and result. Evaluation may be failed or absent; saving a
+version preserves what happened.
 
 ```sh
-omf --actor release-operator release create run/<run-id> \
-  --name affine-v1 --intended-use "affine regression demo" \
-  --vulnerability-report vulnerability-report.yaml \
-  --approval independent-reviewer --promote --alias candidate
+omf release create run/<run-id> --name v1 --intended-use "Classify incoming text"
+omf release show v1
+omf release promote v1 --alias candidate
 omf release list
-omf release show affine-v1
 ```
 
-Promotion moves the alias only when every gate passes:
+`release create --promote` combines saving and selection. Promotion and deployment
+verify the signature and check current data rights and project requirements.
+By default, evaluation must pass. Projects can also require compatibility or a
+vulnerability scan, or allow selection without a passing evaluation:
 
-- the run succeeded with exactly one aggregate model artifact;
-- its evaluation passed and its compatibility check passed;
-- every admitted dataset still allows its training or evaluation uses under its newest revision;
-- lineage for the run is complete;
-- the factory signing identity is valid;
-- the vulnerability report covers every required subject with no blocking
-  finding;
-- at least one approval names an identity other than the promoting actor;
-- the project policy allows `release.create` and `release.promote`.
+```yaml
+config:
+  promotion:
+    requireEvaluationPass: true
+    requireCompatibilityPass: false
+    requireVulnerabilityScan: false
+```
 
-A release without `--promote` is still created and signed; it can be promoted
-later by creating a new release from the same run with the evidence in place.
-The alias move is guarded by the alias version observed inside the rights
-lock, so two concurrent promotions cannot silently overwrite each other.
-`release show` prints the release resource and the aliases that point at it.
+Lineage and current rights are always checked. Actor authorization is enforced
+by the project's rules. An alias move is atomic; `--expected-version <version>`
+rejects a stale update. Saving a new release revision never changes an existing
+alias implicitly. `release show` includes `aliasVersions` for guarded updates.
+References accept `release/<name>`, `alias/<name>`, or an exact release URI.
+Deployments resolve the reference once and preserve that revision for rollback.
+Launch and rollback recheck current requirements under dataset-rights locks.
+
+## Optional vulnerability evidence
+
+`omf release evidence run/<run-id>` prints a report skeleton with the aggregate
+model and captured source digests. Populate it with actual scanner output and
+pass it to `release create --vulnerability-report <path>`. OMF imports the report;
+it does not perform a vulnerability scan. The report records scanner identity,
+database revision, a timestamp with timezone, subjects, findings, and waivers.
+Open high or critical findings block promotion unless their IDs are waived.
+A supplied failing report blocks promotion even when scanning is optional.
 
 ## Deployments
 
@@ -69,8 +65,8 @@ omf deployment cancel affine-service
 omf deployment rollback affine-service --expected-version <status-version>
 ```
 
-`deploy` verifies the release signature, requires its recorded promotion
-decision to be `allow`, applies the manifest as an immutable revision, and
+`deploy` verifies the release against current promotion requirements, applies
+the deployment manifest as an immutable revision, and
 launches it through the executor named in `extensions.executor` (default
 `local`, options in `extensions.executorConfig`). Forms:
 

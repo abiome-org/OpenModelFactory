@@ -88,20 +88,12 @@ omf --actor research-agent experiment create longer-training \
 ```
 
 The experiment refuses two results evaluated under different evaluation
-revisions and records `candidate`, `baseline`, or `tie`. Record the outcome:
-
-```sh
-omf --actor research-agent knowledge record longer-training-result \
-  --category observation \
-  --claim "500 steps lowered training loss under the fixed protocol" \
-  --confidence 0.95 --evidence experiment/longer-training
-```
-
-Update `MODEL_CARD.md` with the decision and the experiment revision.
+revisions and records `candidate`, `baseline`, or `tie`. Update `MODEL_CARD.md`
+with the decision and the experiment revision.
 
 ## Refining from a release
 
-A stage input may name `release/<name>`, `checkpoint/<name>`, or an artifact
+A stage input may name `release/<name>`, `alias/<name>`, `checkpoint/<name>`, or an artifact
 digest instead of starting from initialization:
 
 ```yaml
@@ -115,16 +107,13 @@ stages:
 The module reads `inputs.base.path` and `inputs.base.state`; lineage from the
 new run leads back to the release it refined.
 
-## Release gate
-
-Promotion without evidence is denied, and the test suite asserts it:
+## Save and select a version
 
 ```sh
-omf --actor release-operator release create run/<run-id> \
-  --name affine-v1 --intended-use "demo" --promote --approval reviewer
+omf release create run/<run-id> --name affine-v1 --intended-use "demo"
+omf release promote affine-v1 --alias candidate
 ```
 
-fails with `promotion denied by gates` because no vulnerability report covers
-the model and module digests. `omf release evidence run/<run-id>` prints the
-subjects a scanner must cover; the [releases page](releases.md) describes the
-rest of the gate and the deployment forms.
+The saved release binds the model to its data, code, and evidence. Promotion
+checks current rights and project requirements; the default requires passing
+evaluation. See [releases](releases.md) for additional policy and deployment.

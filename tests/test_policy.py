@@ -1,10 +1,7 @@
-from datetime import UTC, datetime, timedelta
-
 import pytest
 import yaml
 from omf.errors import ValidationError
-from omf.policy import BreakGlass, PolicyEngine, PolicyRule, ProjectPolicy, promotion_gate
-from omf.security import SigningIdentity
+from omf.policy import PolicyEngine, PolicyRule, ProjectPolicy, promotion_gate
 
 NAMESPACE = "local/test-project"
 PROJECT = {
@@ -77,9 +74,9 @@ def test_project_policy_without_documents_allows_and_records_no_enforcement(tmp_
     [
         ({"dirtyWorktree": "sometimes"}, "dirtyWorktree"),
         ({"unsignedModules": "allow"}, "unsignedModules"),
-        ({"sync": {"allowDelete": True}}, "allowDelete"),
-        ({"sync": {"retries": 3}}, "requirePlan and allowDelete"),
-        ({"promotion": {"requireEvaluationPass": False}}, "mandatory"),
+        ({"sync": {"allowDelete": True}}, "not enforced"),
+        ({"sync": {"retries": 3}}, "not enforced"),
+        ({"promotion": {"requireEvaluationPass": "yes"}}, "boolean"),
         ({"retention": {"days": 3}}, "not enforced"),
     ],
 )
@@ -114,17 +111,24 @@ def test_project_policy_rejects_conflicts_namespace_and_directory_escape(tmp_pat
         )
 
 
-def test_signed_break_glass_converts_failed_gate_to_warning(tmp_path):
-    identity = SigningIdentity(tmp_path / "key")
-    expiry = (datetime.now(UTC) + timedelta(hours=1)).isoformat().replace("+00:00", "Z")
-    unsigned = {
-        "actor": "operator",
-        "reason": "incident",
-        "expiresAt": expiry,
-        "keyId": identity.key_id,
-    }
-    grant = BreakGlass("operator", "incident", expiry, identity.key_id, identity.sign(unsigned))
-    decision = promotion_gate(
-        {}, actor="operator", break_glass=grant, public_key=identity.public_bytes
+def test_promotion_requires_integrity_and_respects_project_quality_requirements(tmp_path):
+    evidence = {"lineage_complete": True, "rights_valid": True, "evaluation_passed": True}
+    assert promotion_gate(evidence).outcome == "allow"
+    assert promotion_gate({**evidence, "evaluation_passed": False}).outcome == "deny"
+    assert promotion_gate(evidence, {"requireVulnerabilityScan": True}).outcome == "deny"
+    assert promotion_gate({**evidence, "vulnerabilities_present": True}).outcome == "deny"
+    assert promotion_gate(evidence, {"requireCompatibilityPass": True}).outcome == "deny"
+    requirements = {"requireEvaluationPass": False}
+    _write_policy(tmp_path, _policy_document(promotion=requirements))
+    policy = ProjectPolicy.load(tmp_path, PROJECT)
+    assert (
+        promotion_gate({**evidence, "evaluation_passed": False}, policy.config["promotion"]).outcome
+        == "allow"
     )
-    assert decision.outcome == "warn"
+    assert promotion_gate({**evidence, "rights_valid": False}, requirements).outcome == "deny"
+    assert promotion_gate({**evidence, "lineage_complete": False}, requirements).outcome == "deny"
+
+
+def test_policy_cannot_silently_ignore_a_misspelled_actor_constraint():
+    with pytest.raises(ValidationError, match="actro"):
+        PolicyEngine([PolicyRule("owner-only", "allow", {"actro": "owner"})])

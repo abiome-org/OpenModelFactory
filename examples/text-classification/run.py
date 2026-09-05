@@ -113,6 +113,10 @@ def run(destination, archive=None, tracking_uri=None):
             raise RuntimeError("reproduction changed evaluation results")
         write_review(winner, paths.root / "review.html")
         exported = factory.experiments.export(winner["candidate"]["runId"], paths.root / "model")
+        factory.create_release(
+            winner["candidate"]["runId"], name="v1", intended_use="Classify SMS messages."
+        )
+        selection = factory.promote_release("v1")
         tracking = None
         if tracking_uri:
             tracking = track(factory.experiments, winner["candidate"]["runId"], tracking_uri)
@@ -132,6 +136,7 @@ def run(destination, archive=None, tracking_uri=None):
             "review": "review.html",
             "export": exported,
             "exportPredictions": predictions,
+            "release": selection,
             "tracking": tracking,
         }
         (paths.root / "results.json").write_text(json.dumps(results, indent=2))

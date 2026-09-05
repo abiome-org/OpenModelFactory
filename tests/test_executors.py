@@ -233,7 +233,7 @@ prefix = Path(sys.prefix).resolve()
 assert Path(omf.__file__).resolve().is_relative_to(prefix)
 assert Path(omf_stable_executor.__file__).resolve().is_relative_to(prefix)
 requires = importlib.metadata.metadata("omf-stable-executor-test-plugin").get_all("Requires-Dist")
-assert requires == ["open-model-factory<2,>=1"]
+assert requires == ["open-model-factory<3,>=2"]
 registry = default_executor_registry()
 catalog = registry.catalog()
 stable = next(item for item in catalog["providers"] if item["name"] == "stable-test")

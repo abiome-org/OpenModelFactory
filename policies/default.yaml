@@ -9,17 +9,7 @@ spec:
       match:
         actor: local-user
         resource: local/open-model-factory
-    - name: deny-unapproved-external-network
-      effect: deny
-      match:
-        action: network.egress
-        purpose: unapproved
   config:
     dirtyWorktree: archive
-    unsignedModules: deny
-    sync:
-      requirePlan: true
-      allowDelete: false
     promotion:
       requireEvaluationPass: true
-      requireCompleteLineage: true

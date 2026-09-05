@@ -1,23 +1,23 @@
 from __future__ import annotations
 
-import re
-from dataclasses import asdict
+from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from omf import __version__
 from omf.artifacts import ArtifactBuilder
-from omf.canonical import load_document, sha256_digest
+from omf.canonical import load_document
 from omf.database import AliasRepository
 from omf.errors import (
+    ConflictError,
     IntegrityError,
     NotFoundError,
     ValidationError,
 )
 from omf.lineage import LineageEdge
 from omf.policy import PolicyDecision, promotion_gate
-from omf.releases import ReleaseBuilder, promote_alias, verify_release
+from omf.releases import Release, ReleaseBuilder, promote_alias, verify_release
 from omf.workloads import DataUse, dataset_uses, project_workload
 
 if TYPE_CHECKING:
@@ -34,32 +34,45 @@ class PublishingService:
     def __init__(self, factory: Factory) -> None:
         self.factory = factory
 
-    def _release_aliases(self, release: dict[str, Any]) -> list[str]:
+    def _release_aliases(self, release: dict[str, Any]) -> dict[str, int]:
         metadata = release["metadata"]
-        return [
-            alias["name"]
+        return {
+            alias["name"]: alias["version"]
             for alias in AliasRepository(self.factory.db).list()
             if alias["uid"] == metadata["uid"] and alias["revision"] == metadata["revision"]
-        ]
+        }
 
     def list_releases(self) -> list[dict[str, Any]]:
         return [
             {
                 "name": release["metadata"]["name"],
                 "revision": release["metadata"]["revision"],
-                "promotion": release["spec"]
+                "evaluationPassed": release["spec"]
                 .get("extensions", {})
-                .get("promotionDecision", {})
-                .get("outcome"),
-                "aliases": self._release_aliases(release),
+                .get("manifest", {})
+                .get("assessment", {})
+                .get("evaluation_passed"),
+                "aliases": list(self._release_aliases(release)),
                 "createdAt": release["metadata"]["createdAt"],
             }
             for release in self.factory.resources.latest(kind="Release")
         ]
 
+    def resolve_release(self, reference: str) -> dict[str, Any]:
+        if reference.startswith("omf://"):
+            return self.factory._resource_by_uri("Release", reference)
+        if reference.startswith("alias/"):
+            uid, revision, _version = AliasRepository(self.factory.db).get(reference[6:])
+            release = self.factory.resources.get(uid, revision)
+            if release["kind"] != "Release":
+                raise IntegrityError("alias does not reference a release")
+            return release
+        return self.factory.find_resource("Release", reference.removeprefix("release/"))
+
     def show_release(self, name: str) -> dict[str, Any]:
-        release = self.factory.find_resource("Release", name)
-        return {"release": release, "aliases": self._release_aliases(release)}
+        release = self.resolve_release(name)
+        aliases = self._release_aliases(release)
+        return {"release": release, "aliases": list(aliases), "aliasVersions": aliases}
 
     def create_release(
         self,
@@ -70,7 +83,6 @@ class PublishingService:
         limitations: list[str] | None = None,
         promote: bool = False,
         alias: str = "candidate",
-        approvals: list[str] | None = None,
         vulnerability_report: str | Path | None = None,
         evaluation_ref: str | None = None,
     ) -> dict[str, Any]:
@@ -88,6 +100,9 @@ class PublishingService:
         evaluation = self._release_evaluation(
             run_id, run_resource, run_result, model_package_ref, evaluation_ref
         )
+        evaluation_spec = evaluation["spec"] if evaluation else {}
+        evaluation_extensions = evaluation_spec.get("extensions", {})
+        evaluation_revision = evaluation["metadata"]["revision"] if evaluation else None
         artifact_digests, model_digest, state_digest = self._release_artifacts(run_result)
         admission = run_resource["spec"]["extensions"]
         source_digests = self._release_sources(run_resource, model_package_ref)
@@ -102,22 +117,20 @@ class PublishingService:
         )
         data_uses = dataset_uses(project_workload(workload).stages)
         rights_valid = self.factory._input_rights_valid(datasets, data_uses)
-        approval_list = approvals or []
-        compatibility_passed = bool(evaluation["spec"]["extensions"].get("compatibilityPassed"))
+        compatibility_passed = bool(evaluation_extensions.get("compatibilityPassed"))
         evidence = {
-            "evaluation_passed": True,
+            "evaluation_passed": bool(evaluation_extensions.get("passed")),
             "lineage_complete": bool(self.factory.lineage.by_run(run_id)),
             "rights_valid": rights_valid,
-            "signatures_valid": self._signing_identity_valid(),
             "compatibility_passed": compatibility_passed,
             "vulnerabilities_valid": vulnerabilities_valid,
-            "approvals_valid": bool(approval_list),
-            "separation_of_duties": any(actor != self.factory.actor for actor in approval_list),
+            "vulnerabilities_present": vulnerability_report is not None,
         }
-        decision = promotion_gate(evidence, actor=self.factory.actor)
+        decision = promotion_gate(evidence, self.factory.policy.config.get("promotion"))
         if promote and decision.outcome == "deny":
             raise IntegrityError(f"promotion denied by gates: {_denied_rules(decision)}")
         manifest = {
+            "format": "omf.release/v2",
             "model": {"digest": model_digest},
             "modelPackage": {"ref": model_package_ref},
             "state": {"digest": state_digest},
@@ -132,23 +145,22 @@ class PublishingService:
                 }
                 for item in datasets.values()
             ],
-            "evaluations": [evaluation["metadata"]["revision"]],
+            "evaluations": [evaluation_revision] if evaluation_revision else [],
             "limitations": limitations or [],
-            "risk": {"promotionDecision": asdict(decision)},
+            "assessment": evidence,
             "intendedUse": intended_use,
-            "prohibitedUse": ["uses not authorized by data and release policy"],
             "compatibility": {
                 "moduleProtocol": "omf.module/v1",
                 "passed": compatibility_passed,
-                "evaluationRevision": evaluation["metadata"]["revision"],
-                "vectors": evaluation["spec"]["extensions"].get("compatibilityVectors", 0),
+                "evaluationRevision": evaluation_revision,
+                "vectors": evaluation_extensions.get("compatibilityVectors", 0),
             },
-            "sbom": self._release_sbom(run_id, source_digests),
-            "provenance": {"runId": run_id, "lineageComplete": evidence["lineage_complete"]},
+            "provenance": {
+                "runId": run_id,
+                "runRef": self.factory._resource_uri(run_resource),
+                "resultRef": self.factory._resource_uri(run_result),
+            },
             "vulnerabilities": vulnerability_summary,
-            "deployment": {"compatible": ["batch", "service", "actor", "edge", "control"]},
-            "rollback": {"compatible": True},
-            "licenses": [item["spec"].get("rights", {}) for item in datasets.values()],
         }
         signed = ReleaseBuilder(self.factory.identity).build(manifest)
         verify_release(signed, self.factory.identity.public_bytes)
@@ -160,7 +172,7 @@ class PublishingService:
                 "spec": {
                     "artifacts": release_artifacts,
                     "evidence": [
-                        evaluation["metadata"]["revision"],
+                        *([evaluation_revision] if evaluation_revision else []),
                         *([vulnerability_artifact] if vulnerability_artifact else []),
                     ],
                     "signatures": [signed.signature],
@@ -168,7 +180,6 @@ class PublishingService:
                         "manifest": signed.manifest,
                         "digest": signed.digest,
                         "keyId": signed.key_id,
-                        "promotionDecision": asdict(decision),
                     },
                 },
             },
@@ -182,7 +193,7 @@ class PublishingService:
             evaluation,
         )
         if promote:
-            self._promote_release(metadata, alias, datasets, data_uses, evidence)
+            self._promote_release(resource, alias)
         self.factory.events.append(
             type="ReleasePublished",
             source=f"omf://{self.factory.namespace}",
@@ -203,7 +214,7 @@ class PublishingService:
         run_result: dict[str, Any],
         model_package_ref: str | None,
         evaluation_ref: str | None,
-    ) -> dict[str, Any]:
+    ) -> dict[str, Any] | None:
         evaluations = [
             item
             for item in self.factory.resources.list(kind="EvaluationResult")
@@ -218,8 +229,6 @@ class PublishingService:
             and item["spec"].get("extensions", {}).get("evaluationRefs")
             == run_resource["spec"]["extensions"].get("evaluationRefs", [])
         ]
-        if not evaluations:
-            raise ValidationError("evaluate the run before creating a release")
         if evaluation_ref is not None:
             evaluations = [
                 item
@@ -229,11 +238,11 @@ class PublishingService:
             ]
             if not evaluations:
                 raise ValidationError("requested evaluation revision is not eligible for this run")
+        if not evaluations:
+            return None
         if len(evaluations) != 1:
             raise ValidationError("multiple evaluations exist; select an exact evaluation revision")
         evaluation = evaluations[0]
-        if not evaluation["spec"]["extensions"]["passed"]:
-            raise ValidationError("a failing evaluation cannot produce a release")
         return evaluation
 
     def _release_datasets(self, admission: dict[str, Any]) -> dict[str, dict[str, Any]]:
@@ -250,7 +259,7 @@ class PublishingService:
         resource: dict[str, Any],
         run_id: str,
         artifacts: list[str],
-        evaluation: dict[str, Any],
+        evaluation: dict[str, Any] | None,
     ) -> None:
         release_uri = self.factory._resource_uri(resource)
         self.factory.lineage.add(
@@ -260,7 +269,7 @@ class PublishingService:
         )
         for source in [
             *(f"artifact:{digest}" for digest in artifacts),
-            self.factory._resource_uri(evaluation),
+            *([self.factory._resource_uri(evaluation)] if evaluation else []),
         ]:
             self.factory.lineage.add(
                 LineageEdge(
@@ -268,26 +277,30 @@ class PublishingService:
                 )
             )
 
-    def _promote_release(
-        self,
-        metadata: dict[str, Any],
-        alias: str,
-        datasets: dict[str, dict[str, Any]],
-        data_uses: dict[str, list[DataUse]],
-        evidence: dict[str, Any],
-    ) -> None:
+    @contextmanager
+    def selection(self, release: dict[str, Any]) -> Iterator[PolicyDecision]:
+        datasets, uses, evidence = self._promotion_inputs(release)
         with self.factory._dataset_rights_locks(list(datasets.values())):
-            current_rights = self.factory._input_rights_valid(datasets, data_uses)
             decision = promotion_gate(
-                {**evidence, "rights_valid": current_rights}, actor=self.factory.actor
+                {**evidence, "rights_valid": self.factory._input_rights_valid(datasets, uses)},
+                self.factory.policy.config.get("promotion"),
             )
             if decision.outcome == "deny":
                 raise IntegrityError(f"promotion denied by gates: {_denied_rules(decision)}")
+            yield decision
+
+    def _promote_release(
+        self, release: dict[str, Any], alias: str, expected_version: int | None = None
+    ) -> int:
+        metadata = release["metadata"]
+        with self.selection(release) as decision:
             try:
                 current_alias_version: int | None = AliasRepository(self.factory.db).get(alias)[2]
             except NotFoundError:
                 current_alias_version = None
-            promote_alias(
+            if expected_version is not None and expected_version != current_alias_version:
+                raise ConflictError("alias version mismatch")
+            return promote_alias(
                 self.factory.db,
                 self.factory.events,
                 name=alias,
@@ -297,6 +310,42 @@ class PublishingService:
                 actor=self.factory.actor,
                 policy_decision=decision,
             )
+
+    def _promotion_inputs(
+        self, release: dict[str, Any]
+    ) -> tuple[dict[str, dict[str, Any]], dict[str, list[DataUse]], dict[str, Any]]:
+        extensions = release["spec"]["extensions"]
+        signatures = release["spec"]["signatures"]
+        if len(signatures) != 1 or extensions["keyId"] != self.factory.identity.key_id:
+            raise IntegrityError("release signing identity mismatch")
+        manifest = extensions["manifest"]
+        verify_release(
+            Release(manifest, extensions["digest"], extensions["keyId"], signatures[0]),
+            self.factory.identity.public_bytes,
+        )
+        run = self.factory._resource_by_uri("Run", manifest["provenance"]["runRef"])
+        datasets = self._release_datasets(run["spec"]["extensions"])
+        workload = self.factory._resource_by_uri("WorkloadSpec", run["spec"]["workloadRef"])
+        return datasets, dataset_uses(project_workload(workload).stages), manifest["assessment"]
+
+    def promotion_decision(self, release: dict[str, Any]) -> PolicyDecision:
+        datasets, uses, evidence = self._promotion_inputs(release)
+        return promotion_gate(
+            {**evidence, "rights_valid": self.factory._input_rights_valid(datasets, uses)},
+            self.factory.policy.config.get("promotion"),
+        )
+
+    def promote_release(
+        self, name: str, *, alias: str = "candidate", expected_version: int | None = None
+    ) -> dict[str, Any]:
+        self.factory._authorize("release.promote")
+        release = self.resolve_release(name)
+        version = self._promote_release(release, alias, expected_version)
+        return {
+            "releaseRef": self.factory._resource_uri(release),
+            "alias": alias,
+            "version": version,
+        }
 
     def _release_artifacts(self, run_result: dict[str, Any]) -> tuple[list[str], str, str]:
         artifacts = [
@@ -375,7 +424,7 @@ class PublishingService:
         self, report_path: str | Path | None, required_subjects: set[str]
     ) -> tuple[dict[str, Any], str | None, bool]:
         if report_path is None:
-            return {"status": "not-scanned", "gate": "deny-promotion"}, None, False
+            return {"status": "not-scanned"}, None, False
         path = Path(report_path)
         report = load_document(path.read_bytes())
         if not isinstance(report, dict):
@@ -427,69 +476,3 @@ class PublishingService:
             artifact.manifest_digest,
             passed,
         )
-
-    def _release_sbom(self, run_id: str, modules: dict[str, str]) -> dict[str, Any]:
-        lock = self.factory.paths.root / "requirements.runtime.lock"
-        dependencies: list[tuple[str, str]] = []
-        if lock.exists():
-            for line in lock.read_text().splitlines():
-                match = re.match(r"^([A-Za-z0-9_.-]+)==([^ \\]+)", line)
-                if match:
-                    dependencies.append((match.group(1), match.group(2)))
-        packages = [
-            {
-                "name": name,
-                "SPDXID": f"SPDXRef-Package-{index}",
-                "versionInfo": version,
-                "downloadLocation": "NOASSERTION",
-                "filesAnalyzed": False,
-                "licenseConcluded": "NOASSERTION",
-                "copyrightText": "NOASSERTION",
-            }
-            for index, (name, version) in enumerate(dependencies)
-        ]
-        packages.extend(
-            {
-                "name": f"omf-module-{name}",
-                "SPDXID": f"SPDXRef-Module-{index}",
-                "versionInfo": digest,
-                "downloadLocation": "NOASSERTION",
-                "filesAnalyzed": False,
-                "licenseConcluded": "NOASSERTION",
-                "copyrightText": "NOASSERTION",
-                "externalRefs": [
-                    {
-                        "referenceCategory": "OTHER",
-                        "referenceType": "omf-artifact",
-                        "referenceLocator": digest,
-                    }
-                ],
-            }
-            for index, (name, digest) in enumerate(sorted(modules.items()))
-        )
-        namespace_digest = sha256_digest({"runId": run_id, "packages": packages}).removeprefix(
-            "sha256:"
-        )
-        return {
-            "spdxVersion": "SPDX-2.3",
-            "dataLicense": "CC0-1.0",
-            "SPDXID": "SPDXRef-DOCUMENT",
-            "name": f"omf-release-{run_id}",
-            "documentNamespace": f"https://omf.dev/spdx/{namespace_digest}",
-            "creationInfo": {
-                "created": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
-                "creators": [f"Tool: Open Model Factory {__version__}"],
-            },
-            "packages": packages,
-        }
-
-    def _signing_identity_valid(self) -> bool:
-        probe = {
-            "purpose": "release-gate",
-            "time": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
-        }
-        try:
-            self.factory.identity.verify(probe, self.factory.identity.sign(probe))
-        except IntegrityError:
-            return False
-        return True

@@ -536,12 +536,7 @@ def test_operator_guide_is_bounded_and_actionable():
     assert "agents.md" not in root_names
     assert guide.count("<!-- BEGIN OMF OPERATOR GUIDE -->") == 1
     assert guide.count("<!-- END OMF OPERATOR GUIDE -->") == 1
-    assert "AGENTS.md standard" in guide
-    assert "another `AGENTS.md`" in guide
-    assert "`MODEL_CARD.md`" in guide
-    assert "--output json doctor" in guide
-    assert "agent context" in guide
-    assert "--expected-version" in guide
+    assert len(guide.splitlines()) <= 100
 
 
 def test_installer_locks_build_backend_and_disables_build_isolation():

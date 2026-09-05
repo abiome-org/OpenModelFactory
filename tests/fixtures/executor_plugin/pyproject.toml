@@ -6,7 +6,7 @@ build-backend = "hatchling.build"
 name = "omf-stable-executor-test-plugin"
 version = "1.0.0"
 requires-python = ">=3.11,<3.13"
-dependencies = ["open-model-factory>=1,<2"]
+dependencies = ["open-model-factory>=2,<3"]
 
 [project.entry-points."omf.executors"]
 stable-test = "omf_stable_executor:provider"

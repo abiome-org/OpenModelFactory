@@ -17,14 +17,6 @@ class ActionDefinition:
     path: str | None = None
     scope: Literal["read", "write", "admin"] = "read"
     mutates: bool = False
-    plan_supported: bool = False
-    idempotency: str = "read-only"
-    risk: str = "low"
-    cost_class: str = "negligible"
-    preconditions: tuple[str, ...] = ()
-    effects: tuple[str, ...] = ("No state change.",)
-    approval_required: bool = False
-    destructive: bool = False
 
     @property
     def cli_path(self) -> tuple[str, ...]:
@@ -50,14 +42,6 @@ class ActionDefinition:
             "interfaces": interfaces,
             "requiredScope": self.scope,
             "mutates": self.mutates,
-            "planSupported": self.plan_supported,
-            "idempotency": self.idempotency,
-            "risk": self.risk,
-            "costClass": self.cost_class,
-            "preconditions": list(self.preconditions),
-            "effects": list(self.effects),
-            "approvalRequired": self.approval_required,
-            "destructive": self.destructive,
         }
 
 
@@ -69,8 +53,6 @@ _ACTIONS = (
         method=None,
         scope="admin",
         mutates=True,
-        idempotency="destination-must-not-exist",
-        effects=("Write an experiment definition and initialize missing project state.",),
     ),
     ActionDefinition(
         "experiment.schema",
@@ -86,11 +68,6 @@ _ACTIONS = (
         path="/v1/experiment-runs",
         scope="write",
         mutates=True,
-        idempotency="new-run-identity",
-        cost_class="compute",
-        risk="high",
-        approval_required=True,
-        effects=("Capture inputs, execute scripts, and record model artifacts and evaluation.",),
     ),
     ActionDefinition(
         "experiment.list",
@@ -118,11 +95,6 @@ _ACTIONS = (
         path="/v1/experiment-runs/{run_id}/reproduce",
         scope="write",
         mutates=True,
-        idempotency="new-run-identity",
-        cost_class="compute",
-        risk="high",
-        approval_required=True,
-        effects=("Execute a new run from the original source, data, and configuration.",),
     ),
     ActionDefinition(
         "experiment.export",
@@ -132,9 +104,6 @@ _ACTIONS = (
         path="/v1/experiment-runs/{run_id}/export",
         scope="write",
         mutates=True,
-        idempotency="destination-must-not-exist",
-        cost_class="io",
-        effects=("Write a local model bundle with its evidence.",),
     ),
     ActionDefinition(
         "experiment.track",
@@ -144,10 +113,6 @@ _ACTIONS = (
         path="/v1/experiment-runs/{run_id}/tracking",
         scope="write",
         mutates=True,
-        idempotency="tracking-run-reused",
-        cost_class="io",
-        risk="medium",
-        effects=("Send parameters, metrics, and the review to the selected MLflow store.",),
     ),
     ActionDefinition(
         "operation.cancel",
@@ -157,9 +122,6 @@ _ACTIONS = (
         path="/v1/operations/{operation_id}/cancel",
         scope="write",
         mutates=True,
-        idempotency="request-idempotent",
-        risk="medium",
-        effects=("Record cancellation intent and confirm execution has stopped.",),
     ),
     ActionDefinition(
         "project.bootstrap",
@@ -168,23 +130,16 @@ _ACTIONS = (
         method=None,
         scope="admin",
         mutates=True,
-        plan_supported=True,
-        idempotency="content-idempotent",
-        risk="medium",
-        cost_class="io",
-        preconditions=("project.manifest-valid",),
-        effects=("Local database, identity, secrets, and artifact store initialized.",),
     ),
     ActionDefinition(
         "agent.context",
         "Read a bounded decision context and incremental event cursor.",
         "omf agent context",
         path="/v1/agent/context",
-        preconditions=("project.manifest-valid",),
     ),
     ActionDefinition(
         "agent.capabilities",
-        "Discover action contracts, effects, risk, and cost classes.",
+        "Discover factory commands, HTTP routes, and required scopes.",
         "omf agent capabilities",
         path="/v1/agent/capabilities",
     ),
@@ -193,14 +148,12 @@ _ACTIONS = (
         "Run non-mutating repository and factory readiness checks.",
         "omf doctor",
         path="/v1/doctor",
-        preconditions=("factory.bootstrapped",),
     ),
     ActionDefinition(
         "executor.list",
         "Discover built-in and trusted plugin executor providers and configuration contracts.",
         "omf executor list",
         path="/v1/executors",
-        preconditions=("factory.bootstrapped",),
     ),
     ActionDefinition(
         "executor.preflight",
@@ -208,67 +161,6 @@ _ACTIONS = (
         "omf executor preflight <binding> [--workload <workload>]",
         method="POST",
         path="/v1/executors/preflight",
-        cost_class="io",
-        preconditions=("binding.valid", "provider.installed"),
-        effects=("No run, event, or resource is allocated.",),
-    ),
-    ActionDefinition(
-        "goal.create",
-        "Persist an objective, measurable success criteria, constraints, and budget.",
-        "omf goal create <name> --objective <text> --success <criterion>",
-        method="POST",
-        path="/v1/goals",
-        scope="write",
-        mutates=True,
-        idempotency="content-idempotent",
-        cost_class="metadata",
-        preconditions=("factory.ready",),
-        effects=("Goal revision committed.", "Goal status initialized.", "Signed events emitted."),
-    ),
-    ActionDefinition(
-        "goal.status",
-        "Guard a goal lifecycle transition with its observed status version.",
-        "omf goal status <name> --state <state> --expected-version <version> --reason <reason>",
-        method="PATCH",
-        path="/v1/goals/{name}/status",
-        scope="write",
-        mutates=True,
-        idempotency="guarded-compare-and-set",
-        cost_class="metadata",
-        preconditions=("goal.exists", "expectedVersion.current"),
-        effects=("Goal status advanced.", "Signed status event emitted."),
-    ),
-    ActionDefinition(
-        "goal.list",
-        "Read bounded current goal revisions and guarded statuses.",
-        "omf goal list",
-        path="/v1/goals",
-        preconditions=("factory.bootstrapped",),
-    ),
-    ActionDefinition(
-        "knowledge.record",
-        "Record an evidence-backed claim, decision, constraint, or lesson.",
-        "omf knowledge record <name> --category <category> --claim <text> "
-        "--confidence <number> --evidence <ref>",
-        method="POST",
-        path="/v1/knowledge",
-        scope="write",
-        mutates=True,
-        idempotency="content-idempotent",
-        cost_class="metadata",
-        preconditions=("factory.ready", "evidence.nonempty"),
-        effects=(
-            "Knowledge revision committed.",
-            "Evidence lineage linked.",
-            "Signed event emitted.",
-        ),
-    ),
-    ActionDefinition(
-        "knowledge.list",
-        "Read active or historical evidence-backed knowledge revisions.",
-        "omf knowledge list",
-        path="/v1/knowledge",
-        preconditions=("factory.bootstrapped",),
     ),
     ActionDefinition(
         "resource.apply",
@@ -278,10 +170,6 @@ _ACTIONS = (
         path="/v1/resources",
         scope="write",
         mutates=True,
-        idempotency="content-idempotent",
-        cost_class="metadata",
-        preconditions=("factory.ready", "resource.schema-valid", "resource.namespace-matches"),
-        effects=("Immutable resource revision committed.", "SpecValidated event emitted."),
     ),
     ActionDefinition(
         "module.validate",
@@ -291,10 +179,6 @@ _ACTIONS = (
         path="/v1/modules/validate",
         scope="write",
         mutates=True,
-        idempotency="content-idempotent",
-        cost_class="io",
-        preconditions=("module.manifest-exists",),
-        effects=("Module source artifact committed.", "Contract result returned."),
     ),
     ActionDefinition(
         "module.test",
@@ -304,11 +188,6 @@ _ACTIONS = (
         path="/v1/modules/test",
         scope="write",
         mutates=True,
-        idempotency="not-guaranteed",
-        risk="medium",
-        cost_class="compute",
-        preconditions=("module.contract-valid",),
-        effects=("Fixture executions performed.", "Contract evidence returned."),
     ),
     ActionDefinition(
         "data.add",
@@ -318,11 +197,6 @@ _ACTIONS = (
         path="/v1/data",
         scope="write",
         mutates=True,
-        idempotency="resource-content-idempotent-events-repeat",
-        risk="medium",
-        cost_class="io",
-        preconditions=("source.readable", "rights.declared"),
-        effects=("DatasetSnapshot committed.", "Payload imported when copy mode is selected."),
     ),
     ActionDefinition(
         "store.add",
@@ -332,12 +206,6 @@ _ACTIONS = (
         path="/v1/stores",
         scope="write",
         mutates=True,
-        plan_supported=True,
-        idempotency="content-idempotent",
-        risk="medium",
-        cost_class="metadata",
-        preconditions=("driver.supported",),
-        effects=("ArtifactStore revision committed when not planning.",),
     ),
     ActionDefinition(
         "sync.execute",
@@ -347,12 +215,6 @@ _ACTIONS = (
         path="/v1/sync",
         scope="write",
         mutates=True,
-        plan_supported=True,
-        idempotency="transfer-convergent-events-repeat",
-        risk="medium",
-        cost_class="io",
-        preconditions=("asset.exists", "stores.reachable", "transfer.policy-allows"),
-        effects=("Missing chunks transferred when not planning.", "Replica event emitted."),
     ),
     ActionDefinition(
         "workload.run",
@@ -362,23 +224,12 @@ _ACTIONS = (
         path="/v1/runs",
         scope="write",
         mutates=True,
-        idempotency="new-run-identity",
-        risk="high",
-        cost_class="compute",
-        preconditions=("factory.ready", "workload.valid", "binding.supported", "inputs.available"),
-        effects=(
-            "Unique Run committed.",
-            "Stages executed.",
-            "Outputs, events, and lineage recorded.",
-        ),
-        approval_required=True,
     ),
     ActionDefinition(
         "run.status",
         "Read observed run state and exact admitted execution digests.",
         "omf runs status <run-id>",
         path="/v1/runs/{run_id}",
-        preconditions=("run.exists",),
     ),
     ActionDefinition(
         "evaluation.create",
@@ -388,11 +239,6 @@ _ACTIONS = (
         path="/v1/evaluations",
         scope="write",
         mutates=True,
-        idempotency="resource-content-idempotent-events-repeat",
-        risk="medium",
-        cost_class="compute",
-        preconditions=("run.succeeded", "evaluation.outputs-present"),
-        effects=("EvaluationResult committed.", "Evaluation event and lineage emitted."),
     ),
     ActionDefinition(
         "experiment.create",
@@ -402,29 +248,24 @@ _ACTIONS = (
         path="/v1/experiments",
         scope="write",
         mutates=True,
-        idempotency="content-idempotent",
-        cost_class="metadata",
-        preconditions=(
-            "evaluation.baseline-exists",
-            "evaluation.candidate-exists",
-            "protocol.same",
-        ),
-        effects=("Immutable Experiment decision committed.",),
     ),
     ActionDefinition(
         "release.create",
-        "Build and optionally promote a signed complete release through fail-closed gates.",
+        "Save a signed model version with its artifacts, data, recipe, and measured evidence.",
         "omf release create <run-id> --name <name> --intended-use <use>",
         method="POST",
         path="/v1/releases",
         scope="write",
         mutates=True,
-        idempotency="not-guaranteed",
-        risk="high",
-        cost_class="external",
-        preconditions=("run.succeeded", "evaluation.passed", "promotion.evidence-complete"),
-        effects=("Signed Release committed.", "Alias may move only when promotion gates allow."),
-        approval_required=True,
+    ),
+    ActionDefinition(
+        "release.promote",
+        "Move an alias to a saved release after checking current project requirements.",
+        "omf release promote <name> --alias <alias>",
+        method="POST",
+        path="/v1/releases/{name}/promote",
+        scope="write",
+        mutates=True,
     ),
     ActionDefinition(
         "deployment.apply",
@@ -434,12 +275,6 @@ _ACTIONS = (
         path="/v1/deployments",
         scope="write",
         mutates=True,
-        idempotency="not-guaranteed",
-        risk="high",
-        cost_class="compute",
-        preconditions=("release.signed", "promotion.allowed", "deployment.valid"),
-        effects=("Deployment status changed.", "Execution may be started.", "Lineage emitted."),
-        approval_required=True,
     ),
     ActionDefinition(
         "deployment.status",
@@ -447,9 +282,6 @@ _ACTIONS = (
         "omf deployment status <name>",
         path="/v1/deployments/{name}",
         mutates=True,
-        idempotency="convergent-reconciliation",
-        preconditions=("deployment.exists",),
-        effects=("Terminal worker state may be reconciled into status.",),
     ),
     ActionDefinition(
         "deployment.rollback",
@@ -459,20 +291,12 @@ _ACTIONS = (
         path="/v1/deployments/{name}/rollback",
         scope="write",
         mutates=True,
-        idempotency="guarded-compare-and-set",
-        risk="high",
-        cost_class="compute",
-        preconditions=("deployment.previous-revision-exists", "expectedVersion.current"),
-        effects=("Current execution may stop.", "Previous deployment revision starts."),
-        approval_required=True,
-        destructive=True,
     ),
     ActionDefinition(
         "lineage.query",
         "Trace upstream derivation or downstream impact.",
         "omf lineage show <subject> --direction <upstream|downstream>",
         path="/v1/lineage",
-        preconditions=("subject.identified",),
     ),
     ActionDefinition(
         "backup.create",
@@ -482,14 +306,6 @@ _ACTIONS = (
         path="/v1/backups",
         scope="admin",
         mutates=True,
-        idempotency="not-guaranteed",
-        risk="medium",
-        cost_class="io",
-        preconditions=("destination.writable",),
-        effects=(
-            "Metadata, identity, encrypted secrets, and local artifacts are archived and verified.",
-        ),
-        approval_required=True,
     ),
     ActionDefinition(
         "schema.list",
@@ -502,40 +318,30 @@ _ACTIONS = (
         "Read the exact JSON Schema for one resource kind.",
         "omf schema show <kind>",
         path="/v1/schemas/{kind}",
-        preconditions=("schema.kind-installed",),
     ),
     ActionDefinition(
         "schema.validate",
         "Validate a local desired-state document without committing it.",
         "omf schema validate <manifest>",
         method=None,
-        preconditions=("manifest.readable",),
     ),
     ActionDefinition(
         "resource.list",
         "Read immutable resource revisions with an optional kind filter.",
         "omf resource list [--kind <kind>]",
         path="/v1/resources",
-        cost_class="metadata",
-        preconditions=("factory.bootstrapped",),
     ),
     ActionDefinition(
         "event.list",
         "Read signed event records, including governed event payloads.",
         "omf event list [--run-id <run-id>]",
         path="/v1/events",
-        risk="medium",
-        cost_class="metadata",
-        preconditions=("factory.bootstrapped", "caller.authorized-for-event-payloads"),
-        effects=("No state change; response may contain sensitive event payloads.",),
     ),
     ActionDefinition(
         "data.verify",
         "Verify a dataset snapshot and locally held content by digest.",
         "omf data verify <name>",
         path="/v1/data/{name}/verify",
-        cost_class="io",
-        preconditions=("dataset.exists", "referenced-content.available"),
     ),
     ActionDefinition(
         "data.revoke",
@@ -545,16 +351,6 @@ _ACTIONS = (
         path="/v1/data/{name}/revoke",
         scope="write",
         mutates=True,
-        idempotency="resource-content-idempotent-events-repeat",
-        risk="high",
-        cost_class="metadata",
-        preconditions=("dataset.exists", "operator.approved"),
-        effects=(
-            "New revoked DatasetSnapshot revision committed.",
-            "Future coordinator use denied.",
-        ),
-        approval_required=True,
-        destructive=True,
     ),
     ActionDefinition(
         "deployment.cancel",
@@ -564,13 +360,6 @@ _ACTIONS = (
         path="/v1/deployments/{name}/cancel",
         scope="write",
         mutates=True,
-        idempotency="convergent-reconciliation",
-        risk="high",
-        cost_class="compute",
-        preconditions=("deployment.exists",),
-        effects=("Current execution stops.", "Deployment status and event advance."),
-        approval_required=True,
-        destructive=True,
     ),
     ActionDefinition(
         "token.create",
@@ -580,12 +369,6 @@ _ACTIONS = (
         path="/v1/tokens",
         scope="admin",
         mutates=True,
-        idempotency="new-credential-identity",
-        risk="high",
-        cost_class="metadata",
-        preconditions=("actor.identified", "scopes.valid"),
-        effects=("API credential created; plaintext token returned once.",),
-        approval_required=True,
     ),
     ActionDefinition(
         "token.list",
@@ -593,9 +376,6 @@ _ACTIONS = (
         "omf admin token list",
         path="/v1/tokens",
         scope="admin",
-        risk="medium",
-        cost_class="metadata",
-        preconditions=("factory.bootstrapped",),
     ),
     ActionDefinition(
         "token.revoke",
@@ -605,32 +385,18 @@ _ACTIONS = (
         path="/v1/tokens/{token_id}",
         scope="admin",
         mutates=True,
-        idempotency="content-idempotent",
-        risk="high",
-        cost_class="metadata",
-        preconditions=("token.exists",),
-        effects=("Credential can no longer authenticate.",),
-        approval_required=True,
-        destructive=True,
     ),
     ActionDefinition(
         "operation.list",
         "Read operation lifecycle metadata with an optional state filter.",
         "omf operation list [--state <state>]",
         path="/v1/operations",
-        cost_class="metadata",
-        preconditions=("factory.bootstrapped",),
-        effects=("No state change; full operation records may include request or result data.",),
     ),
     ActionDefinition(
         "operation.get",
         "Read one exact operation lifecycle record.",
         "omf operation get <operation-id>",
         path="/v1/operations/{operation_id}",
-        risk="medium",
-        cost_class="metadata",
-        preconditions=("operation.exists", "caller.authorized-for-operation-payloads"),
-        effects=("No state change; response may include request or result data.",),
     ),
     ActionDefinition(
         "operation.reconcile",
@@ -640,16 +406,6 @@ _ACTIONS = (
         path="/v1/operations/{operation_id}/reconcile",
         scope="write",
         mutates=True,
-        idempotency="operation-keyed-no-replay",
-        risk="high",
-        cost_class="compute",
-        preconditions=("operation.exists", "operation.kind=run", "operation.actor=caller"),
-        effects=(
-            (
-                "Execute pending work or resume admitted execution under an exclusive lease; "
-                "ambiguous launches require inspection before replay."
-            ),
-        ),
     ),
     ActionDefinition(
         "secret.set",
@@ -658,13 +414,6 @@ _ACTIONS = (
         method=None,
         scope="admin",
         mutates=True,
-        idempotency="guarded-compare-and-set",
-        risk="high",
-        cost_class="metadata",
-        preconditions=("operator.approved", "purpose.explicit"),
-        effects=("Encrypted secret version advances; plaintext is not logged or listed.",),
-        approval_required=True,
-        destructive=True,
     ),
     ActionDefinition(
         "secret.list",
@@ -672,16 +421,9 @@ _ACTIONS = (
         "omf admin secret list",
         method=None,
         scope="admin",
-        risk="medium",
-        cost_class="metadata",
-        preconditions=("factory.bootstrapped",),
-        effects=("No state change; no plaintext values are returned.",),
     ),
     ActionDefinition(
-        "run.list",
-        "List runs and their current status.",
-        "omf runs list",
-        path="/v1/runs",
+        "run.list", "List runs and their current status.", "omf runs list", path="/v1/runs"
     ),
     ActionDefinition(
         "release.list",
@@ -708,17 +450,9 @@ _ACTIONS = (
         path="/v1/deployments",
     ),
     ActionDefinition(
-        "store.list",
-        "List artifact store declarations.",
-        "omf store list",
-        path="/v1/stores",
+        "store.list", "List artifact store declarations.", "omf store list", path="/v1/stores"
     ),
-    ActionDefinition(
-        "data.list",
-        "List dataset snapshots.",
-        "omf data list",
-        path="/v1/data",
-    ),
+    ActionDefinition("data.list", "List dataset snapshots.", "omf data list", path="/v1/data"),
     ActionDefinition(
         "sync.pull",
         "Fetch missing verified chunks from a source store.",
@@ -726,12 +460,6 @@ _ACTIONS = (
         method=None,
         scope="write",
         mutates=True,
-        plan_supported=True,
-        idempotency="transfer-convergent-events-repeat",
-        risk="medium",
-        cost_class="io",
-        preconditions=("asset.exists", "stores.reachable", "transfer.policy-allows"),
-        effects=("Missing chunks transferred when not planning.", "Replica event emitted."),
     ),
     ActionDefinition(
         "module.init",
@@ -739,10 +467,6 @@ _ACTIONS = (
         "omf module init <directory> [--name <name>]",
         mutates=True,
         scope="write",
-        risk="medium",
-        cost_class="io",
-        idempotency="not-guaranteed",
-        effects=("Create a starter module in the project.",),
     ),
     ActionDefinition(
         "backup.restore",
@@ -750,10 +474,6 @@ _ACTIONS = (
         "omf admin restore <source> [--expected-key-id <id>]",
         mutates=True,
         scope="admin",
-        risk="medium",
-        cost_class="io",
-        idempotency="not-guaranteed",
-        effects=("Restore a verified backup into an uninitialized project.",),
     ),
     ActionDefinition(
         "api.serve",
@@ -761,12 +481,9 @@ _ACTIONS = (
         "omf api serve [--host <host>] [--port <port>]",
         mutates=True,
         scope="admin",
-        risk="medium",
-        cost_class="io",
-        idempotency="not-guaranteed",
-        effects=("Serve the authenticated local HTTP API.",),
     ),
 )
+
 
 ACTION_BY_NAME = {item.action: item for item in _ACTIONS}
 
@@ -782,7 +499,7 @@ def capability_catalog(action: str | None = None) -> dict[str, Any]:
     selected = (action_definition(action),) if action is not None else _ACTIONS
     body = {
         "apiVersion": "omf.agent/v1alpha1",
-        "catalogVersion": 1,
+        "catalogVersion": 2,
         "actions": [item.as_dict() for item in selected],
     }
     return {**body, "catalogDigest": sha256_digest(body)}

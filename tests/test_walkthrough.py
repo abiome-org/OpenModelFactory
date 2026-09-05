@@ -7,10 +7,8 @@ import sys
 import tarfile
 from pathlib import Path
 
-import pytest
 import yaml
 from omf.config import ProjectPaths, bootstrap
-from omf.errors import IntegrityError
 from omf.factory import Factory
 from omf.install_support import copy_starter
 
@@ -165,14 +163,13 @@ def test_walkthrough_transcript_executes_end_to_end(tmp_path):
         evaluations = factory.list_resources(kind="EvaluationResult")
         assert len(evaluations) == 1
         assert evaluations[0]["spec"]["scores"]["passed"]
-        with pytest.raises(IntegrityError, match="promotion denied"):
-            factory.create_release(
-                run_id,
-                name="walkthrough-without-scanner-evidence",
-                intended_use="walkthrough test",
-                promote=True,
-                approvals=["independent-reviewer"],
-            )
+        release = factory.create_release(
+            run_id,
+            name="walkthrough-v1",
+            intended_use="walkthrough test",
+            promote=True,
+        )
+        assert factory.show_release("alias/candidate")["release"] == release
 
 
 def test_source_distribution_contains_the_docs_and_starter(tmp_path):

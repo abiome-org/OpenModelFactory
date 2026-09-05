@@ -18,7 +18,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from omf.agent import AgentControl
+from omf.agent import FactoryView
 from omf.artifacts import ArtifactBuilder, ArtifactManifest, AtomicCheckpointPublisher
 from omf.backups import create_backup
 from omf.canonical import canonical_json, load_document, portable_relative_path, sha256_digest
@@ -320,7 +320,7 @@ class Factory:
         self.local_store = FilesystemStore(paths.store)
         self.executors = executors or default_executor_registry()
         self._policy_cache: tuple[tuple[tuple[str, int, int], ...], ProjectPolicy] | None = None
-        self.agent = AgentControl(self)
+        self.agent = FactoryView(self)
         self.evaluation = EvaluationService(self)
         self.publishing = PublishingService(self)
         self.deployments = DeploymentService(self)
@@ -2332,7 +2332,7 @@ class Factory:
     @staticmethod
     def _is_reference_input(reference: str) -> bool:
         return (
-            reference.startswith(("release/", "checkpoint/", "artifact:sha256:"))
+            reference.startswith(("release/", "alias/", "checkpoint/", "artifact:sha256:"))
             or re.fullmatch(r"sha256:[0-9a-f]{64}", reference) is not None
         )
 
@@ -2354,15 +2354,19 @@ class Factory:
         return pinned
 
     def _pin_reference(self, reference: str, expected: dict[str, Any] | None) -> dict[str, Any]:
-        if reference.startswith(("release/", "checkpoint/")):
-            kind = "Release" if reference.startswith("release/") else "Checkpoint"
+        if reference.startswith(("release/", "alias/", "checkpoint/")):
+            kind = "Checkpoint" if reference.startswith("checkpoint/") else "Release"
             name = reference.split("/", 1)[1]
             if not name or "@" in name:
                 raise ValidationError(f"reference input must use {kind.lower()}/<name>")
             resource = (
                 self._resource_by_uri(kind, str(expected["uri"]))
                 if expected is not None
-                else self.find_resource(kind, name)
+                else (
+                    self.publishing.resolve_release(reference)
+                    if kind == "Release"
+                    else self.find_resource(kind, name)
+                )
             )
             pinned = (
                 self._pin_release(resource, name)
@@ -2644,7 +2648,6 @@ class Factory:
         limitations: list[str] | None = None,
         promote: bool = False,
         alias: str = "candidate",
-        approvals: list[str] | None = None,
         vulnerability_report: str | Path | None = None,
         evaluation_ref: str | None = None,
     ) -> dict[str, Any]:
@@ -2655,10 +2658,14 @@ class Factory:
             limitations=limitations,
             promote=promote,
             alias=alias,
-            approvals=approvals,
             vulnerability_report=vulnerability_report,
             evaluation_ref=evaluation_ref,
         )
+
+    def promote_release(
+        self, name: str, *, alias: str = "candidate", expected_version: int | None = None
+    ) -> dict[str, Any]:
+        return self.publishing.promote_release(name, alias=alias, expected_version=expected_version)
 
     def create_experiment(
         self,

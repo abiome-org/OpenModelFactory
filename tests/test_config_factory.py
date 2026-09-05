@@ -152,17 +152,15 @@ def test_clean_clone_to_signed_release_and_edge_deployment(tmp_path):
                 }
             )
         )
-        with pytest.raises(IntegrityError, match="vulnerabilities"):
-            factory.create_release(
-                run["runId"],
-                name="unscanned",
-                intended_use="test",
-                promote=True,
-                approvals=["independent-reviewer"],
-            )
-        assert all(
-            item["metadata"]["name"] != "unscanned"
-            for item in factory.list_resources(kind="Release")
+        unscanned = factory.create_release(
+            run["runId"],
+            name="unscanned",
+            intended_use="test",
+            promote=True,
+        )
+        assert (
+            unscanned["spec"]["extensions"]["manifest"]["vulnerabilities"]["status"]
+            == "not-scanned"
         )
         conflicting_evaluation = deepcopy(evaluation)
         conflicting_evaluation["metadata"] = {
@@ -178,13 +176,14 @@ def test_clean_clone_to_signed_release_and_edge_deployment(tmp_path):
             name="release-one",
             intended_use="test",
             promote=True,
-            approvals=["independent-reviewer"],
             vulnerability_report=scan_path,
             evaluation_ref=evaluation["metadata"]["revision"],
         )
-        assert release["spec"]["extensions"]["promotionDecision"]["outcome"] == "allow"
+        assert factory.publishing.promotion_decision(release).outcome == "allow"
         assert release["spec"]["extensions"]["manifest"]["vulnerabilities"]["status"] == "passed"
-        assert release["spec"]["extensions"]["manifest"]["sbom"]["spdxVersion"] == "SPDX-2.3"
+        assert release["spec"]["extensions"]["manifest"]["provenance"][
+            "runRef"
+        ] == factory._resource_uri(factory._run_resource(run["runId"]))
         assert release["spec"]["extensions"]["manifest"]["compatibility"]["passed"] is True
         assert (
             release["spec"]["extensions"]["manifest"]["compatibility"]["evaluationRevision"]
@@ -813,7 +812,6 @@ def test_alias_promotion_moves_between_releases(paths):
             name="release-one",
             intended_use="test",
             promote=True,
-            approvals=["independent-reviewer"],
             vulnerability_report=scan_path,
         )
         aliases = AliasRepository(factory.db)
@@ -827,7 +825,6 @@ def test_alias_promotion_moves_between_releases(paths):
             name="release-two",
             intended_use="test",
             promote=True,
-            approvals=["independent-reviewer"],
             vulnerability_report=scan_path,
         )
         assert aliases.get("candidate") == (
@@ -961,7 +958,6 @@ def test_service_deployment_serves_release_through_admitted_adapter(tmp_path):
             name="affine-v1",
             intended_use="test",
             promote=True,
-            approvals=["independent-reviewer"],
             vulnerability_report=_scan_for(paths, factory, run),
         )
         (paths.root / "modules/examples/affine-serving/main.py").write_text(
@@ -1029,7 +1025,8 @@ def test_service_deployment_serves_release_through_admitted_adapter(tmp_path):
             factory.deploy(deployment_path)
 
 
-def test_reference_inputs_pin_prior_release_checkpoint_and_artifact(tmp_path):
+@pytest.mark.parametrize("base_reference", ["release/affine-v1", "alias/candidate"])
+def test_reference_inputs_pin_prior_release_checkpoint_and_artifact(tmp_path, base_reference):
     paths, workload_path = _affine_project(tmp_path)
     probe = paths.root / "modules/probe"
     shutil.copytree(paths.root / "modules/examples/statistical", probe)
@@ -1090,7 +1087,6 @@ def test_reference_inputs_pin_prior_release_checkpoint_and_artifact(tmp_path):
             name="affine-v1",
             intended_use="test",
             promote=True,
-            approvals=["independent-reviewer"],
             vulnerability_report=_scan_for(paths, factory, baseline),
         )
         release_uri = factory._resource_uri(release)
@@ -1108,7 +1104,7 @@ def test_reference_inputs_pin_prior_release_checkpoint_and_artifact(tmp_path):
         assert len(factory.list_resources(kind="Run")) == 1
 
         refined = factory.run(
-            refine_workload("release/affine-v1", f"checkpoint/{checkpoint_name}", model_digest),
+            refine_workload(base_reference, f"checkpoint/{checkpoint_name}", model_digest),
             paths.root / "bindings/local.yaml",
         )
         seen = refined["outputs"]["refine.seen"]
@@ -1132,7 +1128,7 @@ def test_reference_inputs_pin_prior_release_checkpoint_and_artifact(tmp_path):
     assert seen["raw"]["state"] is None
     assert materialized == ["base", "ckpt", "raw"]
     assert admission["admittedReferences"] == {
-        "release/affine-v1": release_uri,
+        base_reference: release_uri,
         f"checkpoint/{checkpoint_name}": factory._resource_uri(checkpoint),
         model_digest: f"artifact:{model_digest}",
     }
@@ -1471,7 +1467,6 @@ def test_model_neutral_from_scratch_golden_path(tmp_path, monkeypatch):
                 name="missing-serving-scan",
                 intended_use="test",
                 promote=True,
-                approvals=["independent-reviewer"],
                 vulnerability_report=scan_path,
             )
         scan["subjects"].append(admission["inferenceAdapter"]["sourceDigest"])
@@ -1528,7 +1523,6 @@ def test_model_neutral_from_scratch_golden_path(tmp_path, monkeypatch):
                     name="rights-race",
                     intended_use="test",
                     promote=True,
-                    approvals=["independent-reviewer"],
                     vulnerability_report=scan_path,
                 )
             except Exception as error:
@@ -2445,3 +2439,92 @@ def test_checkpoint_publication_rejects_incomplete_stage_results(paths, failure)
             ]
             == "Failed"
         )
+
+
+def test_release_preservation_and_selection_use_current_requirements(paths):
+    def require(**requirements):
+        policy_dir = paths.root / "policies"
+        policy_dir.mkdir(exist_ok=True)
+        (policy_dir / "default.yaml").write_text(
+            yaml.safe_dump(
+                {
+                    "apiVersion": "omf.dev/v1alpha1",
+                    "kind": "Policy",
+                    "metadata": {"name": "default"},
+                    "spec": {
+                        "rules": [
+                            {"name": "owner", "effect": "allow", "match": {"actor": "local-user"}}
+                        ],
+                        "config": {"promotion": requirements},
+                    },
+                }
+            )
+        )
+
+    with Factory(paths) as factory:
+        _add_numbers(factory, paths)
+        run = factory.run(*_statistical(paths))
+        unevaluated = factory.create_release(run["runId"], name="early", intended_use="test")
+        assert unevaluated["spec"]["extensions"]["manifest"]["evaluations"] == []
+        assert factory.show_release("early")["aliases"] == []
+        with pytest.raises(IntegrityError, match="evaluation"):
+            factory.promote_release("early")
+        require(requireEvaluationPass=False)
+        assert factory.promote_release("early")["version"] == 1
+        with pytest.raises(ConflictError, match="version"):
+            factory.promote_release("early", expected_version=99)
+        assert factory.show_release("early")["release"] == unevaluated
+        require(requireEvaluationPass=True)
+        with pytest.raises(IntegrityError, match="evaluation"):
+            factory.promote_release("early", alias="stable")
+
+        factory.evaluate(run["runId"])
+        measured = factory.create_release(run["runId"], name="measured", intended_use="test")
+        assert factory.promote_release("measured", expected_version=1)["version"] == 2
+        assert factory.show_release("early")["release"] == unevaluated
+        require(requireVulnerabilityScan=True)
+        with pytest.raises(IntegrityError, match="vulnerabilities"):
+            factory.promote_release("measured", alias="stable")
+        require()
+        selected_path = paths.root / "selected.yaml"
+        selected_path.write_text(
+            yaml.safe_dump(
+                {
+                    "apiVersion": "omf.dev/v1alpha1",
+                    "kind": "DeploymentSpec",
+                    "metadata": {"name": "selected"},
+                    "spec": {"releaseRef": "alias/candidate", "extensions": {"form": "edge"}},
+                }
+            )
+        )
+        first = factory.deploy(selected_path)
+        assert first["deployment"]["spec"]["releaseRef"] == factory._resource_uri(measured)
+        revised = factory.create_release(run["runId"], name="measured", intended_use="revised")
+        assert factory.show_release("alias/candidate")["release"] == measured
+        assert factory.show_release("alias/candidate")["aliasVersions"] == {"candidate": 2}
+        factory.promote_release("measured", expected_version=2)
+        second = factory.deploy(selected_path)
+        assert second["deployment"]["spec"]["releaseRef"] == factory._resource_uri(revised)
+        version = factory.deployment_status("selected")["statusVersion"]
+        rolled_back = factory.rollback_deployment("selected", expected_version=version)
+        assert rolled_back["deployment"] == first["deployment"]
+        assert rolled_back["status"]["releaseRevision"] == measured["metadata"]["revision"]
+        factory.revoke_data("example-numbers", reason="consent withdrawn")
+        with pytest.raises(IntegrityError, match="rights"):
+            factory.promote_release("measured", alias="stable")
+        deployment = paths.root / "revoked-deployment.yaml"
+        deployment.write_text(
+            yaml.safe_dump(
+                {
+                    "apiVersion": "omf.dev/v1alpha1",
+                    "kind": "DeploymentSpec",
+                    "metadata": {"name": "revoked"},
+                    "spec": {"releaseRef": "release/measured", "extensions": {"form": "edge"}},
+                }
+            )
+        )
+        with pytest.raises(IntegrityError, match="current promotion policy"):
+            factory.deploy(deployment)
+        with pytest.raises(IntegrityError, match="current promotion policy"):
+            factory.rollback_deployment("selected", expected_version=rolled_back["statusVersion"])
+        assert factory.show_release(factory._resource_uri(measured))["release"] == measured

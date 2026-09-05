@@ -101,5 +101,4 @@ that used the same evaluation revisions and records `baseline`, `candidate`,
 or `tie` with the delta. References may be `run/<id>`, an evaluation result
 name, or a full `omf://` URI. Statistical treatment, repeats, slices, and
 uncertainty belong to evaluator modules and their artifacts; the experiment
-decision is only as strong as the metric behind it. Record the conclusion with
-`omf knowledge record` and cite the experiment revision in the model card.
+decision is only as strong as the metric behind it. Record the conclusion and experiment revision in the model card.

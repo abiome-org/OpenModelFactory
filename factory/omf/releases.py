@@ -10,26 +10,7 @@ from omf.errors import ConflictError, IntegrityError
 from omf.events import EventStore
 from omf.security import SigningIdentity, verify
 
-_REQUIRED = {
-    "model",
-    "state",
-    "runtime",
-    "workload",
-    "binding",
-    "dataSummary",
-    "evaluations",
-    "limitations",
-    "risk",
-    "intendedUse",
-    "prohibitedUse",
-    "compatibility",
-    "sbom",
-    "provenance",
-    "vulnerabilities",
-    "deployment",
-    "rollback",
-    "licenses",
-}
+_REQUIRED = {"format", "model", "runtime", "provenance", "dataSummary", "evaluations", "assessment"}
 
 
 @dataclass(frozen=True)
@@ -48,6 +29,8 @@ class ReleaseBuilder:
         missing = _REQUIRED - manifest.keys()
         if missing:
             raise IntegrityError(f"incomplete release manifest: {sorted(missing)}")
+        if manifest["format"] != "omf.release/v2":
+            raise IntegrityError("unsupported release format")
         unsigned = dict(manifest)
         digest = sha256_digest(unsigned)
         return Release(
@@ -61,7 +44,11 @@ class ReleaseBuilder:
 def verify_release(
     release: Release, public_key: bytes, resolver: Callable[[str], Any] | None = None
 ) -> None:
-    if _REQUIRED - release.manifest.keys() or sha256_digest(release.manifest) != release.digest:
+    if (
+        _REQUIRED - release.manifest.keys()
+        or release.manifest.get("format") != "omf.release/v2"
+        or sha256_digest(release.manifest) != release.digest
+    ):
         raise IntegrityError("release manifest integrity failure")
     verify(public_key, {"manifest": release.manifest, "digest": release.digest}, release.signature)
     if resolver:
@@ -85,11 +72,7 @@ def promote_alias(
 ) -> int:
     if getattr(policy_decision, "outcome", None) not in {"allow", "warn"}:
         raise IntegrityError("policy denied alias promotion")
-    row = db.connection.execute("SELECT version FROM aliases WHERE name=?", (name,)).fetchone()
-    current = None if row is None else int(row[0])
-    if current != expected_version:
-        raise ConflictError("alias version mismatch")
-    version = 1 if current is None else current + 1
+    version = 1 if expected_version is None else expected_version + 1
     events.append(
         type="PolicyDecisionRecorded",
         source="omf/release",
@@ -102,6 +85,9 @@ def promote_alias(
     )
 
     def mutation(connection: Any) -> None:
+        row = connection.execute("SELECT version FROM aliases WHERE name=?", (name,)).fetchone()
+        if (None if row is None else int(row[0])) != expected_version:
+            raise ConflictError("alias version mismatch")
         connection.execute(
             "INSERT INTO aliases VALUES(?,?,?,?) ON CONFLICT(name) DO UPDATE SET "
             "uid=excluded.uid,revision=excluded.revision,version=excluded.version",

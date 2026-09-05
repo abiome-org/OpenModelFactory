@@ -12,7 +12,7 @@ from typer.testing import CliRunner
 
 def test_cli_help_version_and_bootstrap_plan(tmp_path):
     runner = CliRunner()
-    assert runner.invoke(app, ["--version"]).stdout.strip() == "1.0.0"
+    assert runner.invoke(app, ["--version"]).stdout.strip() == "2.0.0"
     assert runner.invoke(app, ["--help"]).exit_code == 0
     root = tmp_path / "project"
     root.mkdir()
@@ -33,10 +33,10 @@ spec: {owners: [local-user], extensions: {}}
         app, ["--project", str(root), "--output", "json", "agent", "capabilities"]
     )
     assert capabilities.exit_code == 0
-    assert json.loads(capabilities.stdout)["catalogVersion"] == 1
+    assert json.loads(capabilities.stdout)["catalogVersion"] == 2
     context = runner.invoke(app, ["--project", str(root), "--output", "json", "agent", "context"])
     assert context.exit_code == 0
-    assert json.loads(context.stdout)["recommendations"][0]["action"] == "project.bootstrap"
+    assert json.loads(context.stdout)["bootstrapPlan"]["actions"]
 
 
 def _full_project(tmp_path):
@@ -72,40 +72,7 @@ def test_cli_complete_local_lifecycle(tmp_path):
 
     assert invoke("bootstrap")["ready"]
     assert invoke("doctor")["ready"]
-    goal = invoke(
-        "goal",
-        "create",
-        "quality",
-        "--objective",
-        "Improve quality",
-        "--success",
-        "score >= 0.9",
-        "--budget",
-        "gpuHours=2",
-    )
-    assert goal["statusVersion"] == 1
-    assert invoke("goal", "list", "--state", "active")["total"] == 1
-    assert (
-        invoke(
-            "knowledge",
-            "record",
-            "baseline",
-            "--category",
-            "observation",
-            "--claim",
-            "The baseline score is 0.4.",
-            "--confidence",
-            "0.9",
-            "--evidence",
-            "evaluation:baseline",
-            "--goal-ref",
-            "goal/quality",
-        )["kind"]
-        == "Knowledge"
-    )
-    agent_context = invoke("agent", "context", "--limit", "2", "--max-bytes", "16384")
-    assert agent_context["goals"]["items"][0]["goal"]["metadata"]["name"] == "quality"
-    assert agent_context["knowledge"]["items"][0]["knowledge"]["metadata"]["name"] == "baseline"
+    assert invoke("agent", "context", "--limit", "2", "--max-bytes", "16384")["readiness"]["ready"]
     assert "Project" in invoke("schema", "list")["kinds"]
     assert invoke("schema", "show", "Project")["x-omf-kind"] == "Project"
     assert invoke("schema", "validate", root / "omf.yaml")["kind"] == "Project"
@@ -232,8 +199,6 @@ def test_cli_complete_local_lifecycle(tmp_path):
         "--intended-use",
         "test",
         "--promote",
-        "--approval",
-        "reviewer",
         "--vulnerability-report",
         vulnerability_report,
     )
@@ -242,12 +207,13 @@ def test_cli_complete_local_lifecycle(tmp_path):
         {
             "name": "release-one",
             "revision": release["metadata"]["revision"],
-            "promotion": "allow",
+            "evaluationPassed": True,
             "aliases": ["candidate"],
             "createdAt": release["metadata"]["createdAt"],
         }
     ]
-    assert invoke("release", "show", "release/release-one")["aliases"] == ["candidate"]
+    assert invoke("release", "promote", "release-one", "--alias", "stable")["version"] == 1
+    assert invoke("release", "show", "release/release-one")["aliases"] == ["candidate", "stable"]
     assert invoke("lineage", "show", f"run:{run_id}/stage:train")
     assert invoke("resource", "list", "--kind", "Release")[0]["metadata"]["name"] == "release-one"
     deployment = {
@@ -266,7 +232,7 @@ def test_cli_complete_local_lifecycle(tmp_path):
     [deployment] = invoke("deployment", "list")
     assert (deployment["name"], deployment["release"], deployment["state"]) == (
         "edge-one",
-        "release/release-one",
+        f"omf://local/cli-full/release/release-one@{release['metadata']['revision']}",
         "packaged",
     )
     revoked = invoke("data", "revoke", "example-numbers", "--reason", "test withdrawal")
@@ -351,17 +317,17 @@ def test_catalog_and_command_tree_match_and_support_focused_help():
         help_result = runner.invoke(app, [*path, "--help"])
         assert help_result.exit_code == 0, (action["action"], help_result.output)
     assert advertised == leaves(get_command(app))
-    focused = runner.invoke(app, ["--output", "json", "agent", "capabilities", "goal.status"])
+    focused = runner.invoke(app, ["--output", "json", "agent", "capabilities", "release.promote"])
     assert focused.exit_code == 0, focused.output
     action = json.loads(focused.stdout)["actions"]
     assert len(action) == 1
-    assert "--reason" in action[0]["interfaces"]["cli"]
+    assert "--alias" in action[0]["interfaces"]["cli"]
     unknown = runner.invoke(app, ["--output", "json", "agent", "capabilities", "does-not-exist"])
     assert unknown.exit_code == 1
     assert json.loads(unknown.stdout)["error"]["code"] == "not_found"
 
 
-def test_cli_secret_stdin_and_nonfinite_budget_errors(tmp_path):
+def test_cli_secret_stdin(tmp_path):
     root = _full_project(tmp_path)
     runner = CliRunner()
     prefix = ["--project", str(root), "--output", "json"]
@@ -375,25 +341,6 @@ def test_cli_secret_stdin_and_nonfinite_budget_errors(tmp_path):
     assert "private-value" not in secret.output
     with Factory(ProjectPaths(root)) as factory:
         assert factory.secrets.get("sample", "test") == b"private-value"
-    for budget in ("hours=nan", "hours=inf", "hours=-1"):
-        invalid = runner.invoke(
-            app,
-            [
-                *prefix,
-                "goal",
-                "create",
-                "bad",
-                "--objective",
-                "Test",
-                "--success",
-                "pass",
-                "--budget",
-                budget,
-            ],
-        )
-        assert invalid.exit_code == 1
-        assert json.loads(invalid.stdout)["error"]["code"] == "validation_error"
-    assert json.loads(runner.invoke(app, [*prefix, "goal", "list"]).stdout)["total"] == 0
     events = runner.invoke(app, [*prefix, "event", "list"])
     assert events.exit_code == 0
     assert isinstance(json.loads(events.stdout), list)
