@@ -16,7 +16,7 @@ make example
 
 This downloads the public UCI SMS corpus, trains three scikit-learn classifiers,
 interrupts and recovers a controller, selects a candidate, reproduces its scores,
-and tests exported inference in a fresh environment. Open
+saves and selects a release, and tests exported inference in a fresh environment. Open
 `.venv/text-classification/review.html` for the comparison and `results.json`
 for timings, compute, and reproduction evidence. Use `EXAMPLE_DIR=/new/path`
 to repeat it. The [example definition](examples/text-classification/experiment.yaml)
@@ -68,12 +68,22 @@ HTTP expose the same workflow; `omf agent capabilities experiment.run` describes
 
 ## Releases and deployment
 
-The [walkthrough](docs/walkthrough.md) covers the lower-level workload, comparison,
-signed release, and local serving lifecycle. `./install.sh /path/to/model-project`
-installs its runnable starter and operator guide. Existing files are preserved.
-Generated experiment manifests remain inspectable under `.omf/experiments/`.
+Save a named version, then select it when it meets your project's requirements:
 
-OMF 1.0 supports the local lifecycle on CPython 3.11/3.12 on Linux x86-64 and
+```sh
+omf release create <run-id> --name v1 --intended-use "Classify incoming text"
+omf release promote v1 --alias candidate
+```
+
+Releases preserve exact data, captured code, artifacts, and evaluation evidence.
+Failed evaluation does not prevent saving a version. Selection requires passing
+evaluation by default; projects can configure additional checks. See
+[releases](docs/releases.md) for policy and serving, or the
+[walkthrough](docs/walkthrough.md) for a complete workload lifecycle.
+`./install.sh /path/to/model-project` installs a runnable starter and operator
+guide. Existing files are preserved.
+
+OMF 2 supports the local lifecycle on CPython 3.11/3.12 on Linux x86-64 and
 the `omf.executor/v1` plugin contract. Only local execution is built in. Production
 scale, cluster recovery, and full air-gap operation require deployment-specific
 evidence. See [operations](docs/operations.md) for installation and support policy.
@@ -89,7 +99,7 @@ evidence. See [operations](docs/operations.md) for installation and support poli
 | [Evaluation](docs/evaluation.md) | Metrics, compatibility, comparisons |
 | [Releases](docs/releases.md) | Promotion, aliases, deployments, serving |
 | [Executors](docs/executors.md) | Provider capabilities and plugin API |
-| [Agent control](docs/agent-control.md) | Context, goals, knowledge, action catalog |
+| [Agent state](docs/agent-control.md) | Factory context and command discovery |
 | [Architecture](docs/architecture.md) | Code ownership and invariants |
 
 Git holds code and configuration. Artifact stores hold data and models. `.omf/`

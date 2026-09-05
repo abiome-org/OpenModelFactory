@@ -83,14 +83,14 @@ source.with_name(source.name + ".sig").write_text(hashlib.sha256(source.read_byt
         source_marker.unlink(missing_ok=True)
     report = json.loads(release.stdout)
     assert report == {
-        "version": "1.0.0",
+        "version": "2.0.0",
         "reproducible": True,
         "artifacts": [
-            "open_model_factory-1.0.0-py3-none-any.whl",
-            "open_model_factory-1.0.0.tar.gz",
+            "open_model_factory-2.0.0-py3-none-any.whl",
+            "open_model_factory-2.0.0.tar.gz",
         ],
-        "sbom": "open-model-factory-1.0.0.spdx.json",
-        "provenance": "open-model-factory-1.0.0.provenance.json",
+        "sbom": "open-model-factory-2.0.0.spdx.json",
+        "provenance": "open-model-factory-2.0.0.provenance.json",
         "checksums": "SHA256SUMS",
         "signature": "SHA256SUMS.sig",
     }
@@ -106,7 +106,7 @@ source.with_name(source.name + ".sig").write_text(hashlib.sha256(source.read_byt
 
     sbom = json.loads((distribution / report["sbom"]).read_text())
     assert sbom["spdxVersion"] == "SPDX-2.3"
-    assert {package["versionInfo"] for package in sbom["packages"][:2]} == {"1.0.0"}
+    assert {package["versionInfo"] for package in sbom["packages"][:2]} == {"2.0.0"}
     assert {package["downloadLocation"] for package in sbom["packages"][:2]} == {"NOASSERTION"}
     assert all("externalRefs" not in package for package in sbom["packages"][:2])
     provenance = json.loads((distribution / report["provenance"]).read_text())
@@ -121,13 +121,13 @@ source.with_name(source.name + ".sig").write_text(hashlib.sha256(source.read_byt
     assert set(source_patch) == {"sha256"}
     assert len(source_patch["sha256"]) == 64
 
-    wheel = distribution / "open_model_factory-1.0.0-py3-none-any.whl"
+    wheel = distribution / "open_model_factory-2.0.0-py3-none-any.whl"
     with zipfile.ZipFile(wheel) as archive:
         metadata_name = next(
             name for name in archive.namelist() if name.endswith(".dist-info/METADATA")
         )
         metadata = BytesParser().parsebytes(archive.read(metadata_name))
-    assert metadata["Version"] == "1.0.0"
+    assert metadata["Version"] == "2.0.0"
     assert metadata["Requires-Python"] == "<3.13,>=3.11"
 
     isolated = tmp_path / "isolated"
@@ -157,7 +157,7 @@ source.with_name(source.name + ".sig").write_text(hashlib.sha256(source.read_byt
         cwd=isolated,
         env=environment,
     )
-    assert json.loads(installed.stdout) == {"version": "1.0.0", "isolated": True}
+    assert json.loads(installed.stdout) == {"version": "2.0.0", "isolated": True}
 
     project = tmp_path / "candidate-project"
     project.mkdir()
@@ -244,7 +244,7 @@ spec: {owners: [release-test], extensions: {}}
     )
     assert upgraded.stdout.strip() == "6"
 
-    sdist = distribution / "open_model_factory-1.0.0.tar.gz"
+    sdist = distribution / "open_model_factory-2.0.0.tar.gz"
     with tarfile.open(sdist, "r:gz") as archive:
         members = {item.name.split("/", 1)[1] for item in archive if "/" in item.name}
     assert {"README.md", "CHANGELOG.md", "docs/walkthrough.md", "install.sh"} <= members
@@ -270,7 +270,7 @@ spec: {owners: [release-test], extensions: {}}
             cwd=isolated,
             env=environment,
         ).stdout.strip()
-        == "1.0.0"
+        == "2.0.0"
     )
 
 

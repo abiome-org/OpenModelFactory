@@ -210,7 +210,7 @@ def test_evaluation_only_data_runs_reproduces_and_retains_rights(tmp_path):
         heldout = factory.find_resource("DatasetSnapshot", "regression-heldout")
         assert heldout["spec"]["rights"]["trainingAllowed"] is False
         release = factory.create_release(run["id"], name="heldout-model", intended_use="Testing")
-        explanations = release["spec"]["extensions"]["promotionDecision"]["explanations"]
+        explanations = factory.publishing.promotion_decision(release).explanations
         assert any(item["rule"] == "rights" and item["effect"] == "allow" for item in explanations)
 
 
@@ -250,7 +250,7 @@ def test_shared_dataset_requires_both_uses_through_release(tmp_path):
             rights={"license": "CC0-1.0", "trainingAllowed": True, "evaluationAllowed": False},
         )
         release = factory.create_release(run["id"], name="shared-model", intended_use="Testing")
-        explanations = release["spec"]["extensions"]["promotionDecision"]["explanations"]
+        explanations = factory.publishing.promotion_decision(release).explanations
         assert any(item["rule"] == "rights" and item["effect"] == "deny" for item in explanations)
         recipe = yaml.safe_load(definition.read_text())
         recipe["data"]["samples"]["rights"]["evaluationAllowed"] = False
@@ -549,3 +549,16 @@ def test_directory_model_passes_between_scripts_and_exports(tmp_path, artifact):
         assert json.loads((model / "weights.json").read_text()) == {"bias": 2.0}
         assert {path.name for path in model.iterdir()} == {"weights.json"}
         assert (Path(exported["destination"]) / "source/train/train.py").read_text() == source
+
+
+def test_failed_candidate_can_be_saved_without_passing_selection(tmp_path):
+    paths, definition = project(tmp_path)
+    with Factory(paths) as factory:
+        baseline = factory.experiments.run(definition, "baseline")
+        release = factory.create_release(baseline["runId"], name="baseline", intended_use="test")
+        manifest = release["spec"]["extensions"]["manifest"]
+        assert manifest["evaluations"]
+        assert manifest["assessment"]["evaluation_passed"] is False
+        with pytest.raises(IntegrityError, match="evaluation"):
+            factory.promote_release("baseline")
+        assert factory.show_release("baseline")["release"] == release

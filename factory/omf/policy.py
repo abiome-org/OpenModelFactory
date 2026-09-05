@@ -2,13 +2,11 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal
 
 from omf.canonical import load_document, sha256_digest
-from omf.errors import IntegrityError, ValidationError
-from omf.security import verify
+from omf.errors import ValidationError
 
 WORKTREE_MODES = ("deny", "allow", "archive")
 _POLICY_SUFFIXES = (".yaml", ".yml", ".json")
@@ -30,11 +28,12 @@ class PolicyDecision:
 
 
 class PolicyEngine:
-    fields = frozenset(
-        {"actor", "action", "resource", "purpose", "classification", "residency", "evidence"}
-    )
+    fields = frozenset({"actor", "action", "resource", "purpose"})
 
     def __init__(self, rules: list[PolicyRule]) -> None:
+        for rule in rules:
+            if unknown := rule.match.keys() - self.fields:
+                raise ValidationError(f"unsupported policy match fields: {sorted(unknown)}")
         self.rules = tuple(rules)
         self.digest = sha256_digest(
             [
@@ -48,9 +47,7 @@ class PolicyEngine:
         effects: list[str] = []
         for rule in self.rules:
             if all(
-                self._matches(context.get(key), expected)
-                for key, expected in rule.match.items()
-                if key in self.fields
+                self._matches(context.get(key), expected) for key, expected in rule.match.items()
             ):
                 effects.append(rule.effect)
                 matched.append({"rule": rule.name, "effect": rule.effect, "reason": rule.reason})
@@ -82,35 +79,17 @@ def _dirty_worktree(value: Any) -> Any:
     return value
 
 
-def _unsigned_modules(value: Any) -> Any:
-    if value != "deny":
-        raise ValidationError("policy unsignedModules supports only 'deny'")
-    return value
-
-
-def _sync(value: Any) -> Any:
-    if not isinstance(value, dict) or set(value) - {"requirePlan", "allowDelete"}:
-        raise ValidationError("policy sync accepts only requirePlan and allowDelete")
-    if not isinstance(value.get("requirePlan", True), bool):
-        raise ValidationError("policy sync.requirePlan must be a boolean")
-    if value.get("allowDelete", False) is not False:
-        raise ValidationError("policy sync.allowDelete must be false; sync never deletes")
-    return dict(value)
-
-
 def _promotion(value: Any) -> Any:
-    allowed = {"requireEvaluationPass", "requireCompleteLineage"}
+    allowed = {"requireEvaluationPass", "requireCompatibilityPass", "requireVulnerabilityScan"}
     if not isinstance(value, dict) or set(value) - allowed:
         raise ValidationError(f"policy promotion accepts only {', '.join(sorted(allowed))}")
-    if any(value.get(name, True) is not True for name in allowed):
-        raise ValidationError("policy promotion gates are mandatory and must remain true")
+    if any(not isinstance(item, bool) for item in value.values()):
+        raise ValidationError("policy promotion requirements must be booleans")
     return dict(value)
 
 
 _CONFIG_KEYS: dict[str, Callable[[Any], Any]] = {
     "dirtyWorktree": _dirty_worktree,
-    "unsignedModules": _unsigned_modules,
-    "sync": _sync,
     "promotion": _promotion,
 }
 
@@ -213,57 +192,30 @@ class ProjectPolicy:
         return cls(PolicyEngine(rules), config, tuple(documents), digest, directory)
 
 
-@dataclass(frozen=True)
-class BreakGlass:
-    actor: str
-    reason: str
-    expires_at: str
-    key_id: str
-    signature: str
-
-    def unsigned(self) -> dict[str, str]:
-        return {
-            "actor": self.actor,
-            "reason": self.reason,
-            "expiresAt": self.expires_at,
-            "keyId": self.key_id,
-        }
-
-
 def promotion_gate(
-    evidence: dict[str, Any],
-    *,
-    actor: str,
-    break_glass: BreakGlass | None = None,
-    public_key: bytes | None = None,
-    now: datetime | None = None,
+    evidence: dict[str, Any], requirements: dict[str, Any] | None = None
 ) -> PolicyDecision:
+    requirements = requirements or {}
     checks = {
-        "evaluation": bool(evidence.get("evaluation_passed")),
         "lineage": bool(evidence.get("lineage_complete")),
         "rights": bool(evidence.get("rights_valid")),
-        "signatures": bool(evidence.get("signatures_valid")),
-        "compatibility": bool(evidence.get("compatibility_passed")),
-        "vulnerabilities": bool(evidence.get("vulnerabilities_valid")),
-        "approvals": bool(evidence.get("approvals_valid")),
-        "separation": bool(evidence.get("separation_of_duties")),
     }
-    digest = sha256_digest({"gate": "promotion-v1", "checks": sorted(checks)})
-    failures = [name for name, passed in checks.items() if not passed]
-    if failures and break_glass is not None:
-        if public_key is None or break_glass.actor != actor:
-            raise IntegrityError("invalid break-glass actor or trust key")
-        verify(public_key, break_glass.unsigned(), break_glass.signature)
-        expiry = datetime.fromisoformat(break_glass.expires_at.replace("Z", "+00:00"))
-        if expiry <= (now or datetime.now(UTC)):
-            raise IntegrityError("break-glass authorization expired")
-        return PolicyDecision(
-            "warn",
-            digest,
-            ({"rule": "signed-break-glass", "effect": "warn", "reason": break_glass.reason},),
-        )
+    optional = {
+        "requireEvaluationPass": ("evaluation", "evaluation_passed", True),
+        "requireCompatibilityPass": ("compatibility", "compatibility_passed", False),
+        "requireVulnerabilityScan": ("vulnerabilities", "vulnerabilities_valid", False),
+    }
+    for option, (name, evidence_key, default) in optional.items():
+        if requirements.get(option, default) or (
+            name == "vulnerabilities" and evidence.get("vulnerabilities_present")
+        ):
+            checks[name] = bool(evidence.get(evidence_key))
     explanations = tuple(
-        {"rule": name, "effect": "allow" if passed else "deny", "reason": "gate evidence"}
+        {"rule": name, "effect": "allow" if passed else "deny", "reason": "release evidence"}
         for name, passed in checks.items()
     )
-    return PolicyDecision("deny" if failures else "allow", digest, explanations)
+    return PolicyDecision(
+        "allow" if all(checks.values()) else "deny",
+        sha256_digest({"gate": "promotion-v2", "requirements": requirements}),
+        explanations,
+    )

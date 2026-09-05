@@ -109,9 +109,13 @@ class ReleaseRequest(RequestModel):
     limitations: list[str] = Field(default_factory=list)
     promote: bool = False
     alias: str = "candidate"
-    approvals: list[str] = Field(default_factory=list)
     vulnerability_report: str | None = None
     evaluation_ref: str | None = None
+
+
+class ReleasePromotionRequest(RequestModel):
+    alias: str = "candidate"
+    expected_version: int | None = Field(default=None, ge=1)
 
 
 class ExperimentRequest(RequestModel):
@@ -133,51 +137,6 @@ class DeploymentRollbackRequest(RequestModel):
 class ApiTokenRequest(RequestModel):
     actor: str = Field(min_length=1)
     scopes: set[str]
-    expires_at: str | None = None
-
-
-class GoalScopeRequest(RequestModel):
-    resource_refs: list[str] = Field(default_factory=list)
-    run_ids: list[str] = Field(default_factory=list)
-
-
-class GoalRequest(RequestModel):
-    name: str
-    objective: str
-    success_criteria: list[str]
-    constraints: list[str] = Field(default_factory=list)
-    budget: dict[str, float] = Field(default_factory=dict)
-    priority: int = Field(default=50, ge=0, le=100)
-    parent_ref: str | None = None
-    scope: GoalScopeRequest = Field(default_factory=GoalScopeRequest)
-
-
-class GoalStatusRequest(RequestModel):
-    state: str
-    expected_version: int = Field(ge=0)
-    reason: str = Field(min_length=1, max_length=2048)
-
-
-class KnowledgeEvidenceRequest(RequestModel):
-    ref: str = Field(min_length=1)
-    digest: str | None = None
-
-
-class KnowledgeScopeRequest(RequestModel):
-    goal_refs: list[str] = Field(default_factory=list)
-    resource_refs: list[str] = Field(default_factory=list)
-    run_ids: list[str] = Field(default_factory=list)
-    tags: list[str] = Field(default_factory=list)
-
-
-class KnowledgeRequest(RequestModel):
-    name: str
-    category: str
-    claim: str
-    confidence: float = Field(ge=0, le=1)
-    evidence: list[KnowledgeEvidenceRequest] = Field(min_length=1)
-    scope: KnowledgeScopeRequest = Field(default_factory=KnowledgeScopeRequest)
-    supersedes: list[str] = Field(default_factory=list)
     expires_at: str | None = None
 
 
@@ -320,68 +279,6 @@ def _agent_routes(app: FastAPI, authorized: Authorized) -> None:
         value = service.agent.context(focus=focus, limit=limit, since=since, max_bytes=max_bytes)
         return _cached(response, value, "viewDigest", if_none_match)
 
-    @_action_route(app, "goal.create")
-    def goal_create(request: GoalRequest, service: Factory = Depends(authorized)) -> dict[str, Any]:
-        scope = request.scope.model_dump()
-        return service.agent.create_goal(
-            request.name,
-            objective=request.objective,
-            success_criteria=request.success_criteria,
-            constraints=request.constraints,
-            budget=request.budget,
-            priority=request.priority,
-            parent_ref=request.parent_ref,
-            scope={
-                "resourceRefs": scope["resource_refs"],
-                "runIds": scope["run_ids"],
-            },
-        )
-
-    @_action_route(app, "goal.list")
-    def goals(
-        state: str | None = None,
-        focus: str | None = None,
-        limit: int = Query(default=20, ge=1, le=100),
-        service: Factory = Depends(authorized),
-    ) -> dict[str, Any]:
-        return service.agent.list_goals(state=state, focus=focus, limit=limit)
-
-    @_action_route(app, "goal.status")
-    def goal_status(
-        name: str, request: GoalStatusRequest, service: Factory = Depends(authorized)
-    ) -> dict[str, Any]:
-        return service.agent.set_goal_status(name, **request.model_dump())
-
-    @_action_route(app, "knowledge.record")
-    def knowledge_record(
-        request: KnowledgeRequest, service: Factory = Depends(authorized)
-    ) -> dict[str, Any]:
-        scope = request.scope.model_dump()
-        return service.agent.record_knowledge(
-            request.name,
-            category=request.category,
-            claim=request.claim,
-            confidence=request.confidence,
-            evidence=[item.model_dump(exclude_none=True) for item in request.evidence],
-            scope={
-                "goalRefs": scope["goal_refs"],
-                "resourceRefs": scope["resource_refs"],
-                "runIds": scope["run_ids"],
-                "tags": scope["tags"],
-            },
-            supersedes=request.supersedes,
-            expires_at=request.expires_at,
-        )
-
-    @_action_route(app, "knowledge.list")
-    def knowledge(
-        active_only: bool = True,
-        focus: str | None = None,
-        limit: int = Query(default=20, ge=1, le=100),
-        service: Factory = Depends(authorized),
-    ) -> dict[str, Any]:
-        return service.agent.list_knowledge(active_only=active_only, focus=focus, limit=limit)
-
 
 def _data_routes(app: FastAPI, authorized: Authorized) -> None:
     @_action_route(app, "resource.list")
@@ -500,12 +397,17 @@ def _release_routes(app: FastAPI, paths: ProjectPaths, authorized: Authorized) -
             limitations=request.limitations,
             promote=request.promote,
             alias=request.alias,
-            approvals=request.approvals,
             vulnerability_report=(
                 paths.root / request.vulnerability_report if request.vulnerability_report else None
             ),
             evaluation_ref=request.evaluation_ref,
         )
+
+    @_action_route(app, "release.promote")
+    def promote_release(
+        name: str, request: ReleasePromotionRequest, service: Factory = Depends(authorized)
+    ) -> dict[str, Any]:
+        return service.promote_release(name, **request.model_dump())
 
     @_action_route(app, "experiment.create")
     def experiment(

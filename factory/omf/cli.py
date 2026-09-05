@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import math
 import sys
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
@@ -48,8 +47,6 @@ operation_app = typer.Typer(no_args_is_help=True)
 token_app = typer.Typer(no_args_is_help=True)
 admin_app = typer.Typer(no_args_is_help=True)
 agent_app = typer.Typer(no_args_is_help=True)
-goal_app = typer.Typer(no_args_is_help=True)
-knowledge_app = typer.Typer(no_args_is_help=True)
 executor_app = typer.Typer(no_args_is_help=True)
 event_app = typer.Typer(no_args_is_help=True)
 
@@ -70,8 +67,6 @@ app.add_typer(admin_app, name="admin")
 admin_app.add_typer(token_app, name="token")
 admin_app.add_typer(secret_app, name="secret")
 app.add_typer(agent_app, name="agent")
-app.add_typer(goal_app, name="goal")
-app.add_typer(knowledge_app, name="knowledge")
 app.add_typer(executor_app, name="executor")
 app.add_typer(event_app, name="event")
 
@@ -245,120 +240,6 @@ def agent_context(
             return factory.agent.context(focus=focus, limit=limit, since=since, max_bytes=max_bytes)
 
     _handle(run)
-
-
-def _budget_values(values: list[str] | None) -> dict[str, float]:
-    result: dict[str, float] = {}
-    for value in values or []:
-        key, separator, raw = value.partition("=")
-        if not separator or not key:
-            raise ValidationError("--budget must be KEY=NUMBER")
-        try:
-            parsed = float(raw)
-        except ValueError as exc:
-            raise ValidationError("--budget must be KEY=NUMBER") from exc
-        if not math.isfinite(parsed) or parsed < 0:
-            raise ValidationError("--budget values must be finite and nonnegative")
-        result[key] = parsed
-    return result
-
-
-@_action_command(goal_app, "goal.create")
-def goal_create(
-    name: str,
-    objective: str = typer.Option(..., "--objective"),
-    success: list[str] | None = typer.Option(None, "--success"),
-    constraint: list[str] | None = typer.Option(None, "--constraint"),
-    budget: list[str] | None = typer.Option(None, "--budget", help="KEY=NUMBER; repeatable"),
-    priority: int = typer.Option(50, "--priority", min=0, max=100),
-    parent_ref: str | None = typer.Option(None, "--parent-ref"),
-    resource_ref: list[str] | None = typer.Option(None, "--resource-ref"),
-    run_id: list[str] | None = typer.Option(None, "--run-id"),
-) -> None:
-    _run(
-        lambda factory: factory.agent.create_goal(
-            name,
-            objective=objective,
-            success_criteria=success or [],
-            constraints=constraint,
-            budget=_budget_values(budget),
-            priority=priority,
-            parent_ref=parent_ref,
-            scope={"resourceRefs": resource_ref or [], "runIds": run_id or []},
-        )
-    )
-
-
-@_action_command(goal_app, "goal.list")
-def goal_list(
-    state_filter: str | None = typer.Option(None, "--state"),
-    focus: str | None = typer.Option(None, "--focus"),
-    limit: int = typer.Option(20, "--limit", min=1, max=100),
-) -> None:
-    _run(lambda factory: factory.agent.list_goals(state=state_filter, focus=focus, limit=limit))
-
-
-@_action_command(goal_app, "goal.status")
-def goal_status(
-    name: str,
-    status_state: str = typer.Option(..., "--state"),
-    expected_version: int = typer.Option(..., "--expected-version", min=0),
-    reason: str = typer.Option(..., "--reason"),
-) -> None:
-    _run(
-        lambda factory: factory.agent.set_goal_status(
-            name,
-            state=status_state,
-            expected_version=expected_version,
-            reason=reason,
-        )
-    )
-
-
-@_action_command(knowledge_app, "knowledge.record")
-def knowledge_record(
-    name: str,
-    category: str = typer.Option(..., "--category"),
-    claim: str = typer.Option(..., "--claim"),
-    confidence: float = typer.Option(..., "--confidence", min=0, max=1),
-    evidence: list[str] | None = typer.Option(None, "--evidence"),
-    goal_ref: list[str] | None = typer.Option(None, "--goal-ref"),
-    resource_ref: list[str] | None = typer.Option(None, "--resource-ref"),
-    run_id: list[str] | None = typer.Option(None, "--run-id"),
-    tag: list[str] | None = typer.Option(None, "--tag"),
-    supersedes: list[str] | None = typer.Option(None, "--supersedes"),
-    expires_at: str | None = typer.Option(None, "--expires-at"),
-) -> None:
-    _run(
-        lambda factory: factory.agent.record_knowledge(
-            name,
-            category=category,
-            claim=claim,
-            confidence=confidence,
-            evidence=[{"ref": item} for item in evidence or []],
-            scope={
-                "goalRefs": goal_ref or [],
-                "resourceRefs": resource_ref or [],
-                "runIds": run_id or [],
-                "tags": tag or [],
-            },
-            supersedes=supersedes,
-            expires_at=expires_at,
-        )
-    )
-
-
-@_action_command(knowledge_app, "knowledge.list")
-def knowledge_list(
-    include_inactive: bool = typer.Option(False, "--all"),
-    focus: str | None = typer.Option(None, "--focus"),
-    limit: int = typer.Option(20, "--limit", min=1, max=100),
-) -> None:
-    _run(
-        lambda factory: factory.agent.list_knowledge(
-            active_only=not include_inactive, focus=focus, limit=limit
-        )
-    )
 
 
 @_action_command(schema_app, "schema.list")
@@ -572,7 +453,6 @@ def release_create(
     limitation: list[str] | None = typer.Option(None, "--limitation"),
     promote: bool = typer.Option(False, "--promote"),
     alias: str = typer.Option("candidate", "--alias"),
-    approval: list[str] | None = typer.Option(None, "--approval"),
     vulnerability_report: Path | None = typer.Option(None, "--vulnerability-report"),
     evaluation: str | None = typer.Option(None, "--evaluation"),
 ) -> None:
@@ -584,9 +464,21 @@ def release_create(
             limitations=limitation,
             promote=promote,
             alias=alias,
-            approvals=approval,
             vulnerability_report=vulnerability_report,
             evaluation_ref=evaluation,
+        )
+    )
+
+
+@_action_command(release_app, "release.promote")
+def release_promote(
+    name: str,
+    alias: str = typer.Option("candidate", "--alias"),
+    expected_version: int | None = typer.Option(None, "--expected-version", min=1),
+) -> None:
+    _run(
+        lambda factory: factory.promote_release(
+            name, alias=alias, expected_version=expected_version
         )
     )
 

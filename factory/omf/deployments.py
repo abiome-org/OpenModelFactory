@@ -24,7 +24,6 @@ from omf.modules import (
     load_manifest,
     validate_contract,
 )
-from omf.releases import Release, verify_release
 from omf.schema_registry import default_registry
 
 if TYPE_CHECKING:
@@ -49,23 +48,11 @@ class DeploymentService:
     def deploy(self, deployment_path: str | Path) -> dict[str, Any]:
         self.factory._authorize("deployment.apply")
         raw = self.factory._load_resource(deployment_path, kind="DeploymentSpec")
-        release_name = str(raw["spec"]["releaseRef"]).removeprefix("release/")
-        release = self.factory.find_resource("Release", release_name)
-        release_extensions = release["spec"].get("extensions", {})
-        signatures = release["spec"].get("signatures", [])
-        if len(signatures) != 1 or release_extensions.get("keyId") != self.factory.identity.key_id:
-            raise IntegrityError("deployment release signing identity mismatch")
-        verify_release(
-            Release(
-                manifest=release_extensions.get("manifest", {}),
-                digest=str(release_extensions.get("digest", "")),
-                key_id=str(release_extensions.get("keyId", "")),
-                signature=str(signatures[0]),
-            ),
-            self.factory.identity.public_bytes,
-        )
-        if release_extensions.get("promotionDecision", {}).get("outcome") != "allow":
-            raise IntegrityError("deployment release has no passing promotion policy decision")
+        release = self.factory.publishing.resolve_release(str(raw["spec"]["releaseRef"]))
+        raw["spec"]["releaseRef"] = self.factory._resource_uri(release)
+        decision = self.factory.publishing.promotion_decision(release)
+        if decision.outcome != "allow":
+            raise IntegrityError("deployment release does not meet the current promotion policy")
         extension = raw["spec"].get("extensions", {})
         form = extension.get("form", "service")
         command = extension.get("command")
@@ -160,12 +147,10 @@ class DeploymentService:
 
     def _prepare_serving(self, resource: dict[str, Any], run_dir: Path) -> tuple[list[str], str]:
         extension = resource["spec"].get("extensions", {})
-        release_name = str(resource["spec"]["releaseRef"]).removeprefix("release/")
-        release = self.factory.find_resource("Release", release_name)
+        release = self.factory._resource_by_uri("Release", resource["spec"]["releaseRef"])
         manifest = release["spec"].get("extensions", {}).get("manifest", {})
         package_ref = manifest.get("modelPackage", {}).get("ref")
         adapter_digest = manifest.get("runtime", {}).get("sources", {}).get("inference")
-        run_id = manifest.get("workload", {}).get("runId")
         if not isinstance(package_ref, str) or not isinstance(adapter_digest, str):
             raise ValidationError(
                 "a service deployment without a command requires a release built from a model "
@@ -174,10 +159,8 @@ class DeploymentService:
         model_package = self.factory._resource_by_uri("ModelPackage", package_ref)
         adapter = model_package["spec"]["adapters"]["inferenceReference"]
         signatures = model_package["spec"]["signatures"]
-        run_resource = self.factory._run_resource(str(run_id))
-        run_result = self.factory._run_result(
-            str(run_id), self.factory.run_status(str(run_id))["status"]
-        )
+        run_resource = self.factory._resource_by_uri("Run", manifest["provenance"]["runRef"])
+        run_result = self.factory._resource_by_uri("RunResult", manifest["provenance"]["resultRef"])
         try:
             state = run_result["spec"]["outputs"][adapter["stateOutput"]]
             admission = run_resource["spec"]["extensions"]["inferenceAdapter"]
@@ -234,6 +217,13 @@ class DeploymentService:
         )
 
     def _launch_deployment(
+        self, resource: dict[str, Any], *, instance: str | None = None
+    ) -> tuple[str, str | None, Path | None, str | None, str | None]:
+        release = self.factory._resource_by_uri("Release", resource["spec"]["releaseRef"])
+        with self.factory.publishing.selection(release):
+            return self._execute_deployment(resource, instance=instance)
+
+    def _execute_deployment(
         self, resource: dict[str, Any], *, instance: str | None = None
     ) -> tuple[str, str | None, Path | None, str | None, str | None]:
         extension = resource["spec"].get("extensions", {})
@@ -329,17 +319,19 @@ class DeploymentService:
         current = self.deployment_status(name)
         if int(current["statusVersion"]) != expected_version:
             raise ConflictError("deployment status version mismatch")
-        if current["status"].get("state") == "running":
-            current = self.cancel_deployment(name)
-            expected_version = int(current["statusVersion"])
         resource = current["deployment"]
         status = current["status"]
         previous = status.get("previousDeploymentRevision")
         if not previous:
             raise ConflictError("deployment has no previous revision to roll back")
         target = self.factory.resources.get(resource["metadata"]["uid"], str(previous))
-        release_name = str(target["spec"]["releaseRef"]).removeprefix("release/")
-        release = self.factory.find_resource("Release", release_name)
+        release = self.factory._resource_by_uri("Release", target["spec"]["releaseRef"])
+        decision = self.factory.publishing.promotion_decision(release)
+        if decision.outcome != "allow":
+            raise IntegrityError("rollback release does not meet the current promotion policy")
+        if current["status"].get("state") == "running":
+            current = self.cancel_deployment(name)
+            expected_version = int(current["statusVersion"])
         state, execution_id, run_dir, executor_name, endpoint = self._launch_deployment(
             target, instance=f"rollback-{expected_version + 1}"
         )

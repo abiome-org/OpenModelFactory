@@ -51,8 +51,7 @@ Every mutation is attributed to an actor. The CLI and Python API default to the
 first configured project owner, or `local-user` when no owner is set. Use
 `omf --actor <identity> ...` to select an existing policy identity explicitly;
 HTTP uses the token's actor. Replace the scaffold's `local-user`
-before sharing a project, and never reuse one identity for an independent
-approval.
+before sharing a project and issue separate scoped tokens to other operators.
 
 ## Policies
 
@@ -73,9 +72,7 @@ spec:
       match: {actor: local-user, resource: local/my-model}
   config:
     dirtyWorktree: archive
-    unsignedModules: deny
-    sync: {requirePlan: true, allowDelete: false}
-    promotion: {requireEvaluationPass: true, requireCompleteLineage: true}
+    promotion: {requireEvaluationPass: true}
 ```
 
 Rules match an action (`workload.run`, `sync.execute`, `release.create`,
@@ -85,8 +82,9 @@ admits a workload only from a committed tree with no uncommitted or untracked
 files, `archive` admits a dirty tree and stores the patch as a
 `worktree-patch` artifact referenced by the run, and `allow` records the state
 without archiving. New projects use `archive`, so iteration does not require a
-commit before each run. The other keys name behavior the factory always has and may
-only carry the values shown; an unknown key is rejected when the policy loads.
+commit before each run. Promotion requirements control evaluation, compatibility,
+and vulnerability checks; see [releases](releases.md). Unknown configuration
+is rejected when policy loads.
 
 ## The model card
 

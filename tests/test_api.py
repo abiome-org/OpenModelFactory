@@ -45,7 +45,7 @@ def test_api_health_auth_schemas_resources_and_doctor(tmp_path):
         operation_id = factory.operations.create("test", {"value": 1})["id"]
     with TestClient(create_app(paths)) as client:
         assert client.get("/healthz").status_code == 200
-        assert client.get("/openapi.json").json()["info"]["version"] == "1.0.0"
+        assert client.get("/openapi.json").json()["info"]["version"] == "2.0.0"
         assert client.get("/v1/doctor").status_code == 403
         headers = {"Authorization": f"Bearer {token}"}
         assert client.get("/v1/doctor", headers=headers).json()["ready"]
@@ -161,7 +161,7 @@ def test_api_health_auth_schemas_resources_and_doctor(tmp_path):
         assert client.get("/v1/doctor", headers=read_headers).status_code == 403
 
 
-def test_agent_goal_and_knowledge_api_parity_scopes_and_etags(tmp_path):
+def test_agent_view_scopes_and_etags(tmp_path):
     paths = _paths(tmp_path)
     with Factory(paths) as factory:
         token = factory.secrets.get("local-api-token", "api-authentication").decode()
@@ -192,58 +192,15 @@ def test_agent_goal_and_knowledge_api_parity_scopes_and_etags(tmp_path):
             == 304
         )
 
-        goal = client.post(
-            "/v1/goals",
-            headers=headers,
-            json={
-                "name": "quality",
-                "objective": "Improve quality",
-                "success_criteria": ["score >= 0.9"],
-                "constraints": ["gpuHours <= 2"],
-                "budget": {"gpuHours": 2},
-            },
-        )
-        assert goal.status_code == 200
-        assert goal.json()["statusVersion"] == 1
-        assert client.get("/v1/goals?state=active", headers=reader_headers).json()["total"] == 1
-        assert client.post("/v1/goals", headers=reader_headers, json={}).status_code == 403
-
-        status = client.patch(
-            "/v1/goals/quality/status",
-            headers=headers,
-            json={"state": "blocked", "expected_version": 1, "reason": "awaiting evidence"},
-        )
-        assert status.json()["statusVersion"] == 2
-        stale = client.patch(
-            "/v1/goals/quality/status",
-            headers=headers,
-            json={"state": "active", "expected_version": 1, "reason": "stale"},
-        )
-        assert stale.status_code == 409
-        assert stale.json()["error"]["retryable"]
-        assert stale.json()["error"]["details"]["currentVersion"] == 2
-
-        knowledge = client.post(
-            "/v1/knowledge",
-            headers=headers,
-            json={
-                "name": "baseline",
-                "category": "observation",
-                "claim": "The baseline score is 0.4.",
-                "confidence": 0.9,
-                "evidence": [{"ref": "evaluation:baseline"}],
-                "scope": {"goal_refs": ["goal/quality"], "tags": ["quality"]},
-            },
-        )
-        assert knowledge.status_code == 200
-        assert knowledge.json()["kind"] == "Knowledge"
+        assert client.get("/v1/agent/context", headers=reader_headers).status_code == 200
         assert (
-            client.get("/v1/knowledge?focus=quality", headers=reader_headers).json()["total"] == 1
+            client.post("/v1/releases/demo/promote", headers=reader_headers, json={}).status_code
+            == 403
         )
         invalid = client.post(
-            "/v1/knowledge",
+            "/v1/releases/demo/promote",
             headers=headers,
-            json={"name": "invalid", "claim": "sensitive-input-must-not-echo"},
+            json={"expected_version": "sensitive-input-must-not-echo"},
         )
         assert invalid.status_code == 422
         assert invalid.json()["error"]["code"] == "request_validation_error"
